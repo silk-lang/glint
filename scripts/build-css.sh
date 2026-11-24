@@ -2,27 +2,51 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-LOCAL_TW="${HOME}/.silk/cache/tailwind/4.3.5/f3f4f5d1727e2b693b8f1c9a1492b5dd87008c86ea286bee1589cb458e6235fc/macos-arm64"
 
-if [ -x "$LOCAL_TW" ]; then
-  "$LOCAL_TW" \
-    --cwd "$ROOT_DIR" \
-    --input "$ROOT_DIR/styles/input.css" \
-    --output "$ROOT_DIR/styles/app.css" \
-    --minify
-elif command -v tailwindcss >/dev/null 2>&1; then
-  tailwindcss \
-    --cwd "$ROOT_DIR" \
-    --input "$ROOT_DIR/styles/input.css" \
-    --output "$ROOT_DIR/styles/app.css" \
-    --minify
-else
-  npx --yes @tailwindcss/cli@4.3.5 \
-    --cwd "$ROOT_DIR" \
-    --input "$ROOT_DIR/styles/input.css" \
-    --output "$ROOT_DIR/styles/app.css" \
-    --minify
-fi
+# Resolve pinned standalone Tailwind CSS binary from tailwind.lock.json (downloads + verifies SHA-256 on miss)
+TW_BIN="$(python3 - "$ROOT_DIR/tailwind.lock.json" << 'PY'
+import hashlib, json, os, platform, stat, sys, urllib.request
+
+lock_path = sys.argv[1]
+with open(lock_path, "r", encoding="utf-8") as f:
+    lock = json.load(f)
+
+sys_name = platform.system().lower()
+mach = platform.machine().lower()
+os_key = "macos" if sys_name == "darwin" else "linux" if sys_name == "linux" else sys_name
+arch_key = "arm64" if mach in ("arm64", "aarch64") else "x64" if mach in ("x86_64", "amd64") else mach
+plat = f"{os_key}-{arch_key}"
+
+ver = lock["version"]
+sha = lock["platforms"][plat]
+cache_dir = os.path.join(os.path.expanduser("~"), ".silk", "cache", "tailwind", ver, sha)
+bin_path = os.path.join(cache_dir, plat)
+
+if not os.path.isfile(bin_path):
+    os.makedirs(cache_dir, exist_ok=True)
+    url = f"https://github.com/tailwindlabs/tailwindcss/releases/download/v{ver}/tailwindcss-{plat}"
+    tmp_path = bin_path + ".tmp"
+    urllib.request.urlretrieve(url, tmp_path)
+    h = hashlib.sha256()
+    with open(tmp_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    got = h.hexdigest()
+    if got != sha:
+        os.remove(tmp_path)
+        raise SystemExit(f"Tailwind SHA-256 mismatch for {plat}: expected {sha}, got {got}")
+    os.chmod(tmp_path, os.stat(tmp_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    os.replace(tmp_path, bin_path)
+
+print(bin_path)
+PY
+)"
+
+"$TW_BIN" \
+  --cwd "$ROOT_DIR" \
+  --input "$ROOT_DIR/styles/input.css" \
+  --output "$ROOT_DIR/styles/app.css" \
+  --minify
 
 python3 - "$ROOT_DIR/styles/app.css" "$ROOT_DIR/src/app_css.silk" << 'PY'
 import sys
