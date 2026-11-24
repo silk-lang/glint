@@ -1,0 +1,618 @@
+//! Praat-faithful Burg LPC formant analysis, following `voiceapp/wayfinder/voice-practice-tool/research/formant-analysis.md`:
+//!   1. Anti-aliased resample to `2 * ceilingHz` (user-adjustable 4000..6500 Hz, default 5500 Hz).
+//!   2. Pre-emphasis `y[n] = x[n] - exp(-2*pi*50/fs) * x[n-1]`.
+//!   3. Praat's pedestal-subtracted Gaussian window (`actual length = 2 * 0.025 s = 0.050 s`).
+//!   4. Burg LPC recursion (`order = 2 * maxFormants`, default 10 for 5 formants).
+//!   5. Complex polynomial roots via Aberth-Ehrlich iteration + unit-circle reflection.
+//!   6. Root -> (frequency, bandwidth) with Praat's 50 Hz safety margin & ascending sort.
+//!   7. LPC vocal-tract spectral envelope evaluation & IPA vowel classification from (F1, F2).
+import audio_native
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.usize
+
+pub const DEFAULT_FORMANT_CEILING_HZ: f64 = 5500.0
+pub const DEFAULT_MAX_FORMANTS: usize = 5
+pub const DEFAULT_LPC_ORDER: usize = 10
+pub const DEFAULT_HALF_WINDOW_S: f64 = 0.025
+pub const PREEMPHASIS_FROM_HZ: f64 = 50.0
+pub const SAFETY_MARGIN_HZ: f64 = 50.0
+pub const MAX_FORMANT_BANDWIDTH_HZ: f64 = 750.0
+
+pub struct FormantPeak {
+  pub freq: f64,
+  pub bw: f64,
+}
+
+impl Copy for FormantPeak {}
+
+pub struct FormantFrame {
+  pub time: f64,
+  pub count: usize,
+  pub f1: f64,
+  pub bw1: f64,
+  pub f2: f64,
+  pub bw2: f64,
+  pub f3: f64,
+  pub bw3: f64,
+  pub f4: f64,
+  pub bw4: f64,
+  pub intensityDb: f64,
+}
+
+impl Copy for FormantFrame {}
+
+impl FormantFrame {
+  pub fn empty(time: f64, intensityDb: f64) -> FormantFrame {
+    return FormantFrame {
+      time: time,
+      count: 0,
+      f1: 0.0, bw1: 0.0,
+      f2: 0.0, bw2: 0.0,
+      f3: 0.0, bw3: 0.0,
+      f4: 0.0, bw4: 0.0,
+      intensityDb: intensityDb,
+    }
+  }
+}
+
+/// Hillenbrand et al. (1995) Table V American English vowel landmarks (Hz) for Women & Men.
+pub const VOWEL_MODE_FEM: u32 = 0
+pub const VOWEL_MODE_MASC: u32 = 1
+pub const VOWEL_MODE_BOTH: u32 = 2
+
+pub struct VowelLandmark {
+  pub idx: usize,
+  pub ipa: string<'static>,
+  pub hint: string<'static>,
+  pub f1: f64,
+  pub f2: f64,
+  pub f3: f64,
+}
+
+impl Copy for VowelLandmark {}
+
+/// Hillenbrand et al. (1995) Table V — Adult Women (n=48) steady-state formant means (Hz).
+pub const VOWELS_FEM: [VowelLandmark; 10] = [
+  VowelLandmark { idx: 0, ipa: "i", hint: "seen", f1: 437.0, f2: 2761.0, f3: 3379.0 },
+  VowelLandmark { idx: 1, ipa: "ɪ", hint: "hid", f1: 558.0, f2: 2375.0, f3: 2987.0 },
+  VowelLandmark { idx: 2, ipa: "e", hint: "hay", f1: 592.0, f2: 2364.0, f3: 2959.0 },
+  VowelLandmark { idx: 3, ipa: "ɛ", hint: "head", f1: 731.0, f2: 2258.0, f3: 2913.0 },
+  VowelLandmark { idx: 4, ipa: "æ", hint: "had", f1: 860.0, f2: 2058.0, f3: 2843.0 },
+  VowelLandmark { idx: 5, ipa: "ɑ", hint: "hod", f1: 850.0, f2: 1335.0, f3: 2838.0 },
+  VowelLandmark { idx: 6, ipa: "ɔ", hint: "hawed", f1: 684.0, f2: 1041.0, f3: 2824.0 },
+  VowelLandmark { idx: 7, ipa: "o", hint: "hoed", f1: 595.0, f2: 1315.0, f3: 2806.0 },
+  VowelLandmark { idx: 8, ipa: "ʊ", hint: "hood", f1: 549.0, f2: 1629.0, f3: 2776.0 },
+  VowelLandmark { idx: 9, ipa: "u", hint: "who'd", f1: 455.0, f2: 1145.0, f3: 2781.0 },
+]
+
+/// Hillenbrand et al. (1995) Table V — Adult Men (n=45) steady-state formant means (Hz).
+pub const VOWELS_MASC: [VowelLandmark; 10] = [
+  VowelLandmark { idx: 0, ipa: "i", hint: "seen", f1: 341.0, f2: 2329.0, f3: 2991.0 },
+  VowelLandmark { idx: 1, ipa: "ɪ", hint: "hid", f1: 427.0, f2: 2038.0, f3: 2664.0 },
+  VowelLandmark { idx: 2, ipa: "e", hint: "hay", f1: 476.0, f2: 2055.0, f3: 2587.0 },
+  VowelLandmark { idx: 3, ipa: "ɛ", hint: "head", f1: 588.0, f2: 1951.0, f3: 2570.0 },
+  VowelLandmark { idx: 4, ipa: "æ", hint: "had", f1: 691.0, f2: 1756.0, f3: 2439.0 },
+  VowelLandmark { idx: 5, ipa: "ɑ", hint: "hod", f1: 732.0, f2: 1139.0, f3: 2471.0 },
+  VowelLandmark { idx: 6, ipa: "ɔ", hint: "hawed", f1: 586.0, f2: 902.0, f3: 2452.0 },
+  VowelLandmark { idx: 7, ipa: "o", hint: "hoed", f1: 515.0, f2: 1144.0, f3: 2455.0 },
+  VowelLandmark { idx: 8, ipa: "ʊ", hint: "hood", f1: 459.0, f2: 1421.0, f3: 2404.0 },
+  VowelLandmark { idx: 9, ipa: "u", hint: "who'd", f1: 378.0, f2: 997.0, f3: 2390.0 },
+]
+
+/// Corner vowels for subtle secondary labels in "Both" overlay mode.
+pub const VOWELS_MASC_CORNERS: [VowelLandmark; 4] = [
+  VowelLandmark { idx: 0, ipa: "i", hint: "seen", f1: 341.0, f2: 2329.0, f3: 2991.0 },
+  VowelLandmark { idx: 4, ipa: "æ", hint: "had", f1: 691.0, f2: 1756.0, f3: 2439.0 },
+  VowelLandmark { idx: 5, ipa: "ɑ", hint: "hod", f1: 732.0, f2: 1139.0, f3: 2471.0 },
+  VowelLandmark { idx: 9, ipa: "u", hint: "who'd", f1: 378.0, f2: 997.0, f3: 2390.0 },
+]
+
+/// Returns the nearest IPA vowel symbol for `(f1, f2)` using the chosen Hillenbrand (1995) reference.
+pub fn estimateVowelForMode(f1: f64, f2: f64, mode: u32) -> string<'static> {
+  if f1 < 180.0 || f1 > 1200.0 || f2 < 550.0 || f2 > 3400.0 || f2 <= f1 {
+    return "—"
+  }
+  let mut bestIpa: string<'static> = "—"
+  let mut bestDist: f64 = 1.0e30
+  if mode == VOWEL_MODE_FEM || mode == VOWEL_MODE_BOTH {
+    let mut i: usize = 0
+    while i < VOWELS_FEM.length {
+      let d1 = f64.log2(f1 / VOWELS_FEM[i].f1)
+      let d2 = f64.log2(f2 / VOWELS_FEM[i].f2)
+      let dist = d1 * d1 + d2 * d2
+      if dist < bestDist {
+        bestDist = dist
+        bestIpa = VOWELS_FEM[i].ipa
+      }
+      i = i + 1
+    }
+  }
+  if mode == VOWEL_MODE_MASC || mode == VOWEL_MODE_BOTH {
+    let mut i: usize = 0
+    while i < VOWELS_MASC.length {
+      let d1 = f64.log2(f1 / VOWELS_MASC[i].f1)
+      let d2 = f64.log2(f2 / VOWELS_MASC[i].f2)
+      let dist = d1 * d1 + d2 * d2
+      if dist < bestDist {
+        bestDist = dist
+        bestIpa = VOWELS_MASC[i].ipa
+      }
+      i = i + 1
+    }
+  }
+  return bestIpa
+}
+
+pub fn estimateVowel(f1: f64, f2: f64) -> string<'static> {
+  return estimateVowelForMode(f1, f2, VOWEL_MODE_BOTH)
+}
+
+/// Praat's exact pedestal-subtracted Gaussian window (sidelobes < -120 dB):
+///   w[i] = (exp(-48 * ((i - mid)/(N+1))^2) - exp(-12)) / (1 - exp(-12))
+effect fn makePraatGaussianWindow(n: usize) -> List<f64>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut w = List<f64>.make()
+  run w.appendRepeated(0.0, n)
+  let out = w.asMutSlice()
+  let nPlus1 = usize.toF64(n + 1)
+  let mid = 0.5 * nPlus1
+  let edge = f64.exp(-12.0)
+  let invDenom = 1.0 / (1.0 - edge)
+  let mut i: usize = 0
+  while i < n {
+    let idx = usize.toF64(i + 1)
+    let rel = (idx - mid) / nPlus1
+    out[i] = (f64.exp(-48.0 * rel * rel) - edge) * invDenom
+    i = i + 1
+  }
+  return move w
+}
+
+/// Resamples a window centered at `centreSec` from `src` (`srcRate`) onto `dst` (`dstRate`)
+/// with a native `-O3` windowed-sinc anti-aliasing low-pass filter and Praat pre-emphasis.
+fn resampleAndPreEmphasize(
+  src: &[f32],
+  srcRate: f64,
+  centreSec: f64,
+  dstRate: f64,
+  dst: &mut [f64],
+  work: &mut [f64],
+) -> f64 {
+  drop work
+  return audio_native.resamplePreEmphNative(
+    src,
+    srcRate,
+    centreSec,
+    dstRate,
+    PREEMPHASIS_FROM_HZ,
+    move dst,
+  )
+}
+
+/// Burg's algorithm for LPC coefficients (Childers 1978 / Praat `VECburg`).
+/// Writes `order` coefficients `a[0..order)` such that `x[n] ~= sum_{k=1..order} a[k-1] * x[n-k]`.
+/// Returns `true` on success, `false` on silent/ill-conditioned input.
+pub fn burgLpc(x: &[f64], order: usize, a: &mut [f64], b1: &mut [f64], b2: &mut [f64], aa: &mut [f64]) -> bool {
+  let n = x.length
+  if n <= order + 1 || order == 0 {
+    return false
+  }
+  let mut p: f64 = 0.0
+  let mut j: usize = 0
+  while j < n {
+    p = p + x[j] * x[j]
+    j = j + 1
+  }
+  if p <= 1.0e-18 {
+    return false
+  }
+
+  j = 0
+  while j < n - 1 {
+    b1[j] = x[j]
+    b2[j] = x[j + 1]
+    j = j + 1
+  }
+
+  let mut m: usize = 0
+  while m < order {
+    let limit = n - 1 - m
+    let mut num: f64 = 0.0
+    let mut den: f64 = 0.0
+    j = 0
+    while j < limit {
+      num = num + b1[j] * b2[j]
+      den = den + b1[j] * b1[j] + b2[j] * b2[j]
+      j = j + 1
+    }
+    if den <= 1.0e-18 {
+      return false
+    }
+    let km = 2.0 * num / den
+    if km >= 0.999999 || km <= -0.999999 {
+      return false
+    }
+    a[m] = km
+    if m > 0 {
+      j = 0
+      while j < m {
+        a[j] = aa[j] - km * aa[m - 1 - j]
+        j = j + 1
+      }
+    }
+    if m + 1 < order {
+      j = 0
+      while j <= m {
+        aa[j] = a[j]
+        j = j + 1
+      }
+      j = 0
+      while j < limit - 1 {
+        let oldB1 = b1[j]
+        let oldB2 = b2[j + 1]
+        b1[j] = oldB1 - km * b2[j]
+        b2[j] = oldB2 - km * b1[j + 1]
+        j = j + 1
+      }
+    }
+    m = m + 1
+  }
+  return true
+}
+
+/// Evaluates polynomial P(z) = sum_{k=0..deg} c[k] * z^k and derivative P'(z) at complex (zr, zi).
+fn evalPolyAndDeriv(c: &[f64], deg: usize, zr: f64, zi: f64) -> [f64; 4] {
+  let mut pr = c[deg]
+  let mut pi: f64 = 0.0
+  let mut dr: f64 = 0.0
+  let mut di: f64 = 0.0
+  let mut k = deg
+  while k > 0 {
+    k = k - 1
+    // d = d * z + p
+    let ndr = dr * zr - di * zi + pr
+    let ndi = dr * zi + di * zr + pi
+    dr = ndr
+    di = ndi
+    // p = p * z + c[k]
+    let npr = pr * zr - pi * zi + c[k]
+    let npi = pr * zi + pi * zr
+    pr = npr
+    pi = npi
+  }
+  return [pr, pi, dr, di]
+}
+
+/// Finds all complex roots of a monic degree-`deg` real polynomial `c[0..deg+1]`
+/// (where `c[deg] == 1.0`) using Aberth-Ehrlich simultaneous iteration.
+fn findPolyRoots(c: &[f64], deg: usize, rr: &mut [f64], ri: &mut [f64]) -> () {
+  // Initial guesses evenly distributed on a slightly tilted circle of radius 0.92.
+  let twoPi = 2.0 * f64.PI
+  let mut k: usize = 0
+  while k < deg {
+    let ang = twoPi * usize.toF64(k) / usize.toF64(deg) + 0.137
+    let rad = 0.88 + 0.06 * usize.toF64(k % 3)
+    rr[k] = rad * f64.cos(ang)
+    ri[k] = rad * f64.sin(ang)
+    k = k + 1
+  }
+
+  let mut iter: usize = 0
+  while iter < 48 {
+    let mut maxStep: f64 = 0.0
+    k = 0
+    while k < deg {
+      let zr = rr[k]
+      let zi = ri[k]
+      let pd = evalPolyAndDeriv(c, deg, zr, zi)
+      let pr = pd[0]
+      let pi = pd[1]
+      let dr = pd[2]
+      let di = pd[3]
+      let dNorm = dr * dr + di * di
+      if dNorm > 1.0e-30 {
+        // w = P(z) / P'(z)
+        let wr = (pr * dr + pi * di) / dNorm
+        let wi = (pi * dr - pr * di) / dNorm
+        // sum_{j != k} 1 / (z_k - z_j)
+        let mut sr: f64 = 0.0
+        let mut si: f64 = 0.0
+        let mut j: usize = 0
+        while j < deg {
+          if j != k {
+            let dx = zr - rr[j]
+            let dy = zi - ri[j]
+            let dn = dx * dx + dy * dy
+            if dn > 1.0e-30 {
+              sr = sr + dx / dn
+              si = si - dy / dn
+            }
+          }
+          j = j + 1
+        }
+        // denom = 1 - w * s
+        let denR = 1.0 - (wr * sr - wi * si)
+        let denI = -(wr * si + wi * sr)
+        let denNorm = denR * denR + denI * denI
+        if denNorm > 1.0e-30 {
+          let stepR = (wr * denR + wi * denI) / denNorm
+          let stepI = (wi * denR - wr * denI) / denNorm
+          rr[k] = zr - stepR
+          ri[k] = zi - stepI
+          let mag = f64.sqrt(stepR * stepR + stepI * stepI)
+          if mag > maxStep {
+            maxStep = mag
+          }
+        }
+      }
+      k = k + 1
+    }
+    if maxStep < 1.0e-9 {
+      break
+    }
+    iter = iter + 1
+  }
+}
+
+/// Evaluates the LPC vocal-tract dB envelope at `freqHz` for `workingRate` (used in the spectrum slice).
+pub fn lpcEnvelopeDb(a: &[f64], order: usize, freqHz: f64, workingRate: f64) -> f32 {
+  if order == 0 || workingRate <= 0.0 || freqHz >= workingRate * 0.5 {
+    return -120.0
+  }
+  let omega = 2.0 * f64.PI * freqHz / workingRate
+  let mut re: f64 = 1.0
+  let mut im: f64 = 0.0
+  let mut k: usize = 0
+  while k < order {
+    let ang = omega * usize.toF64(k + 1)
+    re = re - a[k] * f64.cos(ang)
+    im = im + a[k] * f64.sin(ang)
+    k = k + 1
+  }
+  let mag2 = re * re + im * im
+  if mag2 <= 1.0e-12 {
+    return 0.0
+  }
+  return f64.toF32(-10.0 * f64.log(mag2) / f64.log(10.0))
+}
+
+/// Reusable Praat Burg formant analyzer + incremental track.
+pub struct FormantTrack {
+  pub frames: List<FormantFrame>,
+  pub ceilingHz: f64,
+  pub hopSeconds: f64,
+  pub sampleRate: f64,
+  pub workingRate: f64,
+  pub windowSamples: usize,
+  window: List<f64>,
+  resampled: List<f64>,
+  work: List<f64>,
+  b1: List<f64>,
+  b2: List<f64>,
+  pub lastLpc: List<f64>,
+  pub lastLpcValid: bool,
+}
+
+impl FormantTrack {
+  pub fn empty() -> FormantTrack {
+    return FormantTrack {
+      frames: List<FormantFrame>.make(),
+      ceilingHz: DEFAULT_FORMANT_CEILING_HZ,
+      hopSeconds: 1024.0 / 44100.0,
+      sampleRate: 48000.0,
+      workingRate: DEFAULT_FORMANT_CEILING_HZ * 2.0,
+      windowSamples: 550,
+      window: List<f64>.make(),
+      resampled: List<f64>.make(),
+      work: List<f64>.make(),
+      b1: List<f64>.make(),
+      b2: List<f64>.make(),
+      lastLpc: List<f64>.make(),
+      lastLpcValid: false,
+    }
+  }
+
+  pub effect fn reset(self: &mut Self, sampleRate: f64, ceilingHz: f64, hopSeconds: f64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.frames.clear()
+    self.sampleRate = sampleRate
+    self.ceilingHz = f64.max(3000.0, f64.min(ceilingHz, sampleRate * 0.49))
+    self.workingRate = self.ceilingHz * 2.0
+    self.hopSeconds = hopSeconds
+    // Praat actual window is 2 * halfdt_window = 0.050 s.
+    let rawWin = f64.toUsize(f64.round(2.0 * DEFAULT_HALF_WINDOW_S * self.workingRate))
+    self.windowSamples = if rawWin < 64 { 64 } else { rawWin }
+    self.window = run makePraatGaussianWindow(self.windowSamples)
+
+    self.resampled.clear()
+    run self.resampled.appendRepeated(0.0, self.windowSamples)
+    self.work.clear()
+    run self.work.appendRepeated(0.0, self.windowSamples + 1)
+    self.b1.clear()
+    run self.b1.appendRepeated(0.0, self.windowSamples)
+    self.b2.clear()
+    run self.b2.appendRepeated(0.0, self.windowSamples)
+    self.lastLpc.clear()
+    run self.lastLpc.appendRepeated(0.0, DEFAULT_LPC_ORDER)
+    self.lastLpcValid = false
+  }
+
+  pub fn analyzeFrame(self: &mut Self, samples: &[f32], centreSec: f64, saveLpc: bool) -> FormantFrame {
+    let intensityDb = resampleAndPreEmphasize(
+      samples,
+      self.sampleRate,
+      centreSec,
+      self.workingRate,
+      self.resampled.asMutSlice(),
+      self.work.asMutSlice(),
+    )
+    if intensityDb < -72.0 {
+      if saveLpc {
+        self.lastLpcValid = false
+      }
+      return FormantFrame.empty(centreSec, intensityDb)
+    }
+
+    let n = self.windowSamples
+    let win = self.window.asSlice()
+    let x = self.resampled.asMutSlice()
+    let mut i: usize = 0
+    while i < n {
+      x[i] = x[i] * win[i]
+      i = i + 1
+    }
+
+    let mut a: [f64; 10] = [0.0; 10]
+    let mut aa: [f64; 10] = [0.0; 10]
+    let ok = burgLpc(self.resampled.asSlice(), DEFAULT_LPC_ORDER, &mut a, self.b1.asMutSlice(), self.b2.asMutSlice(), &mut aa)
+    if !ok {
+      if saveLpc {
+        self.lastLpcValid = false
+      }
+      return FormantFrame.empty(centreSec, intensityDb)
+    }
+
+    if saveLpc {
+      let dst = self.lastLpc.asMutSlice()
+      i = 0
+      while i < DEFAULT_LPC_ORDER {
+        dst[i] = a[i]
+        i = i + 1
+      }
+      self.lastLpcValid = true
+    }
+
+    // Polynomial in reverse order with leading 1.0 (Praat Sound_to_Formant.cpp:41-53):
+    //   P(z) = z^p - a[0]*z^(p-1) - ... - a[p-1]
+    let mut poly: [f64; 11] = [0.0; 11]
+    i = 0
+    while i < DEFAULT_LPC_ORDER {
+      poly[i] = -a[DEFAULT_LPC_ORDER - 1 - i]
+      i = i + 1
+    }
+    poly[DEFAULT_LPC_ORDER] = 1.0
+
+    let mut rr: [f64; 10] = [0.0; 10]
+    let mut ri: [f64; 10] = [0.0; 10]
+    findPolyRoots(&poly, DEFAULT_LPC_ORDER, &mut rr, &mut ri)
+
+    // Convert roots on/above real axis into (freq, bw) after reflecting unstable roots into unit circle.
+    let nyq = self.workingRate * 0.5
+    let mut peaks: [FormantPeak; 10] = [FormantPeak { freq: 0.0, bw: 0.0 }; 10]
+    let mut pCount: usize = 0
+
+    i = 0
+    while i < DEFAULT_LPC_ORDER {
+      let mut re = rr[i]
+      let mut im = ri[i]
+      let mut norm2 = re * re + im * im
+      if norm2 > 1.0 {
+        // Reflect outside root inside: 1 / conj(z) = z / |z|^2
+        re = re / norm2
+        im = im / norm2
+        norm2 = 1.0 / norm2
+      }
+      // Keep only upper half-plane roots (im >= 0) so conjugate pairs are counted once.
+      if im >= 1.0e-7 && norm2 > 1.0e-12 {
+        let freq = f64.abs(f64.atan2(im, re)) * nyq / f64.PI
+        let bw = -f64.log(norm2) * nyq / f64.PI
+        if freq >= SAFETY_MARGIN_HZ && freq <= nyq - SAFETY_MARGIN_HZ && bw > 0.0 && bw <= MAX_FORMANT_BANDWIDTH_HZ {
+          peaks[pCount] = FormantPeak { freq: freq, bw: bw }
+          pCount = pCount + 1
+        }
+      }
+      i = i + 1
+    }
+
+    // Selection sort ascending by frequency (Praat Formant_sort).
+    i = 0
+    while i < pCount {
+      let mut best = i
+      let mut j = i + 1
+      while j < pCount {
+        if peaks[j].freq < peaks[best].freq {
+          best = j
+        }
+        j = j + 1
+      }
+      if best != i {
+        let tmp = peaks[i]
+        peaks[i] = peaks[best]
+        peaks[best] = tmp
+      }
+      i = i + 1
+    }
+
+    let mut frame = FormantFrame.empty(centreSec, intensityDb)
+    frame.count = pCount
+    if pCount >= 1 {
+      frame.f1 = peaks[0].freq
+      frame.bw1 = peaks[0].bw
+    }
+    if pCount >= 2 {
+      frame.f2 = peaks[1].freq
+      frame.bw2 = peaks[1].bw
+    }
+    if pCount >= 3 {
+      frame.f3 = peaks[2].freq
+      frame.bw3 = peaks[2].bw
+    }
+    if pCount >= 4 {
+      frame.f4 = peaks[3].freq
+      frame.bw4 = peaks[3].bw
+    }
+    return frame
+  }
+
+  /// Appends newly computable formant frames for `samples`.
+  pub effect fn update(self: &mut Self, samples: &[f32]) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let duration = usize.toF64(samples.length) / self.sampleRate
+    if duration < DEFAULT_HALF_WINDOW_S * 2.0 {
+      return 0
+    }
+    let margin = DEFAULT_HALF_WINDOW_S
+    let computable = f64.toUsize(f64.floor((duration - 2.0 * margin) / self.hopSeconds)) + 1
+    let already = self.frames.length()
+    if computable <= already {
+      return 0
+    }
+    let mut added: usize = 0
+    let mut idx = already
+    while idx < computable {
+      let t = margin + usize.toF64(idx) * self.hopSeconds
+      let frame = self.analyzeFrame(samples, t, false)
+      run self.frames.append(frame)
+      idx = idx + 1
+      added = added + 1
+    }
+    return added
+  }
+
+  pub fn nearest(self: &Self, timeSec: f64) -> Option<FormantFrame> {
+    let n = self.frames.length()
+    if n == 0 {
+      return Option<FormantFrame>.None
+    }
+    let firstT = self.frames.get(0).time
+    if self.hopSeconds <= 0.0 {
+      return Option<FormantFrame>.some(self.frames.get(0))
+    }
+    let raw = f64.round((timeSec - firstT) / self.hopSeconds)
+    if raw < 0.0 {
+      return Option<FormantFrame>.some(self.frames.get(0))
+    }
+    let idx = f64.toUsize(raw)
+    if idx >= n {
+      return Option<FormantFrame>.some(self.frames.get(n - 1))
+    }
+    return Option<FormantFrame>.some(self.frames.get(idx))
+  }
+}

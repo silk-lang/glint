@@ -1,0 +1,7 @@
+build/
+web-pkg/build/
+dist/
+.DS_Store
+*.log
+node_modules/
+.wrangler/

@@ -1,0 +1,23 @@
+import silk.build.plan { Framework, Plan }
+import silk.build.step { sourcePath }
+
+static fn plan() -> Plan {
+  let mut plan = Plan.empty()
+  if Intrinsic.targetOperatingSystem() == "darwin" {
+    plan = plan
+      |> Plan.compileNative(
+        "objc",
+        sourcePath("native/audio.m"),
+        &["-fobjc-arc", "-fblocks", "-O3", "-Wno-deprecated-declarations", "-mmacosx-version-min=14.0"],
+        &[],
+      )
+      |> Plan.linkFramework("AVFoundation", Framework.make())
+      |> Plan.linkFramework("Accelerate", Framework.make())
+      |> Plan.linkFramework("AudioToolbox", Framework.make())
+      |> Plan.linkFramework("CoreAudio", Framework.make())
+      |> Plan.linkFramework("Cocoa", Framework.make())
+  }
+  return plan
+}
+
+pub const PLAN: Plan = plan()

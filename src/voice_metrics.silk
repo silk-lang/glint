@@ -1,0 +1,410 @@
+//! Voice training acoustic metrics:
+//!   - Vocal Size / Resonance (Apparent Vocal Tract Length in cm from F1..F4 weighted toward F2-F4,
+//!     plus normalized Size score 0=big/dark .. 1=small/bright)
+//!   - Vocal Weight (exact Hann-windowed Goertzel H1-H2 in dB, normalized 0=heavy .. 1=light/thin)
+//!   - Breathiness / Clarity (Praat Boersma HNR = 10*log10(r / (1 - r)) in dB)
+//!   - Whole-clip summary (medians, F1/F2 vowel cloud centroid, active speech bounds)
+//!   - Long-Term Average Spectrum (LTAS, 64 log-spaced bins from 60 Hz .. 6000 Hz)
+import audio_native
+import formants { FormantFrame }
+import pitch { PitchFrame }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.usize
+
+/// Speed of sound in warm vocal tract air (cm/s).
+const SPEED_OF_SOUND_CM_S: f64 = 35000.0
+
+/// Normalization bounds for apparent VTL (cm): 18.5 cm = very large/dark, 13.0 cm = very small/bright.
+pub const VTL_BIG_CM: f64 = 18.5
+pub const VTL_SMALL_CM: f64 = 13.0
+
+/// Normalization bounds for H1-H2 (dB): -4 dB = heavy/thick, +14 dB = light/thin.
+pub const H1H2_HEAVY_DB: f64 = -4.0
+pub const H1H2_LIGHT_DB: f64 = 14.0
+
+pub const LTAS_BINS: usize = 64
+pub const LTAS_FMIN: f64 = 60.0
+pub const LTAS_FMAX: f64 = 6000.0
+
+pub struct VoiceFrame {
+  pub time: f64,
+  pub voiced: bool,
+  pub f0: f64,
+  pub intensityDb: f64,
+  /// Apparent Vocal Tract Length (cm). Smaller = brighter/smaller resonance.
+  pub vtlCm: f64,
+  /// Normalized resonance/size in [0, 1] (0 = big/dark, 1 = small/bright), EMA-smoothed.
+  pub sizeNorm: f64,
+  /// Raw H1 - H2 harmonic amplitude difference (dB). Higher = lighter/thinner weight.
+  pub h1h2Db: f64,
+  /// Normalized vocal lightness in [0, 1] (0 = heavy/thick, 1 = light/thin), EMA-smoothed.
+  pub weightLightNorm: f64,
+  /// Harmonics-to-Noise Ratio (dB) from Boersma autocorrelation peak.
+  pub hnrDb: f64,
+  /// Formant snapshot for vowel cloud plotting.
+  pub f1: f64,
+  pub f2: f64,
+  pub hasFormants: bool,
+}
+
+impl Copy for VoiceFrame {}
+
+impl VoiceFrame {
+  pub fn unvoiced(time: f64, intensityDb: f64) -> VoiceFrame {
+    return VoiceFrame {
+      time: time,
+      voiced: false,
+      f0: 0.0,
+      intensityDb: intensityDb,
+      vtlCm: 0.0,
+      sizeNorm: 0.5,
+      h1h2Db: 0.0,
+      weightLightNorm: 0.5,
+      hnrDb: 0.0,
+      f1: 0.0,
+      f2: 0.0,
+      hasFormants: false,
+    }
+  }
+}
+
+pub struct VoiceSummary {
+  pub voicedFrames: usize,
+  pub medianF0: f64,
+  pub medianVtlCm: f64,
+  pub medianSizeNorm: f64,
+  pub medianH1H2Db: f64,
+  pub medianWeightLight: f64,
+  pub medianHnrDb: f64,
+  pub meanF1: f64,
+  pub meanF2: f64,
+  pub formantCount: usize,
+  pub activeStartSec: f64,
+  pub activeEndSec: f64,
+}
+
+impl Copy for VoiceSummary {}
+
+impl VoiceSummary {
+  pub fn empty() -> VoiceSummary {
+    return VoiceSummary {
+      voicedFrames: 0,
+      medianF0: 0.0,
+      medianVtlCm: 0.0,
+      medianSizeNorm: 0.5,
+      medianH1H2Db: 0.0,
+      medianWeightLight: 0.5,
+      medianHnrDb: 0.0,
+      meanF1: 0.0,
+      meanF2: 0.0,
+      formantCount: 0,
+      activeStartSec: 0.0,
+      activeEndSec: 0.0,
+    }
+  }
+}
+
+pub fn vtlToSizeNorm(vtlCm: f64) -> f64 {
+  if vtlCm <= 1.0 {
+    return 0.5
+  }
+  let t = (VTL_BIG_CM - vtlCm) / (VTL_BIG_CM - VTL_SMALL_CM)
+  return f64.max(0.0, f64.min(1.0, t))
+}
+
+pub fn h1h2ToLightNorm(h1h2Db: f64) -> f64 {
+  let t = (h1h2Db - H1H2_HEAVY_DB) / (H1H2_LIGHT_DB - H1H2_HEAVY_DB)
+  return f64.max(0.0, f64.min(1.0, t))
+}
+
+/// Estimates apparent Vocal Tract Length (cm) from Praat Burg F1..F4 using quarter-wave
+/// tube scaling, weighted heavily toward F2..F4 so vowel articulation on F1 doesn't dominate.
+pub fn estimateVtlCm(ff: FormantFrame) -> f64 {
+  let mut wSum: f64 = 0.0
+  let mut lSum: f64 = 0.0
+
+  if ff.count >= 1 && ff.f1 > 180.0 && ff.f1 < 1250.0 {
+    let l1 = (1.0 * SPEED_OF_SOUND_CM_S) / (4.0 * ff.f1)
+    if l1 >= 10.0 && l1 <= 24.0 {
+      lSum = lSum + l1 * 0.12
+      wSum = wSum + 0.12
+    }
+  }
+  if ff.count >= 2 && ff.f2 > 600.0 && ff.f2 < 3400.0 {
+    let l2 = (3.0 * SPEED_OF_SOUND_CM_S) / (4.0 * ff.f2)
+    if l2 >= 10.0 && l2 <= 24.0 {
+      lSum = lSum + l2 * 0.24
+      wSum = wSum + 0.24
+    }
+  }
+  if ff.count >= 3 && ff.f3 > 1600.0 && ff.f3 < 4400.0 {
+    let l3 = (5.0 * SPEED_OF_SOUND_CM_S) / (4.0 * ff.f3)
+    if l3 >= 10.0 && l3 <= 24.0 {
+      lSum = lSum + l3 * 0.32
+      wSum = wSum + 0.32
+    }
+  }
+  if ff.count >= 4 && ff.f4 > 2400.0 && ff.f4 < 5600.0 {
+    let l4 = (7.0 * SPEED_OF_SOUND_CM_S) / (4.0 * ff.f4)
+    if l4 >= 10.0 && l4 <= 24.0 {
+      lSum = lSum + l4 * 0.32
+      wSum = wSum + 0.32
+    }
+  }
+  if wSum <= 0.0 {
+    return 0.0
+  }
+  return lSum / wSum
+}
+
+/// Praat's Boersma HNR formula from normalized autocorrelation peak `r`: `10 * log10(r / (1 - r))`.
+pub fn clarityToHnrDb(clarity: f64) -> f64 {
+  let r = f64.max(0.05, f64.min(0.9995, clarity))
+  let hnr = 10.0 * f64.log(r / (1.0 - r)) / f64.log(10.0)
+  return f64.max(-5.0, f64.min(35.0, hnr))
+}
+
+fn insertionSortF64(vals: &mut [f64]) -> () {
+  let n = vals.length
+  let mut i: usize = 1
+  while i < n {
+    let key = vals[i]
+    let mut j = i
+    while j > 0 && vals[j - 1] > key {
+      vals[j] = vals[j - 1]
+      j = j - 1
+    }
+    vals[j] = key
+    i = i + 1
+  }
+}
+
+fn medianOfList(vals: &mut List<f64>) -> f64 {
+  let n = vals.length()
+  if n == 0 {
+    return 0.0
+  }
+  insertionSortF64(vals.asMutSlice())
+  let s = vals.asSlice()
+  let mid = n / 2
+  if (n % 2) == 1 {
+    return s[mid]
+  }
+  return 0.5 * (s[mid - 1] + s[mid])
+}
+
+pub struct VoiceMetricsTrack {
+  pub frames: List<VoiceFrame>,
+  pub summary: VoiceSummary,
+  pub ltas: [f32; 64],
+  pub hasLtas: bool,
+  smoothSize: f64,
+  smoothLight: f64,
+  hasSmoothSize: bool,
+  hasSmoothLight: bool,
+}
+
+impl VoiceMetricsTrack {
+  pub fn empty() -> VoiceMetricsTrack {
+    return VoiceMetricsTrack {
+      frames: List<VoiceFrame>.make(),
+      summary: VoiceSummary.empty(),
+      ltas: [0.0; 64],
+      hasLtas: false,
+      smoothSize: 0.5,
+      smoothLight: 0.5,
+      hasSmoothSize: false,
+      hasSmoothLight: false,
+    }
+  }
+
+  pub fn reset(self: &mut Self) -> () {
+    self.frames.clear()
+    self.summary = VoiceSummary.empty()
+    self.ltas = [0.0; 64]
+    self.hasLtas = false
+    self.smoothSize = 0.5
+    self.smoothLight = 0.5
+    self.hasSmoothSize = false
+    self.hasSmoothLight = false
+  }
+
+  /// Incrementally processes any new frames from `pitchFrames` & `formantFrames`.
+  pub effect fn update(
+    self: &mut Self,
+    samples: &[f32],
+    sampleRate: f64,
+    pitchFrames: &[PitchFrame],
+    formantFrames: &[FormantFrame],
+    displayClarity: f64,
+  ) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut added: usize = 0
+    let mut i = self.frames.length()
+    let maxIdx = pitchFrames.length
+    while i < maxIdx {
+      let pf = pitchFrames[i]
+      let voiced = pf.voiced && pf.clarity >= displayClarity && pf.frequency > 45.0
+      if !voiced {
+        run self.frames.append(VoiceFrame.unvoiced(pf.time, pf.intensityDb))
+      } else {
+        let hnrDb = clarityToHnrDb(pf.clarity)
+        let h1h2Db = audio_native.harmonicH1H2Native(samples, sampleRate, pf.time, pf.frequency)
+        let rawLight = h1h2ToLightNorm(h1h2Db)
+        if !self.hasSmoothLight {
+          self.smoothLight = rawLight
+          self.hasSmoothLight = true
+        } else {
+          self.smoothLight = self.smoothLight * 0.65 + rawLight * 0.35
+        }
+
+        let mut vtlCm: f64 = 0.0
+        let mut f1: f64 = 0.0
+        let mut f2: f64 = 0.0
+        let mut hasFormants = false
+        if i < formantFrames.length {
+          let ff = formantFrames[i]
+          vtlCm = estimateVtlCm(ff)
+          if ff.count >= 2 && ff.f1 > 160.0 && ff.f2 > ff.f1 {
+            f1 = ff.f1
+            f2 = ff.f2
+            hasFormants = true
+          }
+        }
+        if vtlCm > 1.0 {
+          let rawSize = vtlToSizeNorm(vtlCm)
+          if !self.hasSmoothSize {
+            self.smoothSize = rawSize
+            self.hasSmoothSize = true
+          } else {
+            self.smoothSize = self.smoothSize * 0.70 + rawSize * 0.30
+          }
+        }
+
+        run self.frames.append(VoiceFrame {
+          time: pf.time,
+          voiced: true,
+          f0: pf.frequency,
+          intensityDb: pf.intensityDb,
+          vtlCm: vtlCm,
+          sizeNorm: self.smoothSize,
+          h1h2Db: h1h2Db,
+          weightLightNorm: self.smoothLight,
+          hnrDb: hnrDb,
+          f1: f1,
+          f2: f2,
+          hasFormants: hasFormants,
+        })
+      }
+      added = added + 1
+      i = i + 1
+    }
+    return added
+  }
+
+  /// Recomputes clip-level medians, vowel centroid, speech bounds, and LTAS.
+  pub effect fn finalizeSummary(self: &mut Self, samples: &[f32], sampleRate: f64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let fs = self.frames.asSlice()
+    let mut f0s = List<f64>.make()
+    let mut vtls = List<f64>.make()
+    let mut sizes = List<f64>.make()
+    let mut h1h2s = List<f64>.make()
+    let mut lights = List<f64>.make()
+    let mut hnrs = List<f64>.make()
+    let mut voicedTimes = List<f64>.make()
+
+    let mut f1Sum: f64 = 0.0
+    let mut f2Sum: f64 = 0.0
+    let mut fmtCount: usize = 0
+    let mut activeStart: f64 = -1.0
+    let mut activeEnd: f64 = 0.0
+
+    let mut i: usize = 0
+    while i < fs.length {
+      let fr = fs[i]
+      if fr.voiced {
+        if activeStart < 0.0 {
+          activeStart = fr.time
+        }
+        activeEnd = fr.time
+        run f0s.append(fr.f0)
+        run h1h2s.append(fr.h1h2Db)
+        run lights.append(fr.weightLightNorm)
+        run hnrs.append(fr.hnrDb)
+        run voicedTimes.append(fr.time)
+        if fr.vtlCm > 1.0 {
+          run vtls.append(fr.vtlCm)
+          run sizes.append(fr.sizeNorm)
+        }
+        if fr.hasFormants {
+          f1Sum = f1Sum + fr.f1
+          f2Sum = f2Sum + fr.f2
+          fmtCount = fmtCount + 1
+        }
+      }
+      i = i + 1
+    }
+
+    let vc = f0s.length()
+    if vc == 0 {
+      self.summary = VoiceSummary.empty()
+      self.hasLtas = false
+      return ()
+    }
+
+    self.summary = VoiceSummary {
+      voicedFrames: vc,
+      medianF0: medianOfList(&mut f0s),
+      medianVtlCm: medianOfList(&mut vtls),
+      medianSizeNorm: if sizes.length() > 0 { medianOfList(&mut sizes) } else { 0.5 },
+      medianH1H2Db: medianOfList(&mut h1h2s),
+      medianWeightLight: medianOfList(&mut lights),
+      medianHnrDb: medianOfList(&mut hnrs),
+      meanF1: if fmtCount > 0 { f1Sum / usize.toF64(fmtCount) } else { 0.0 },
+      meanF2: if fmtCount > 0 { f2Sum / usize.toF64(fmtCount) } else { 0.0 },
+      formantCount: fmtCount,
+      activeStartSec: if activeStart >= 0.0 { activeStart } else { 0.0 },
+      activeEndSec: activeEnd,
+    }
+
+    let mut ltasBuf: [f32; 64] = [0.0; 64]
+    let ok = audio_native.computeLtasNative(
+      samples,
+      sampleRate,
+      voicedTimes.asSlice(),
+      &mut ltasBuf,
+      LTAS_FMIN,
+      LTAS_FMAX,
+    )
+    self.ltas = ltasBuf
+    self.hasLtas = ok
+  }
+
+  pub fn nearest(self: &Self, timeSec: f64) -> Option<VoiceFrame> {
+    let fs = self.frames.asSlice()
+    if fs.length == 0 {
+      return Option<VoiceFrame>.None
+    }
+    let mut lo: usize = 0
+    let mut hi: usize = fs.length - 1
+    while lo < hi {
+      let mid = lo + (hi - lo) / 2
+      if fs[mid].time < timeSec {
+        lo = mid + 1
+      } else {
+        hi = mid
+      }
+    }
+    if lo > 0 && f64.abs(fs[lo - 1].time - timeSec) < f64.abs(fs[lo].time - timeSec) {
+      return Option<VoiceFrame>.some(fs[lo - 1])
+    }
+    return Option<VoiceFrame>.some(fs[lo])
+  }
+}

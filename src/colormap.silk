@@ -1,0 +1,216 @@
+//! Colormaps baked into a 256x1 RGBA8 lookup texture for WebGPU & WebGL2.
+//!
+//! Default palette is Glint's Muted perceptual palette:
+//!   #1E2A55 deep slate -> #5C9FB0 muted teal -> #D8CF8A warm sand -> #9B3A4A muted crimson
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u32
+import silk.num.u8
+import silk.num.usize
+
+pub const LUT_SIZE: usize = 256
+
+pub const DEFAULT_DISPLAY_FLOOR_DB: f32 = -129.0
+pub const DEFAULT_DISPLAY_CEILING_DB: f32 = -25.0
+
+pub enum Palette {
+  Muted,
+  VoceVista,
+  Inferno,
+  Magma,
+  Viridis,
+  Ocean,
+  Grayscale,
+  InvertGray,
+}
+
+pub struct ColorStop {
+  pub at: f32,
+  pub r: f32,
+  pub g: f32,
+  pub b: f32,
+}
+
+impl Copy for ColorStop {}
+
+const MUTED_STOPS: [ColorStop; 5] = [
+  ColorStop { at: 0.00, r: 0.055000, g: 0.058000, b: 0.078000 },
+  ColorStop { at: 0.14, r: 0.117647, g: 0.164706, b: 0.333333 },
+  ColorStop { at: 0.44, r: 0.360784, g: 0.623529, b: 0.690196 },
+  ColorStop { at: 0.74, r: 0.847059, g: 0.811765, b: 0.541176 },
+  ColorStop { at: 1.00, r: 0.607843, g: 0.227451, b: 0.290196 },
+]
+
+const VOCE_STOPS: [ColorStop; 5] = [
+  ColorStop { at: 0.00, r: 0.000000, g: 0.000000, b: 0.784314 },
+  ColorStop { at: 0.25, r: 0.000000, g: 0.784314, b: 0.941176 },
+  ColorStop { at: 0.50, r: 1.000000, g: 1.000000, b: 0.403922 },
+  ColorStop { at: 0.75, r: 0.823529, g: 0.450980, b: 0.372549 },
+  ColorStop { at: 1.00, r: 0.733333, g: 0.309804, b: 0.435294 },
+]
+
+const INFERNO_STOPS: [ColorStop; 7] = [
+  ColorStop { at: 0.000, r: 0.000000, g: 0.000000, b: 0.015686 },
+  ColorStop { at: 0.167, r: 0.105882, g: 0.047059, b: 0.254902 },
+  ColorStop { at: 0.333, r: 0.290196, g: 0.047059, b: 0.419608 },
+  ColorStop { at: 0.500, r: 0.470588, g: 0.109804, b: 0.427451 },
+  ColorStop { at: 0.667, r: 0.733333, g: 0.215686, b: 0.329412 },
+  ColorStop { at: 0.833, r: 0.976471, g: 0.549020, b: 0.039216 },
+  ColorStop { at: 1.000, r: 0.988235, g: 1.000000, b: 0.643137 },
+]
+
+const MAGMA_STOPS: [ColorStop; 6] = [
+  ColorStop { at: 0.00, r: 0.004, g: 0.004, b: 0.020 },
+  ColorStop { at: 0.22, r: 0.145, g: 0.067, b: 0.345 },
+  ColorStop { at: 0.45, r: 0.447, g: 0.122, b: 0.506 },
+  ColorStop { at: 0.68, r: 0.784, g: 0.239, b: 0.451 },
+  ColorStop { at: 0.86, r: 0.988, g: 0.545, b: 0.388 },
+  ColorStop { at: 1.00, r: 0.988, g: 0.992, b: 0.749 },
+]
+
+const VIRIDIS_STOPS: [ColorStop; 6] = [
+  ColorStop { at: 0.00, r: 0.020, g: 0.015, b: 0.080 },
+  ColorStop { at: 0.22, r: 0.267, g: 0.004, b: 0.329 },
+  ColorStop { at: 0.44, r: 0.229, g: 0.322, b: 0.545 },
+  ColorStop { at: 0.66, r: 0.129, g: 0.569, b: 0.549 },
+  ColorStop { at: 0.85, r: 0.369, g: 0.788, b: 0.384 },
+  ColorStop { at: 1.00, r: 0.992, g: 0.906, b: 0.145 },
+]
+
+const OCEAN_STOPS: [ColorStop; 5] = [
+  ColorStop { at: 0.00, r: 0.010, g: 0.020, b: 0.060 },
+  ColorStop { at: 0.30, r: 0.020, g: 0.160, b: 0.420 },
+  ColorStop { at: 0.60, r: 0.050, g: 0.540, b: 0.760 },
+  ColorStop { at: 0.85, r: 0.460, g: 0.900, b: 0.960 },
+  ColorStop { at: 1.00, r: 0.960, g: 0.990, b: 1.000 },
+]
+
+const GRAY_STOPS: [ColorStop; 2] = [
+  ColorStop { at: 0.0, r: 0.0, g: 0.0, b: 0.0 },
+  ColorStop { at: 1.0, r: 1.0, g: 1.0, b: 1.0 },
+]
+
+const INVERT_GRAY_STOPS: [ColorStop; 2] = [
+  ColorStop { at: 0.0, r: 0.95, g: 0.96, b: 0.98 },
+  ColorStop { at: 1.0, r: 0.04, g: 0.05, b: 0.08 },
+]
+
+fn clamp01(v: f32) -> f32 {
+  if v < 0.0 {
+    return 0.0
+  }
+  if v > 1.0 {
+    return 1.0
+  }
+  return v
+}
+
+fn toByte(v: f32) -> u8 {
+  let c = clamp01(v) * 255.0 + 0.5
+  if c >= 255.0 {
+    return 255
+  }
+  return f32.toU8(c)
+}
+
+fn sampleStops(stops: &[ColorStop], t: f32) -> ColorStop {
+  if t <= stops[0].at {
+    return stops[0]
+  }
+  let last = stops.length - 1
+  if t >= stops[last].at {
+    return stops[last]
+  }
+  let mut i: usize = 0
+  while i < last {
+    let a = stops[i]
+    let b = stops[i + 1]
+    if t >= a.at && t <= b.at {
+      let span = b.at - a.at
+      let f: f32 = if span == 0.0 { 0.0 } else { (t - a.at) / span }
+      return ColorStop {
+        at: t,
+        r: a.r + (b.r - a.r) * f,
+        g: a.g + (b.g - a.g) * f,
+        b: a.b + (b.b - a.b) * f,
+      }
+    }
+    i = i + 1
+  }
+  return stops[last]
+}
+
+pub fn paletteName(p: Palette) -> string<'static> {
+  return match p {
+    Palette.Muted => "Muted"
+    Palette.VoceVista => "VoceVista"
+    Palette.Inferno => "Inferno"
+    Palette.Magma => "Magma"
+    Palette.Viridis => "Viridis"
+    Palette.Ocean => "Ocean"
+    Palette.Grayscale => "Grayscale"
+    Palette.InvertGray => "Praat light"
+  }
+}
+
+pub fn paletteIndex(p: Palette) -> u32 {
+  return match p {
+    Palette.Muted => 0
+    Palette.VoceVista => 1
+    Palette.Inferno => 2
+    Palette.Magma => 3
+    Palette.Viridis => 4
+    Palette.Ocean => 5
+    Palette.Grayscale => 6
+    Palette.InvertGray => 7
+  }
+}
+
+pub fn paletteFromIndex(idx: u32) -> Palette {
+  return match idx {
+    0 => Palette.Muted
+    1 => Palette.VoceVista
+    2 => Palette.Inferno
+    3 => Palette.Magma
+    4 => Palette.Viridis
+    5 => Palette.Ocean
+    6 => Palette.Grayscale
+    _ => Palette.InvertGray
+  }
+}
+
+pub fn nextPalette(p: Palette) -> Palette {
+  return paletteFromIndex((paletteIndex(p) + 1) % 8)
+}
+
+pub effect fn buildLut(palette: Palette) -> List<u8>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let stops: &[ColorStop] = match palette {
+    Palette.Muted => Slice.view<ColorStop>(&MUTED_STOPS, 0, 5)
+    Palette.VoceVista => Slice.view<ColorStop>(&VOCE_STOPS, 0, 5)
+    Palette.Inferno => Slice.view<ColorStop>(&INFERNO_STOPS, 0, 7)
+    Palette.Magma => Slice.view<ColorStop>(&MAGMA_STOPS, 0, 6)
+    Palette.Viridis => Slice.view<ColorStop>(&VIRIDIS_STOPS, 0, 6)
+    Palette.Ocean => Slice.view<ColorStop>(&OCEAN_STOPS, 0, 5)
+    Palette.Grayscale => Slice.view<ColorStop>(&GRAY_STOPS, 0, 2)
+    Palette.InvertGray => Slice.view<ColorStop>(&INVERT_GRAY_STOPS, 0, 2)
+  }
+  let mut lut = List<u8>.make()
+  run lut.appendRepeated(0, LUT_SIZE * 4)
+  let bytes = lut.asMutSlice()
+  let mut i: usize = 0
+  while i < LUT_SIZE {
+    let t = usize.toF32(i) / usize.toF32(LUT_SIZE - 1)
+    let c = sampleStops(stops, t)
+    bytes[i * 4 + 0] = toByte(c.r)
+    bytes[i * 4 + 1] = toByte(c.g)
+    bytes[i * 4 + 2] = toByte(c.b)
+    bytes[i * 4 + 3] = 255
+    i = i + 1
+  }
+  return move lut
+}

@@ -1,0 +1,1250 @@
+//! Platform bindings:
+//!   - macOS native: `native/audio.m` (CoreAudio + Accelerate vDSP + real filesystem library)
+//!   - Browser WASM: `glint#*` JS imports (Web Audio + IndexedDB storage) + `dsp_wasm` pure-Silk DSP
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  import dsp_wasm
+}
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.num.f64
+import silk.num.i32
+import silk.num.usize
+import silk.text.string { InvalidUtf8, String }
+
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  unsafe extern "C" fn ov_audio_refresh_devices() -> i32 as "glint#ov_audio_refresh_devices"
+  unsafe extern "C" fn ov_audio_input_count() -> i32 as "glint#ov_audio_input_count"
+  unsafe extern "C" fn ov_audio_input_id(idx: i32) -> u32 as "glint#ov_audio_input_id"
+  unsafe extern "C" fn ov_audio_input_name(idx: i32, out: ?[*]mut u8, cap: i32) -> i32 as "glint#ov_audio_input_name"
+  unsafe extern "C" fn ov_audio_output_count() -> i32 as "glint#ov_audio_output_count"
+  unsafe extern "C" fn ov_audio_output_id(idx: i32) -> u32 as "glint#ov_audio_output_id"
+  unsafe extern "C" fn ov_audio_output_name(idx: i32, out: ?[*]mut u8, cap: i32) -> i32 as "glint#ov_audio_output_name"
+  unsafe extern "C" fn ov_audio_get_input_device() -> u32 as "glint#ov_audio_get_input_device"
+  unsafe extern "C" fn ov_audio_get_output_device() -> u32 as "glint#ov_audio_get_output_device"
+  unsafe extern "C" fn ov_audio_set_input_device(devId: u32) -> i32 as "glint#ov_audio_set_input_device"
+  unsafe extern "C" fn ov_audio_set_output_device(devId: u32) -> i32 as "glint#ov_audio_set_output_device"
+
+  unsafe extern "C" fn ov_mic_start_rate(preferredRate: f64) -> i32 as "glint#ov_mic_start_rate"
+  unsafe extern "C" fn ov_mic_start() -> i32 as "glint#ov_mic_start"
+  unsafe extern "C" fn ov_mic_stop() -> () as "glint#ov_mic_stop"
+  unsafe extern "C" fn ov_mic_running() -> i32 as "glint#ov_mic_running"
+  unsafe extern "C" fn ov_mic_sample_rate() -> f64 as "glint#ov_mic_sample_rate"
+  unsafe extern "C" fn ov_mic_level_db() -> f32 as "glint#ov_mic_level_db"
+  unsafe extern "C" fn ov_mic_available() -> i32 as "glint#ov_mic_available"
+  unsafe extern "C" fn ov_mic_drain(out: ?[*]mut f32, maxCount: i32) -> i32 as "glint#ov_mic_drain"
+  unsafe extern "C" fn ov_mic_error(out: ?[*]mut u8, capacity: i32) -> i32 as "glint#ov_mic_error"
+
+  unsafe extern "C" fn ov_load_file(path: ?[*]const u8, length: usize) -> i32 as "glint#ov_load_file"
+  unsafe extern "C" fn ov_loaded_count() -> i32 as "glint#ov_loaded_count"
+  unsafe extern "C" fn ov_loaded_rate() -> f64 as "glint#ov_loaded_rate"
+  unsafe extern "C" fn ov_loaded_copy(out: ?[*]mut f32, maxCount: i32) -> i32 as "glint#ov_loaded_copy"
+  unsafe extern "C" fn ov_loaded_name(out: ?[*]mut u8, capacity: i32) -> i32 as "glint#ov_loaded_name"
+
+  unsafe extern "C" fn ov_play_range(
+    samples: ?[*]const f32,
+    totalCount: i32,
+    sampleRate: f64,
+    startSec: f64,
+    endSec: f64,
+    loop: i32,
+  ) -> i32 as "glint#ov_play_range"
+  unsafe extern "C" fn ov_play_stop() -> () as "glint#ov_play_stop"
+  unsafe extern "C" fn ov_play_is_playing() -> i32 as "glint#ov_play_is_playing"
+  unsafe extern "C" fn ov_play_take_finished() -> i32 as "glint#ov_play_take_finished"
+  unsafe extern "C" fn ov_play_position() -> f64 as "glint#ov_play_position"
+  unsafe extern "C" fn ov_play_set_volume(volume: f32) -> () as "glint#ov_play_set_volume"
+  unsafe extern "C" fn ov_play_set_speed(speed: f32) -> () as "glint#ov_play_set_speed"
+  unsafe extern "C" fn ov_play_get_speed() -> f32 as "glint#ov_play_get_speed"
+  unsafe extern "C" fn ov_scrub_begin(samples: ?[*]const f32, totalCount: i32, sampleRate: f64, centerSec: f64) -> () as "glint#ov_scrub_begin"
+  unsafe extern "C" fn ov_scrub_move(centerSec: f64) -> () as "glint#ov_scrub_move"
+  unsafe extern "C" fn ov_scrub_stop() -> () as "glint#ov_scrub_stop"
+
+  unsafe extern "C" fn ov_export_wav(
+    path: ?[*]const u8,
+    pathLen: usize,
+    samples: ?[*]const f32,
+    count: i32,
+    sampleRate: i32,
+  ) -> i32 as "glint#ov_export_wav"
+
+  unsafe extern "C" fn ov_lib_scan_tree(
+    expandedLines: ?[*]const u8,
+    expandedLen: usize,
+    notesDir: ?[*]const u8,
+    notesDirLen: usize,
+    activeRefPath: ?[*]const u8,
+    activeRefLen: usize,
+    sortMode: i32,
+  ) -> i32 as "glint#ov_lib_scan_tree"
+  unsafe extern "C" fn ov_lib_tree_meta(
+    idx: i32,
+    outIsDir: ?[*]mut i32,
+    outDepth: ?[*]mut i32,
+    outExpanded: ?[*]mut i32,
+    outRating: ?[*]mut i32,
+    outStarred: ?[*]mut i32,
+    outScore: ?[*]mut i32,
+  ) -> () as "glint#ov_lib_tree_meta"
+  unsafe extern "C" fn ov_lib_tree_scores(
+    idx: i32,
+    outOverall: ?[*]mut i32,
+    outPitch: ?[*]mut i32,
+    outSize: ?[*]mut i32,
+    outWeight: ?[*]mut i32,
+    outVowel: ?[*]mut i32,
+    outVer: ?[*]mut i32,
+  ) -> () as "glint#ov_lib_tree_scores"
+  unsafe extern "C" fn ov_lib_tree_str(idx: i32, field: i32, out: ?[*]mut u8, cap: i32) -> i32 as "glint#ov_lib_tree_str"
+  unsafe extern "C" fn ov_lib_create_folder(
+    parentRel: ?[*]const u8,
+    parentLen: usize,
+    folderName: ?[*]const u8,
+    nameLen: usize,
+    outRel: ?[*]mut u8,
+    outCap: i32,
+  ) -> i32 as "glint#ov_lib_create_folder"
+  unsafe extern "C" fn ov_lib_reveal_dir(relDir: ?[*]const u8, relDirLen: usize) -> () as "glint#ov_lib_reveal_dir"
+  unsafe extern "C" fn ov_lib_reveal_entry(
+    parentRel: ?[*]const u8,
+    parentLen: usize,
+    name: ?[*]const u8,
+    nameLen: usize,
+  ) -> () as "glint#ov_lib_reveal_entry"
+  unsafe extern "C" fn ov_lib_save_wav(
+    relDir: ?[*]const u8,
+    relDirLen: usize,
+    desiredName: ?[*]const u8,
+    nameLen: usize,
+    overwriteExisting: i32,
+    samples: ?[*]const f32,
+    count: i32,
+    sampleRate: i32,
+    score: i32,
+    outFileName: ?[*]mut u8,
+    outNameCap: i32,
+    outFullPath: ?[*]mut u8,
+    outPathCap: i32,
+  ) -> i32 as "glint#ov_lib_save_wav"
+  unsafe extern "C" fn ov_lib_rename_entry(
+    parentRel: ?[*]const u8,
+    parentLen: usize,
+    oldName: ?[*]const u8,
+    oldLen: usize,
+    newName: ?[*]const u8,
+    newLen: usize,
+    isDir: i32,
+    outNewName: ?[*]mut u8,
+    outNameCap: i32,
+    outNewRel: ?[*]mut u8,
+    outRelCap: i32,
+    outFullPath: ?[*]mut u8,
+    outPathCap: i32,
+  ) -> i32 as "glint#ov_lib_rename_entry"
+  unsafe extern "C" fn ov_lib_move_entry(
+    srcParentRel: ?[*]const u8,
+    srcParentLen: usize,
+    name: ?[*]const u8,
+    nameLen: usize,
+    dstFolderRel: ?[*]const u8,
+    dstFolderLen: usize,
+    isDir: i32,
+    outNewRel: ?[*]mut u8,
+    outRelCap: i32,
+    outFullPath: ?[*]mut u8,
+    outPathCap: i32,
+  ) -> i32 as "glint#ov_lib_move_entry"
+  unsafe extern "C" fn ov_lib_update_meta(
+    relDir: ?[*]const u8,
+    relDirLen: usize,
+    fileName: ?[*]const u8,
+    fnLen: usize,
+    rating: i32,
+    starred: i32,
+    score: i32,
+    scoreRef: ?[*]const u8,
+    scoreRefLen: usize,
+    comment: ?[*]const u8,
+    commentLen: usize,
+  ) -> i32 as "glint#ov_lib_update_meta"
+  unsafe extern "C" fn ov_lib_update_scores(
+    relDir: ?[*]const u8,
+    relDirLen: usize,
+    fileName: ?[*]const u8,
+    fnLen: usize,
+    scoreRef: ?[*]const u8,
+    scoreRefLen: usize,
+    overall: i32,
+    pitch: i32,
+    size: i32,
+    weight: i32,
+    vowel: i32,
+    ver: i32,
+  ) -> i32 as "glint#ov_lib_update_scores"
+  unsafe extern "C" fn ov_lib_delete_entry(
+    parentRel: ?[*]const u8,
+    parentLen: usize,
+    name: ?[*]const u8,
+    nameLen: usize,
+    isDir: i32,
+  ) -> i32 as "glint#ov_lib_delete_entry"
+  unsafe extern "C" fn ov_lib_get_notes(out: ?[*]mut u8, cap: i32) -> i32 as "glint#ov_lib_get_notes"
+  unsafe extern "C" fn ov_lib_set_notes(relDir: ?[*]const u8, relDirLen: usize, notes: ?[*]const u8, notesLen: usize) -> i32 as "glint#ov_lib_set_notes"
+} else {
+  unsafe extern "C" fn ov_audio_refresh_devices() -> i32
+  unsafe extern "C" fn ov_audio_input_count() -> i32
+  unsafe extern "C" fn ov_audio_input_id(idx: i32) -> u32
+  unsafe extern "C" fn ov_audio_input_name(idx: i32, out: ?[*]mut u8, cap: i32) -> i32
+  unsafe extern "C" fn ov_audio_output_count() -> i32
+  unsafe extern "C" fn ov_audio_output_id(idx: i32) -> u32
+  unsafe extern "C" fn ov_audio_output_name(idx: i32, out: ?[*]mut u8, cap: i32) -> i32
+  unsafe extern "C" fn ov_audio_get_input_device() -> u32
+  unsafe extern "C" fn ov_audio_get_output_device() -> u32
+  unsafe extern "C" fn ov_audio_set_input_device(devId: u32) -> i32
+  unsafe extern "C" fn ov_audio_set_output_device(devId: u32) -> i32
+
+  unsafe extern "C" fn ov_mic_start_rate(preferredRate: f64) -> i32
+  unsafe extern "C" fn ov_mic_start() -> i32
+  unsafe extern "C" fn ov_mic_stop() -> ()
+  unsafe extern "C" fn ov_mic_running() -> i32
+  unsafe extern "C" fn ov_mic_sample_rate() -> f64
+  unsafe extern "C" fn ov_mic_level_db() -> f32
+  unsafe extern "C" fn ov_mic_available() -> i32
+  unsafe extern "C" fn ov_mic_drain(out: ?[*]mut f32, maxCount: i32) -> i32
+  unsafe extern "C" fn ov_mic_error(out: ?[*]mut u8, capacity: i32) -> i32
+
+  unsafe extern "C" fn ov_load_file(path: ?[*]const u8, length: usize) -> i32
+  unsafe extern "C" fn ov_loaded_count() -> i32
+  unsafe extern "C" fn ov_loaded_rate() -> f64
+  unsafe extern "C" fn ov_loaded_copy(out: ?[*]mut f32, maxCount: i32) -> i32
+  unsafe extern "C" fn ov_loaded_name(out: ?[*]mut u8, capacity: i32) -> i32
+
+  unsafe extern "C" fn ov_play_range(
+    samples: ?[*]const f32,
+    totalCount: i32,
+    sampleRate: f64,
+    startSec: f64,
+    endSec: f64,
+    loop: i32,
+  ) -> i32
+  unsafe extern "C" fn ov_play_stop() -> ()
+  unsafe extern "C" fn ov_play_is_playing() -> i32
+  unsafe extern "C" fn ov_play_take_finished() -> i32
+  unsafe extern "C" fn ov_play_position() -> f64
+  unsafe extern "C" fn ov_play_set_volume(volume: f32) -> ()
+  unsafe extern "C" fn ov_play_set_speed(speed: f32) -> ()
+  unsafe extern "C" fn ov_play_get_speed() -> f32
+  unsafe extern "C" fn ov_scrub_begin(samples: ?[*]const f32, totalCount: i32, sampleRate: f64, centerSec: f64) -> ()
+  unsafe extern "C" fn ov_scrub_move(centerSec: f64) -> ()
+  unsafe extern "C" fn ov_scrub_stop() -> ()
+
+  unsafe extern "C" fn ov_export_wav(
+    path: ?[*]const u8,
+    pathLen: usize,
+    samples: ?[*]const f32,
+    count: i32,
+    sampleRate: i32,
+  ) -> i32
+
+  unsafe extern "C" fn ov_compute_columns_db(
+    samples: ?[*]const f32,
+    sampleCount: i32,
+    firstCentre: i32,
+    hop: i32,
+    numColumns: i32,
+    window: ?[*]const f32,
+    windowSize: i32,
+    coherentGain: f32,
+    dbFloor: f32,
+    outBins: i32,
+    outDb: ?[*]mut f32,
+  ) -> ()
+
+  unsafe extern "C" fn ov_columns_to_rgba(
+    data: ?[*]const f32,
+    colOffset: i32,
+    cols: i32,
+    bins: i32,
+    floorDb: f32,
+    ceilingDb: f32,
+    rgba: ?[*]mut u8,
+  ) -> ()
+
+  unsafe extern "C" fn ov_autocorr_fft(
+    input: ?[*]const f32,
+    inputLen: i32,
+    fftSize: i32,
+    outAcf: ?[*]mut f64,
+    outLen: i32,
+  ) -> ()
+
+  unsafe extern "C" fn ov_resample_preemph(
+    src: ?[*]const f32,
+    srcLen: i32,
+    srcRate: f64,
+    centreSec: f64,
+    dstRate: f64,
+    preemphHz: f64,
+    dst: ?[*]mut f64,
+    n: i32,
+  ) -> f64
+
+  unsafe extern "C" fn ov_harmonic_h1_h2(
+    samples: ?[*]const f32,
+    sampleCount: i32,
+    sampleRate: f64,
+    centreSec: f64,
+    f0: f64,
+  ) -> f64
+
+  unsafe extern "C" fn ov_compute_ltas(
+    samples: ?[*]const f32,
+    sampleCount: i32,
+    sampleRate: f64,
+    voicedTimes: ?[*]const f64,
+    numVoiced: i32,
+    outBins: ?[*]mut f32,
+    numBins: i32,
+    fMin: f64,
+    fMax: f64,
+  ) -> i32
+
+  unsafe extern "C" fn ov_lib_scan_tree(
+    expandedLines: ?[*]const u8,
+    expandedLen: usize,
+    notesDir: ?[*]const u8,
+    notesDirLen: usize,
+    activeRefPath: ?[*]const u8,
+    activeRefLen: usize,
+    sortMode: i32,
+  ) -> i32
+  unsafe extern "C" fn ov_lib_tree_meta(
+    idx: i32,
+    outIsDir: ?[*]mut i32,
+    outDepth: ?[*]mut i32,
+    outExpanded: ?[*]mut i32,
+    outRating: ?[*]mut i32,
+    outStarred: ?[*]mut i32,
+    outScore: ?[*]mut i32,
+  ) -> ()
+  unsafe extern "C" fn ov_lib_tree_scores(
+    idx: i32,
+    outOverall: ?[*]mut i32,
+    outPitch: ?[*]mut i32,
+    outSize: ?[*]mut i32,
+    outWeight: ?[*]mut i32,
+    outVowel: ?[*]mut i32,
+    outVer: ?[*]mut i32,
+  ) -> ()
+  unsafe extern "C" fn ov_lib_tree_str(idx: i32, field: i32, out: ?[*]mut u8, cap: i32) -> i32
+  unsafe extern "C" fn ov_lib_create_folder(
+    parentRel: ?[*]const u8,
+    parentLen: usize,
+    folderName: ?[*]const u8,
+    nameLen: usize,
+    outRel: ?[*]mut u8,
+    outCap: i32,
+  ) -> i32
+  unsafe extern "C" fn ov_lib_reveal_dir(relDir: ?[*]const u8, relDirLen: usize) -> ()
+  unsafe extern "C" fn ov_lib_reveal_entry(
+    parentRel: ?[*]const u8,
+    parentLen: usize,
+    name: ?[*]const u8,
+    nameLen: usize,
+  ) -> ()
+  unsafe extern "C" fn ov_lib_save_wav(
+    relDir: ?[*]const u8,
+    relDirLen: usize,
+    desiredName: ?[*]const u8,
+    nameLen: usize,
+    overwriteExisting: i32,
+    samples: ?[*]const f32,
+    count: i32,
+    sampleRate: i32,
+    score: i32,
+    outFileName: ?[*]mut u8,
+    outNameCap: i32,
+    outFullPath: ?[*]mut u8,
+    outPathCap: i32,
+  ) -> i32
+  unsafe extern "C" fn ov_lib_rename_entry(
+    parentRel: ?[*]const u8,
+    parentLen: usize,
+    oldName: ?[*]const u8,
+    oldLen: usize,
+    newName: ?[*]const u8,
+    newLen: usize,
+    isDir: i32,
+    outNewName: ?[*]mut u8,
+    outNameCap: i32,
+    outNewRel: ?[*]mut u8,
+    outRelCap: i32,
+    outFullPath: ?[*]mut u8,
+    outPathCap: i32,
+  ) -> i32
+  unsafe extern "C" fn ov_lib_move_entry(
+    srcParentRel: ?[*]const u8,
+    srcParentLen: usize,
+    name: ?[*]const u8,
+    nameLen: usize,
+    dstFolderRel: ?[*]const u8,
+    dstFolderLen: usize,
+    isDir: i32,
+    outNewRel: ?[*]mut u8,
+    outRelCap: i32,
+    outFullPath: ?[*]mut u8,
+    outPathCap: i32,
+  ) -> i32
+  unsafe extern "C" fn ov_lib_update_meta(
+    relDir: ?[*]const u8,
+    relDirLen: usize,
+    fileName: ?[*]const u8,
+    fnLen: usize,
+    rating: i32,
+    starred: i32,
+    score: i32,
+    scoreRef: ?[*]const u8,
+    scoreRefLen: usize,
+    comment: ?[*]const u8,
+    commentLen: usize,
+  ) -> i32
+  unsafe extern "C" fn ov_lib_update_scores(
+    relDir: ?[*]const u8,
+    relDirLen: usize,
+    fileName: ?[*]const u8,
+    fnLen: usize,
+    scoreRef: ?[*]const u8,
+    scoreRefLen: usize,
+    overall: i32,
+    pitch: i32,
+    size: i32,
+    weight: i32,
+    vowel: i32,
+    ver: i32,
+  ) -> i32
+  unsafe extern "C" fn ov_lib_delete_entry(
+    parentRel: ?[*]const u8,
+    parentLen: usize,
+    name: ?[*]const u8,
+    nameLen: usize,
+    isDir: i32,
+  ) -> i32
+  unsafe extern "C" fn ov_lib_get_notes(out: ?[*]mut u8, cap: i32) -> i32
+  unsafe extern "C" fn ov_lib_set_notes(relDir: ?[*]const u8, relDirLen: usize, notes: ?[*]const u8, notesLen: usize) -> i32
+}
+
+pub struct AudioDeviceInfo {
+  pub id: u32,
+  pub name: String,
+}
+
+pub struct LoadedAudio {
+  pub name: String,
+  pub sampleRate: f64,
+  pub samples: List<f32>,
+}
+
+effect fn copyUtf8Lossy(bytes: &[u8]) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match move run String.copyUtf8(bytes) {
+    Result<String, InvalidUtf8>.Success { value } => move value
+    Result<String, InvalidUtf8>.Failure { error } => {
+      drop error
+      String.make()
+    }
+  }
+}
+
+pub fn micStart() -> bool {
+  return unsafe ov_mic_start() != 0
+}
+
+pub fn micStartAt(preferredRate: f64) -> bool {
+  return unsafe ov_mic_start_rate(preferredRate) != 0
+}
+
+pub fn micStop() -> () {
+  unsafe ov_mic_stop()
+}
+
+pub fn micRunning() -> bool {
+  return unsafe ov_mic_running() != 0
+}
+
+pub fn micSampleRate() -> f64 {
+  return unsafe ov_mic_sample_rate()
+}
+
+pub fn micLevelDb() -> f32 {
+  return unsafe ov_mic_level_db()
+}
+
+pub effect fn micError() -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut buf: [u8; 256] = [0; 256]
+  let len = unsafe ov_mic_error(Pointer.fromMutSlice(&mut buf), 256)
+  if len <= 0 {
+    return String.make()
+  }
+  return run copyUtf8Lossy(Slice.view<u8>(&buf, 0, i32.toUsize(len)))
+}
+
+/// Appends any newly captured microphone samples onto `dst`. Returns count appended.
+pub effect fn micDrainInto(dst: &mut List<f32>) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let avail = unsafe ov_mic_available()
+  if avail <= 0 {
+    return 0
+  }
+  let mut count = i32.toUsize(avail)
+  if count > 32768 {
+    count = 32768
+  }
+  let oldLen = dst.length()
+  run dst.appendRepeated(0.0, count)
+  let slice = dst.asMutSlice()
+  let view = Slice.viewMut<f32>(move slice, oldLen, count)
+  let got = unsafe ov_mic_drain(Pointer.fromMutSlice(move view), usize.toI32(count))
+  let gotU = if got > 0 { i32.toUsize(got) } else { 0 }
+  if gotU < count {
+    dst.truncate(oldLen + gotU)
+  }
+  return gotU
+}
+
+/// Decodes any CoreAudio-supported audio file (WAV, MP3, M4A, FLAC, AIFF) to mono f32.
+pub effect fn loadAudioFile(path: string) -> Option<LoadedAudio>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let ok = unsafe ov_load_file(Pointer.fromSlice(String.utf8Bytes(path)), String.byteLength(path))
+  if ok == 0 {
+    return Option<LoadedAudio>.None
+  }
+  let countI = unsafe ov_loaded_count()
+  if countI <= 0 {
+    return Option<LoadedAudio>.None
+  }
+  let count = i32.toUsize(countI)
+  let rate = unsafe ov_loaded_rate()
+  let mut samples = List<f32>.make()
+  run samples.appendRepeated(0.0, count)
+  let copied = unsafe ov_loaded_copy(Pointer.fromMutSlice(samples.asMutSlice()), countI)
+  if copied <= 0 {
+    return Option<LoadedAudio>.None
+  }
+  let copiedU = i32.toUsize(copied)
+  if copiedU < count {
+    samples.truncate(copiedU)
+  }
+  let mut nameBuf: [u8; 512] = [0; 512]
+  let nameLen = unsafe ov_loaded_name(Pointer.fromMutSlice(&mut nameBuf), 512)
+  let name = if nameLen > 0 {
+    run copyUtf8Lossy(Slice.view<u8>(&nameBuf, 0, i32.toUsize(nameLen)))
+  } else {
+    run String.copy("Audio")
+  }
+  return Option<LoadedAudio>.some(LoadedAudio { name: move name, sampleRate: rate, samples: move samples })
+}
+
+pub fn playRange(samples: &[f32], sampleRate: f64, startSec: f64, endSec: f64, loopPlay: bool) -> bool {
+  if samples.length == 0 {
+    return false
+  }
+  return unsafe ov_play_range(
+    Pointer.fromSlice(samples),
+    usize.toI32(samples.length),
+    sampleRate,
+    startSec,
+    endSec,
+    if loopPlay { 1 } else { 0 },
+  ) != 0
+}
+
+pub fn playStop() -> () {
+  unsafe ov_play_stop()
+}
+
+pub fn isPlaying() -> bool {
+  return unsafe ov_play_is_playing() != 0
+}
+
+pub fn takeFinished() -> bool {
+  return unsafe ov_play_take_finished() != 0
+}
+
+pub fn playPosition() -> f64 {
+  return unsafe ov_play_position()
+}
+
+pub fn setVolume(volume: f32) -> () {
+  unsafe ov_play_set_volume(volume)
+}
+
+pub fn setPlaySpeed(speed: f32) -> () {
+  unsafe ov_play_set_speed(speed)
+}
+
+pub fn getPlaySpeed() -> f32 {
+  return unsafe ov_play_get_speed()
+}
+
+pub fn scrubBegin(samples: &[f32], sampleRate: f64, centerSec: f64) -> () {
+  if samples.length == 0 || sampleRate <= 0.0 {
+    return ()
+  }
+  unsafe ov_scrub_begin(Pointer.fromSlice(samples), usize.toI32(samples.length), sampleRate, centerSec)
+}
+
+pub fn scrubMove(centerSec: f64) -> () {
+  unsafe ov_scrub_move(centerSec)
+}
+
+pub fn scrubStop() -> () {
+  unsafe ov_scrub_stop()
+}
+
+pub fn exportWav(path: string, samples: &[f32], sampleRate: f64) -> bool {
+  if samples.length == 0 {
+    return false
+  }
+  return unsafe ov_export_wav(
+    Pointer.fromSlice(String.utf8Bytes(path)),
+    String.byteLength(path),
+    Pointer.fromSlice(samples),
+    usize.toI32(samples.length),
+    f64.toI32(sampleRate),
+  ) != 0
+}
+
+pub fn computeColumnsDbNative(
+  samples: &[f32],
+  firstCentre: i32,
+  hop: i32,
+  numColumns: i32,
+  window: &[f32],
+  coherentGain: f32,
+  dbFloor: f32,
+  outBins: i32,
+  outDb: &mut [f32],
+) -> () {
+  if numColumns <= 0 || outBins <= 0 || window.length == 0 {
+    return ()
+  }
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    dsp_wasm.computeColumnsDb(samples, firstCentre, hop, numColumns, window, coherentGain, dbFloor, outBins, &mut outDb)
+  } else {
+    unsafe ov_compute_columns_db(
+      Pointer.fromSlice(samples),
+      usize.toI32(samples.length),
+      firstCentre,
+      hop,
+      numColumns,
+      Pointer.fromSlice(window),
+      usize.toI32(window.length),
+      coherentGain,
+      dbFloor,
+      outBins,
+      Pointer.fromMutSlice(move outDb),
+    )
+  }
+}
+
+pub fn columnsToRgbaNative(
+  data: &[f32],
+  colOffset: usize,
+  cols: usize,
+  bins: usize,
+  floorDb: f32,
+  ceilingDb: f32,
+  rgba: &mut [u8],
+) -> () {
+  if cols == 0 || bins == 0 || data.length == 0 || rgba.length < cols * bins * 4 {
+    return ()
+  }
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    dsp_wasm.columnsToRgba(data, colOffset, cols, bins, floorDb, ceilingDb, &mut rgba)
+  } else {
+    unsafe ov_columns_to_rgba(
+      Pointer.fromSlice(data),
+      usize.toI32(colOffset),
+      usize.toI32(cols),
+      usize.toI32(bins),
+      floorDb,
+      ceilingDb,
+      Pointer.fromMutSlice(move rgba),
+    )
+  }
+}
+
+pub fn autocorrFftNative(input: &[f32], fftSize: i32, outAcf: &mut [f64]) -> () {
+  if input.length == 0 || outAcf.length == 0 {
+    return ()
+  }
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    dsp_wasm.autocorrFft(input, fftSize, &mut outAcf)
+  } else {
+    let outLen = usize.toI32(outAcf.length)
+    unsafe ov_autocorr_fft(
+      Pointer.fromSlice(input),
+      usize.toI32(input.length),
+      fftSize,
+      Pointer.fromMutSlice(move outAcf),
+      outLen,
+    )
+  }
+}
+
+pub fn resamplePreEmphNative(
+  src: &[f32],
+  srcRate: f64,
+  centreSec: f64,
+  dstRate: f64,
+  preemphHz: f64,
+  dst: &mut [f64],
+) -> f64 {
+  if src.length == 0 || dst.length == 0 {
+    return -120.0
+  }
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    return dsp_wasm.resamplePreEmph(src, srcRate, centreSec, dstRate, preemphHz, &mut dst)
+  } else {
+    let n = usize.toI32(dst.length)
+    return unsafe ov_resample_preemph(
+      Pointer.fromSlice(src),
+      usize.toI32(src.length),
+      srcRate,
+      centreSec,
+      dstRate,
+      preemphHz,
+      Pointer.fromMutSlice(move dst),
+      n,
+    )
+  }
+}
+
+pub fn harmonicH1H2Native(samples: &[f32], sampleRate: f64, centreSec: f64, f0: f64) -> f64 {
+  if samples.length == 0 || f0 < 40.0 {
+    return 0.0
+  }
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    return dsp_wasm.harmonicH1H2(samples, sampleRate, centreSec, f0)
+  } else {
+    return unsafe ov_harmonic_h1_h2(
+      Pointer.fromSlice(samples),
+      usize.toI32(samples.length),
+      sampleRate,
+      centreSec,
+      f0,
+    )
+  }
+}
+
+pub fn computeLtasNative(
+  samples: &[f32],
+  sampleRate: f64,
+  voicedTimes: &[f64],
+  outBins: &mut [f32],
+  fMin: f64,
+  fMax: f64,
+) -> bool {
+  if samples.length == 0 || voicedTimes.length == 0 || outBins.length < 2 {
+    return false
+  }
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    return dsp_wasm.computeLtas(samples, sampleRate, voicedTimes, &mut outBins, fMin, fMax)
+  } else {
+    let numBins = usize.toI32(outBins.length)
+    return unsafe ov_compute_ltas(
+      Pointer.fromSlice(samples),
+      usize.toI32(samples.length),
+      sampleRate,
+      Pointer.fromSlice(voicedTimes),
+      usize.toI32(voicedTimes.length),
+      Pointer.fromMutSlice(move outBins),
+      numBins,
+      fMin,
+      fMax,
+    ) != 0
+  }
+}
+
+// ============================================================================
+// IDE-Style Real-Filesystem Explorer Tree (~/Documents/Overtone Library/)
+// ============================================================================
+
+pub const SORT_ALPHA: i32 = 0
+pub const SORT_OVERALL: i32 = 1
+pub const SORT_PITCH: i32 = 2
+pub const SORT_SIZE: i32 = 3
+pub const SORT_WEIGHT: i32 = 4
+pub const SORT_VOWEL: i32 = 5
+pub const SCORE_VERSION: i32 = 2
+
+pub struct LibTreeNode {
+  pub idx: usize,
+  pub isDir: bool,
+  pub depth: u32,
+  pub expanded: bool,
+  pub rating: i32,
+  pub starred: bool,
+  /// Active display score for the current sort mode (-1 if not scored yet, else 0..100)
+  pub score: i32,
+  pub scoreOverall: i32,
+  pub scorePitch: i32,
+  pub scoreSize: i32,
+  pub scoreWeight: i32,
+  pub scoreVowel: i32,
+  pub scoreVer: i32,
+  /// Pre-formatted score badge text (e.g. `"87%"` or `""` when unscored)
+  pub scoreText: String,
+  /// Real folder name or real filename on disk
+  pub name: String,
+  /// Extension-free display name for audio files (or folder name for dirs)
+  pub displayName: String,
+  /// Relative path inside `~/Documents/Overtone Library/`
+  pub relPath: String,
+  /// Relative path of parent folder (`""` for root)
+  pub parentRel: String,
+  pub fullPath: String,
+  pub modified: String,
+  pub comment: String,
+}
+
+pub struct LibTreeListing {
+  pub nodes: List<LibTreeNode>,
+  pub notes: String,
+}
+
+pub struct SavedClipResult {
+  pub ok: bool,
+  pub filename: String,
+  pub fullPath: String,
+}
+
+pub struct RenameEntryResult {
+  pub ok: bool,
+  pub newName: String,
+  pub newRel: String,
+  pub fullPath: String,
+}
+
+pub struct MoveEntryResult {
+  pub ok: bool,
+  pub newRel: String,
+  pub fullPath: String,
+}
+
+effect fn formatIntPct(score: i32) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if score < 0 {
+    return String.make()
+  }
+  let mut v = score
+  if v > 100 { v = 100 }
+  let mut s = String.make()
+  if v == 100 {
+    run s.append("100%")
+    return move s
+  }
+  let tens = v / 10
+  let ones = v % 10
+  let digits: [u8; 10] = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57]
+  let mut buf: [u8; 4] = [0; 4]
+  let mut len: usize = 0
+  if tens > 0 {
+    buf[len] = digits[i32.toUsize(tens)]
+    len = len + 1
+  }
+  buf[len] = digits[i32.toUsize(ones)]
+  len = len + 1
+  buf[len] = 37 // '%'
+  len = len + 1
+  return run copyUtf8Lossy(Slice.view<u8>(&buf, 0, len))
+}
+
+pub effect fn libScanTree(expandedLines: string, notesDir: string, activeRefPath: string, sortMode: i32) -> LibTreeListing
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = unsafe ov_lib_scan_tree(
+    Pointer.fromSlice(String.utf8Bytes(expandedLines)),
+    String.byteLength(expandedLines),
+    Pointer.fromSlice(String.utf8Bytes(notesDir)),
+    String.byteLength(notesDir),
+    Pointer.fromSlice(String.utf8Bytes(activeRefPath)),
+    String.byteLength(activeRefPath),
+    sortMode,
+  )
+  let mut nodes = List<LibTreeNode>.make()
+  let mut buf: [u8; 1024] = [0; 1024]
+  let mut i: i32 = 0
+  while i < count {
+    let mut isDirArr: [i32; 1] = [0]
+    let mut depthArr: [i32; 1] = [0]
+    let mut expArr: [i32; 1] = [0]
+    let mut ratingArr: [i32; 1] = [0]
+    let mut starArr: [i32; 1] = [0]
+    let mut scoreArr: [i32; 1] = [-1]
+    unsafe ov_lib_tree_meta(
+      i,
+      Pointer.fromMutSlice(&mut isDirArr),
+      Pointer.fromMutSlice(&mut depthArr),
+      Pointer.fromMutSlice(&mut expArr),
+      Pointer.fromMutSlice(&mut ratingArr),
+      Pointer.fromMutSlice(&mut starArr),
+      Pointer.fromMutSlice(&mut scoreArr),
+    )
+    let mut ovArr: [i32; 1] = [-1]
+    let mut piArr: [i32; 1] = [-1]
+    let mut szArr: [i32; 1] = [-1]
+    let mut wtArr: [i32; 1] = [-1]
+    let mut vwArr: [i32; 1] = [-1]
+    let mut verArr: [i32; 1] = [0]
+    unsafe ov_lib_tree_scores(
+      i,
+      Pointer.fromMutSlice(&mut ovArr),
+      Pointer.fromMutSlice(&mut piArr),
+      Pointer.fromMutSlice(&mut szArr),
+      Pointer.fromMutSlice(&mut wtArr),
+      Pointer.fromMutSlice(&mut vwArr),
+      Pointer.fromMutSlice(&mut verArr),
+    )
+    let l0 = unsafe ov_lib_tree_str(i, 0, Pointer.fromMutSlice(&mut buf), 1024)
+    let name = if l0 > 0 { run copyUtf8Lossy(Slice.view<u8>(&buf, 0, i32.toUsize(l0))) } else { String.make() }
+    let l1 = unsafe ov_lib_tree_str(i, 1, Pointer.fromMutSlice(&mut buf), 1024)
+    let relPath = if l1 > 0 { run copyUtf8Lossy(Slice.view<u8>(&buf, 0, i32.toUsize(l1))) } else { String.make() }
+    let l2 = unsafe ov_lib_tree_str(i, 2, Pointer.fromMutSlice(&mut buf), 1024)
+    let parentRel = if l2 > 0 { run copyUtf8Lossy(Slice.view<u8>(&buf, 0, i32.toUsize(l2))) } else { String.make() }
+    let l3 = unsafe ov_lib_tree_str(i, 3, Pointer.fromMutSlice(&mut buf), 1024)
+    let fullPath = if l3 > 0 { run copyUtf8Lossy(Slice.view<u8>(&buf, 0, i32.toUsize(l3))) } else { String.make() }
+    let l4 = unsafe ov_lib_tree_str(i, 4, Pointer.fromMutSlice(&mut buf), 1024)
+    let modified = if l4 > 0 { run copyUtf8Lossy(Slice.view<u8>(&buf, 0, i32.toUsize(l4))) } else { String.make() }
+    let l5 = unsafe ov_lib_tree_str(i, 5, Pointer.fromMutSlice(&mut buf), 1024)
+    let comment = if l5 > 0 { run copyUtf8Lossy(Slice.view<u8>(&buf, 0, i32.toUsize(l5))) } else { String.make() }
+    let l6 = unsafe ov_lib_tree_str(i, 6, Pointer.fromMutSlice(&mut buf), 1024)
+    let displayName = if l6 > 0 { run copyUtf8Lossy(Slice.view<u8>(&buf, 0, i32.toUsize(l6))) } else { run String.copy(String.view(&name)) }
+
+    let sc = if sortMode == SORT_PITCH {
+      piArr[0]
+    } else if sortMode == SORT_SIZE {
+      szArr[0]
+    } else if sortMode == SORT_WEIGHT {
+      wtArr[0]
+    } else if sortMode == SORT_VOWEL {
+      vwArr[0]
+    } else {
+      ovArr[0]
+    }
+    let scoreText = run formatIntPct(sc)
+    run nodes.append(LibTreeNode {
+      idx: i32.toUsize(i),
+      isDir: isDirArr[0] != 0,
+      depth: if depthArr[0] > 0 { i32.toU32(depthArr[0]) } else { 0 },
+      expanded: expArr[0] != 0,
+      rating: ratingArr[0],
+      starred: starArr[0] != 0,
+      score: sc,
+      scoreOverall: ovArr[0],
+      scorePitch: piArr[0],
+      scoreSize: szArr[0],
+      scoreWeight: wtArr[0],
+      scoreVowel: vwArr[0],
+      scoreVer: verArr[0],
+      scoreText: move scoreText,
+      name: move name,
+      displayName: move displayName,
+      relPath: move relPath,
+      parentRel: move parentRel,
+      fullPath: move fullPath,
+      modified: move modified,
+      comment: move comment,
+    })
+    i = i + 1
+  }
+  let notes = run libGetNotes()
+  return LibTreeListing { nodes: move nodes, notes: move notes }
+}
+
+pub effect fn libCreateFolder(parentRel: string, folderName: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut buf: [u8; 1024] = [0; 1024]
+  let ok = unsafe ov_lib_create_folder(
+    Pointer.fromSlice(String.utf8Bytes(parentRel)),
+    String.byteLength(parentRel),
+    Pointer.fromSlice(String.utf8Bytes(folderName)),
+    String.byteLength(folderName),
+    Pointer.fromMutSlice(&mut buf),
+    1024,
+  )
+  if ok == 0 {
+    return String.make()
+  }
+  let mut len: usize = 0
+  while len < 1024 && buf[len] != 0 {
+    len = len + 1
+  }
+  return run copyUtf8Lossy(Slice.view<u8>(&buf, 0, len))
+}
+
+pub fn libRevealDir(relDir: string) -> () {
+  unsafe ov_lib_reveal_dir(Pointer.fromSlice(String.utf8Bytes(relDir)), String.byteLength(relDir))
+}
+
+pub fn libRevealEntry(parentRel: string, name: string) -> () {
+  unsafe ov_lib_reveal_entry(
+    Pointer.fromSlice(String.utf8Bytes(parentRel)),
+    String.byteLength(parentRel),
+    Pointer.fromSlice(String.utf8Bytes(name)),
+    String.byteLength(name),
+  )
+}
+
+pub effect fn libSaveWav(
+  relDir: string,
+  desiredName: string,
+  overwriteExisting: bool,
+  samples: &[f32],
+  sampleRate: f64,
+  score: i32,
+) -> SavedClipResult
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if samples.length == 0 || sampleRate <= 0.0 {
+    return SavedClipResult { ok: false, filename: String.make(), fullPath: String.make() }
+  }
+  let mut nameBuf: [u8; 512] = [0; 512]
+  let mut pathBuf: [u8; 1024] = [0; 1024]
+  let ok = unsafe ov_lib_save_wav(
+    Pointer.fromSlice(String.utf8Bytes(relDir)),
+    String.byteLength(relDir),
+    Pointer.fromSlice(String.utf8Bytes(desiredName)),
+    String.byteLength(desiredName),
+    if overwriteExisting { 1 } else { 0 },
+    Pointer.fromSlice(samples),
+    usize.toI32(samples.length),
+    f64.toI32(sampleRate),
+    score,
+    Pointer.fromMutSlice(&mut nameBuf),
+    512,
+    Pointer.fromMutSlice(&mut pathBuf),
+    1024,
+  )
+  if ok == 0 {
+    return SavedClipResult { ok: false, filename: String.make(), fullPath: String.make() }
+  }
+  let mut nLen: usize = 0
+  while nLen < 512 && nameBuf[nLen] != 0 { nLen = nLen + 1 }
+  let mut pLen: usize = 0
+  while pLen < 1024 && pathBuf[pLen] != 0 { pLen = pLen + 1 }
+  let fnStr = run copyUtf8Lossy(Slice.view<u8>(&nameBuf, 0, nLen))
+  let fpStr = run copyUtf8Lossy(Slice.view<u8>(&pathBuf, 0, pLen))
+  return SavedClipResult { ok: true, filename: move fnStr, fullPath: move fpStr }
+}
+
+pub effect fn libRenameEntry(parentRel: string, oldName: string, newName: string, isDir: bool) -> RenameEntryResult
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut nameBuf: [u8; 512] = [0; 512]
+  let mut relBuf: [u8; 1024] = [0; 1024]
+  let mut pathBuf: [u8; 1024] = [0; 1024]
+  let ok = unsafe ov_lib_rename_entry(
+    Pointer.fromSlice(String.utf8Bytes(parentRel)),
+    String.byteLength(parentRel),
+    Pointer.fromSlice(String.utf8Bytes(oldName)),
+    String.byteLength(oldName),
+    Pointer.fromSlice(String.utf8Bytes(newName)),
+    String.byteLength(newName),
+    if isDir { 1 } else { 0 },
+    Pointer.fromMutSlice(&mut nameBuf),
+    512,
+    Pointer.fromMutSlice(&mut relBuf),
+    1024,
+    Pointer.fromMutSlice(&mut pathBuf),
+    1024,
+  )
+  if ok == 0 {
+    return RenameEntryResult { ok: false, newName: String.make(), newRel: String.make(), fullPath: String.make() }
+  }
+  let mut nLen: usize = 0
+  while nLen < 512 && nameBuf[nLen] != 0 { nLen = nLen + 1 }
+  let mut rLen: usize = 0
+  while rLen < 1024 && relBuf[rLen] != 0 { rLen = rLen + 1 }
+  let mut pLen: usize = 0
+  while pLen < 1024 && pathBuf[pLen] != 0 { pLen = pLen + 1 }
+  let fnStr = run copyUtf8Lossy(Slice.view<u8>(&nameBuf, 0, nLen))
+  let relStr = run copyUtf8Lossy(Slice.view<u8>(&relBuf, 0, rLen))
+  let fpStr = run copyUtf8Lossy(Slice.view<u8>(&pathBuf, 0, pLen))
+  return RenameEntryResult { ok: true, newName: move fnStr, newRel: move relStr, fullPath: move fpStr }
+}
+
+pub effect fn libMoveEntry(srcParentRel: string, name: string, dstFolderRel: string, isDir: bool) -> MoveEntryResult
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut relBuf: [u8; 1024] = [0; 1024]
+  let mut pathBuf: [u8; 1024] = [0; 1024]
+  let ok = unsafe ov_lib_move_entry(
+    Pointer.fromSlice(String.utf8Bytes(srcParentRel)),
+    String.byteLength(srcParentRel),
+    Pointer.fromSlice(String.utf8Bytes(name)),
+    String.byteLength(name),
+    Pointer.fromSlice(String.utf8Bytes(dstFolderRel)),
+    String.byteLength(dstFolderRel),
+    if isDir { 1 } else { 0 },
+    Pointer.fromMutSlice(&mut relBuf),
+    1024,
+    Pointer.fromMutSlice(&mut pathBuf),
+    1024,
+  )
+  if ok == 0 {
+    return MoveEntryResult { ok: false, newRel: String.make(), fullPath: String.make() }
+  }
+  let mut rLen: usize = 0
+  while rLen < 1024 && relBuf[rLen] != 0 { rLen = rLen + 1 }
+  let mut pLen: usize = 0
+  while pLen < 1024 && pathBuf[pLen] != 0 { pLen = pLen + 1 }
+  let relStr = run copyUtf8Lossy(Slice.view<u8>(&relBuf, 0, rLen))
+  let fpStr = run copyUtf8Lossy(Slice.view<u8>(&pathBuf, 0, pLen))
+  return MoveEntryResult { ok: true, newRel: move relStr, fullPath: move fpStr }
+}
+
+pub fn libUpdateMeta(
+  relDir: string,
+  filename: string,
+  rating: i32,
+  starred: bool,
+  score: i32,
+  scoreRef: string,
+  comment: string,
+) -> bool {
+  return unsafe ov_lib_update_meta(
+    Pointer.fromSlice(String.utf8Bytes(relDir)),
+    String.byteLength(relDir),
+    Pointer.fromSlice(String.utf8Bytes(filename)),
+    String.byteLength(filename),
+    rating,
+    if starred { 1 } else { 0 },
+    score,
+    Pointer.fromSlice(String.utf8Bytes(scoreRef)),
+    String.byteLength(scoreRef),
+    Pointer.fromSlice(String.utf8Bytes(comment)),
+    String.byteLength(comment),
+  ) != 0
+}
+
+pub fn libUpdateScores(
+  relDir: string,
+  filename: string,
+  scoreRef: string,
+  overall: i32,
+  pitch: i32,
+  size: i32,
+  weight: i32,
+  vowel: i32,
+  ver: i32,
+) -> bool {
+  return unsafe ov_lib_update_scores(
+    Pointer.fromSlice(String.utf8Bytes(relDir)),
+    String.byteLength(relDir),
+    Pointer.fromSlice(String.utf8Bytes(filename)),
+    String.byteLength(filename),
+    Pointer.fromSlice(String.utf8Bytes(scoreRef)),
+    String.byteLength(scoreRef),
+    overall,
+    pitch,
+    size,
+    weight,
+    vowel,
+    ver,
+  ) != 0
+}
+
+pub fn libDeleteEntry(parentRel: string, name: string, isDir: bool) -> bool {
+  return unsafe ov_lib_delete_entry(
+    Pointer.fromSlice(String.utf8Bytes(parentRel)),
+    String.byteLength(parentRel),
+    Pointer.fromSlice(String.utf8Bytes(name)),
+    String.byteLength(name),
+    if isDir { 1 } else { 0 },
+  ) != 0
+}
+
+pub effect fn libGetNotes() -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut buf: [u8; 8192] = [0; 8192]
+  let len = unsafe ov_lib_get_notes(Pointer.fromMutSlice(&mut buf), 8192)
+  if len <= 0 {
+    return String.make()
+  }
+  return run copyUtf8Lossy(Slice.view<u8>(&buf, 0, i32.toUsize(len)))
+}
+
+pub fn libSetNotes(relDir: string, notes: string) -> bool {
+  return unsafe ov_lib_set_notes(
+    Pointer.fromSlice(String.utf8Bytes(relDir)),
+    String.byteLength(relDir),
+    Pointer.fromSlice(String.utf8Bytes(notes)),
+    String.byteLength(notes),
+  ) != 0
+}
+
+pub fn refreshAudioDevices() -> () {
+  drop unsafe ov_audio_refresh_devices()
+}
+
+pub effect fn listInputDevices() -> List<AudioDeviceInfo>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = unsafe ov_audio_input_count()
+  let mut out = List<AudioDeviceInfo>.make()
+  let mut buf: [u8; 256] = [0; 256]
+  let mut i: i32 = 0
+  while i < count {
+    let id = unsafe ov_audio_input_id(i)
+    let len = unsafe ov_audio_input_name(i, Pointer.fromMutSlice(&mut buf), 256)
+    let name = if len > 0 { run copyUtf8Lossy(Slice.view<u8>(&buf, 0, i32.toUsize(len))) } else { String.make() }
+    run out.append(AudioDeviceInfo { id: id, name: move name })
+    i = i + 1
+  }
+  return move out
+}
+
+pub effect fn listOutputDevices() -> List<AudioDeviceInfo>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = unsafe ov_audio_output_count()
+  let mut out = List<AudioDeviceInfo>.make()
+  let mut buf: [u8; 256] = [0; 256]
+  let mut i: i32 = 0
+  while i < count {
+    let id = unsafe ov_audio_output_id(i)
+    let len = unsafe ov_audio_output_name(i, Pointer.fromMutSlice(&mut buf), 256)
+    let name = if len > 0 { run copyUtf8Lossy(Slice.view<u8>(&buf, 0, i32.toUsize(len))) } else { String.make() }
+    run out.append(AudioDeviceInfo { id: id, name: move name })
+    i = i + 1
+  }
+  return move out
+}
+
+pub fn getInputDevice() -> u32 {
+  return unsafe ov_audio_get_input_device()
+}
+
+pub fn getOutputDevice() -> u32 {
+  return unsafe ov_audio_get_output_device()
+}
+
+pub fn setInputDevice(devId: u32) -> bool {
+  return unsafe ov_audio_set_input_device(devId) != 0
+}
+
+pub fn setOutputDevice(devId: u32) -> bool {
+  return unsafe ov_audio_set_output_device(devId) != 0
+}

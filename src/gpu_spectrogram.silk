@@ -1,0 +1,797 @@
+//! Zero-copy WebGPU spectrogram renderer — direct 1:1 Silk port of
+//! `voiceapp/packages/components/src/spectrogram/renderer.ts` + `shader.wgsl.ts`.
+//!
+//! Renders on the app's own `CanvasGpu` device into a `GpuCanvas` (BGRA IOSurface swap chain
+//! on macOS — zero CPU readback!), presented directly into a Loom `h.surface(...)` node.
+//!
+//! Three GPU texture tiers (coarsest to finest):
+//!   - `coarse`: whole recording at fixed hop (preallocated in-place during live recording)
+//!   - `live`:   recent growing end at fine hop (sliding 8192-column window during recording)
+//!   - `sharp`:  on-demand high-resolution 8192-pt FFT for the visible viewport range
+//! Hardware bilinear filtering + 256-entry RGBA8 LUT colormap (`VOCE_STOPS` by default).
+import audio_native
+import colormap {
+  DEFAULT_DISPLAY_CEILING_DB,
+  DEFAULT_DISPLAY_FLOOR_DB,
+  LUT_SIZE,
+  Palette,
+  buildLut
+}
+import dsp { ColumnData }
+import viewport { MIN_LOG_FREQ_HZ, Viewport }
+import ui_tree_window.canvas_frames { CanvasPresenter }
+import ui_tree_window.gpu_canvas { CANVAS_FORMAT_BGRA, CanvasGpu, GpuCanvas }
+import webgpu.descriptors {
+  BindGroupDescriptor,
+  BindGroupEntry,
+  BindGroupLayoutDescriptor,
+  BindGroupLayoutEntry,
+  BufferBindingLayout,
+  BufferDescriptor,
+  Color,
+  ColorTargetState,
+  Extent3D,
+  FragmentState,
+  MultisampleState,
+  Origin3D,
+  PipelineLayoutDescriptor,
+  PrimitiveState,
+  RenderPassColorAttachment,
+  RenderPassDescriptor,
+  RenderPipelineDescriptor,
+  SamplerBindingLayout,
+  SamplerDescriptor,
+  TexelCopyBufferLayout,
+  TexelCopyTextureInfo,
+  TextureBindingLayout,
+  TextureDescriptor,
+  TextureViewDescriptor,
+  VertexState
+}
+import webgpu.resources as gpu
+import webgpu.resources { BindGroup, BindGroupLayout, Buffer, RenderPipeline, Sampler, Texture }
+import webgpu.runtime { GpuError }
+import webgpu_sys.generated_webgpu as flags
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import silk.num.u8
+import silk.num.usize
+
+/// Exact `voiceapp` Uniforms float count (25 floats = 100 bytes).
+const UNIFORM_FLOATS: usize = 25
+const UNIFORM_BYTES: usize = 100
+
+/// Max texture dimension we clamp to (safe on every WebGPU adapter).
+const MAX_TEX_DIM: usize = 8192
+
+/// Live tier width in columns (~65 s at hop 384, 48 kHz).
+pub const LIVE_TEXTURE_COLUMNS: usize = 8192
+
+/// WebGPU spectrogram shader with exact texel-center vertical bin alignment:
+/// Row `r = bins - 1 - b` stores bin `b` (freq = b * hzPerBin), whose texel center is
+/// `(r + 0.5) / bins = 1.0 - (freq / (bins * hzPerBin)) - 0.5 / bins`.
+const SPECTROGRAM_WGSL: &'static [u8] = b"struct Uniforms {\n  t0: f32,\n  t1: f32,\n  f0: f32,\n  f1: f32,\n  coarseT0: f32,\n  coarseT1: f32,\n  liveT0: f32,\n  liveT1: f32,\n  sharpT0: f32,\n  sharpT1: f32,\n  coarseMaxHz: f32,\n  liveMaxHz: f32,\n  sharpMaxHz: f32,\n  scaleMode: f32,\n  liveValid: f32,\n  sharpValid: f32,\n  brightness: f32,\n  contrast: f32,\n  minLogFreq: f32,\n  coarseUScale: f32,\n  coarseUOffset: f32,\n  liveUScale: f32,\n  liveUOffset: f32,\n  sharpUScale: f32,\n  sharpUOffset: f32,\n};\n@group(0) @binding(0) var<uniform> u: Uniforms;\n@group(0) @binding(1) var samp: sampler;\n@group(0) @binding(2) var coarseTex: texture_2d<f32>;\n@group(0) @binding(3) var sharpTex: texture_2d<f32>;\n@group(0) @binding(4) var lutTex: texture_2d<f32>;\n@group(0) @binding(5) var liveTex: texture_2d<f32>;\nstruct VertexOut {\n  @builtin(position) pos: vec4f,\n  @location(0) uv: vec2f,\n};\n@vertex fn vs(@builtin(vertex_index) idx: u32) -> VertexOut {\n  var xy = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));\n  let p = xy[idx];\n  var out: VertexOut;\n  out.pos = vec4f(p, 0.0, 1.0);\n  out.uv = vec2f((p.x + 1.0) * 0.5, (p.y + 1.0) * 0.5);\n  return out;\n}\nfn normToFreq(norm: f32) -> f32 {\n  if (u.scaleMode > 0.5) {\n    let lo = log(max(u.f0, u.minLogFreq));\n    let hi = log(max(u.f1, u.minLogFreq * 2.0));\n    return exp(lo + norm * (hi - lo));\n  }\n  return u.f0 + norm * (u.f1 - u.f0);\n}\nfn sampleTier(tex: texture_2d<f32>, time: f32, freq: f32, tierT0: f32, tierT1: f32, tierMaxHz: f32, uScale: f32, uOffset: f32) -> vec2f {\n  let span = tierT1 - tierT0;\n  let x = select(0.0, (time - tierT0) / span, span > 0.0);\n  let y = freq / tierMaxHz;\n  let halfTexel = 0.5 / max(f32(textureDimensions(tex).y), 1.0);\n  let uTex = clamp(x, 0.0, 1.0) * uScale + uOffset;\n  let vTex = clamp(1.0 - y - halfTexel, halfTexel, 1.0 - halfTexel);\n  let v = textureSample(tex, samp, vec2f(uTex, vTex)).r;\n  let inside = span > 0.0 && time >= tierT0 && time <= tierT1 && y <= 1.0 && y >= 0.0;\n  return vec2f(v, select(0.0, 1.0, inside));\n}\n@fragment fn fs(in: VertexOut) -> @location(0) vec4f {\n  let time = u.t0 + in.uv.x * (u.t1 - u.t0);\n  let freq = normToFreq(in.uv.y);\n  let s = sampleTier(sharpTex, time, freq, u.sharpT0, u.sharpT1, u.sharpMaxHz, u.sharpUScale, u.sharpUOffset);\n  let l = sampleTier(liveTex, time, freq, u.liveT0, u.liveT1, u.liveMaxHz, u.liveUScale, u.liveUOffset);\n  let c = sampleTier(coarseTex, time, freq, u.coarseT0, u.coarseT1, u.coarseMaxHz, u.coarseUScale, u.coarseUOffset);\n  let useSharp = u.sharpValid > 0.5 && s.y > 0.5;\n  let useLive = !useSharp && u.liveValid > 0.5 && l.y > 0.5;\n  var value = c.x;\n  var have = c.y;\n  if (useLive) { value = l.x; have = 1.0; }\n  if (useSharp) { value = s.x; have = 1.0; }\n  var v = clamp((value + u.brightness) * u.contrast, 0.0, 1.0);\n  let rgb = textureSample(lutTex, samp, vec2f(v, 0.5)).rgb;\n  return vec4f(rgb * step(0.5, have), 1.0);\n}\n"
+
+struct Tier {
+  texture: Texture,
+  t0: f64,
+  t1: f64,
+  maxHz: f64,
+  valid: bool,
+  uScale: f32,
+  uOffset: f32,
+}
+
+fn uScaleOf(written: usize, width: usize) -> f32 {
+  if written <= 1 || width == 0 {
+    return 0.0
+  }
+  return usize.toF32(written - 1) / usize.toF32(width)
+}
+
+fn uOffsetOf(width: usize) -> f32 {
+  if width == 0 {
+    return 0.5
+  }
+  return 0.5 / usize.toF32(width)
+}
+
+fn writeF32Le(dst: &mut [u8], index: usize, value: f32) -> () {
+  let bits = f32.toBits(value)
+  let base = index * 4
+  dst[base + 0] = u32.toU8(bits & 0xFF)
+  dst[base + 1] = u32.toU8(u32.shiftRight(bits, 8) & 0xFF)
+  dst[base + 2] = u32.toU8(u32.shiftRight(bits, 16) & 0xFF)
+  dst[base + 3] = u32.toU8(u32.shiftRight(bits, 24) & 0xFF)
+}
+
+effect fn createRgbaTexture(device: &CanvasGpu, width: u32, height: u32, label: &[u8]) -> Texture
+  ! GpuError {
+  let mut size = Extent3D.default()
+  size.setWidth(if width == 0 { 1 } else { width })
+  size.setHeight(if height == 0 { 1 } else { height })
+  size.setDepthOrArrayLayers(1)
+  let mut desc = TextureDescriptor.default().withLabel(label)
+  desc.setSize(size)
+  desc.setFormat(flags.WGPUTextureFormat_RGBA8Unorm)
+  desc.setDimension(flags.WGPUTextureDimension_2D)
+  desc.setMipLevelCount(1)
+  desc.setSampleCount(1)
+  desc.setUsage(flags.WGPUTextureUsage_TextureBinding | flags.WGPUTextureUsage_CopyDst)
+  return run gpu.createTexture(&device.device, &desc)
+}
+
+effect fn emptyTier(device: &CanvasGpu, label: &[u8]) -> Tier
+  ! GpuError {
+  let tex = run createRgbaTexture(device, 1, 1, label)
+  return Tier {
+    texture: move tex,
+    t0: 0.0,
+    t1: 0.0,
+    maxHz: 1.0,
+    valid: false,
+    uScale: 0.0,
+    uOffset: 0.5,
+  }
+}
+
+effect fn createLutTexture(device: &CanvasGpu, palette: Palette) -> Texture
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let lut = run buildLut(palette)
+  let tex = run createRgbaTexture(device, usize.toU32(LUT_SIZE), 1, b"spectrogram lut")
+  let dest = TexelCopyTextureInfo.default().withTexture(&tex)
+  let mut layout = TexelCopyBufferLayout.default()
+  layout.setBytesPerRow(usize.toU32(LUT_SIZE * 4))
+  layout.setRowsPerImage(1)
+  let mut extent = Extent3D.default()
+  extent.setWidth(usize.toU32(LUT_SIZE))
+  extent.setHeight(1)
+  extent.setDepthOrArrayLayers(1)
+  device.queue.writeTexture(&dest, lut.asSlice(), &layout, &extent)
+  return move tex
+}
+
+/// Converts column-major dB values to RGBA8 rows (row 0 = highest bin, last row = DC) in -O3 native C.
+effect fn columnsToRgba(
+  data: &[f32],
+  colOffset: usize,
+  cols: usize,
+  bins: usize,
+  floorDb: f32,
+  ceilingDb: f32,
+  scratch: &mut List<u8>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let needed = cols * bins * 4
+  if scratch.length() < needed {
+    scratch.clear()
+    run scratch.appendRepeated(0, needed)
+  }
+  audio_native.columnsToRgbaNative(data, colOffset, cols, bins, floorDb, ceilingDb, scratch.asMutSlice())
+}
+
+pub struct GpuSpectrogram {
+  gpu: CanvasGpu,
+  pub canvas: GpuCanvas,
+  pipeline: RenderPipeline,
+  bindGroupLayout: BindGroupLayout,
+  sampler: Sampler,
+  uniformBuffer: Buffer,
+  lutTexture: Texture,
+  coarse: Tier,
+  live: Tier,
+  sharp: Tier,
+  coarseStepSec: f64,
+  coarseHzPerBin: f64,
+  sharpStepSec: f64,
+  bindGroup: BindGroup,
+
+  recordingWidth: usize,
+  recordingWritten: usize,
+  liveWidth: usize,
+  liveWritten: usize,
+  liveFirstColumn: usize,
+  liveHop: usize,
+  liveSampleRate: f64,
+
+  pub brightness: f32,
+  pub contrast: f32,
+  pub displayFloorDb: f32,
+  pub displayCeilingDb: f32,
+  pub palette: Palette,
+  uploadScratch: List<u8>,
+}
+
+effect fn makeBindGroupLayout(device: &CanvasGpu) -> BindGroupLayout
+  ! GpuError {
+  let mut e0 = BindGroupLayoutEntry.default()
+  e0.setBinding(0)
+  e0.setVisibility(flags.WGPUShaderStage_Fragment)
+  let mut b0 = BufferBindingLayout.default()
+  b0.setType(flags.WGPUBufferBindingType_Uniform)
+  b0.setMinBindingSize(usize.toU64(UNIFORM_BYTES))
+  e0.setBuffer(b0)
+
+  let mut e1 = BindGroupLayoutEntry.default()
+  e1.setBinding(1)
+  e1.setVisibility(flags.WGPUShaderStage_Fragment)
+  let mut s1 = SamplerBindingLayout.default()
+  s1.setType(flags.WGPUSamplerBindingType_Filtering)
+  e1.setSampler(s1)
+
+  let mut tLayout = TextureBindingLayout.default()
+  tLayout.setSampleType(flags.WGPUTextureSampleType_Float)
+  tLayout.setViewDimension(flags.WGPUTextureViewDimension_2D)
+  tLayout.setMultisampled(false)
+
+  let mut e2 = BindGroupLayoutEntry.default()
+  e2.setBinding(2)
+  e2.setVisibility(flags.WGPUShaderStage_Fragment)
+  e2.setTexture(tLayout)
+
+  let mut e3 = BindGroupLayoutEntry.default()
+  e3.setBinding(3)
+  e3.setVisibility(flags.WGPUShaderStage_Fragment)
+  e3.setTexture(tLayout)
+
+  let mut e4 = BindGroupLayoutEntry.default()
+  e4.setBinding(4)
+  e4.setVisibility(flags.WGPUShaderStage_Fragment)
+  e4.setTexture(tLayout)
+
+  let mut e5 = BindGroupLayoutEntry.default()
+  e5.setBinding(5)
+  e5.setVisibility(flags.WGPUShaderStage_Fragment)
+  e5.setTexture(tLayout)
+
+  let entries = [e0, e1, e2, e3, e4, e5]
+  let desc = BindGroupLayoutDescriptor.default()
+    .withLabel(b"spectrogram bgl")
+    .withEntries(&entries)
+  return run gpu.createBindGroupLayout(&device.device, &desc)
+}
+
+effect fn buildBindGroup(
+  device: &CanvasGpu,
+  layout: &BindGroupLayout,
+  uniformBuffer: &Buffer,
+  sampler: &Sampler,
+  coarse: &Texture,
+  sharp: &Texture,
+  lut: &Texture,
+  live: &Texture,
+) -> BindGroup
+  ! GpuError {
+  let coarseView = run coarse.createView(&TextureViewDescriptor.default())
+  let sharpView = run sharp.createView(&TextureViewDescriptor.default())
+  let lutView = run lut.createView(&TextureViewDescriptor.default())
+  let liveView = run live.createView(&TextureViewDescriptor.default())
+
+  let mut e0 = BindGroupEntry.default().withBuffer(uniformBuffer)
+  e0.setBinding(0)
+  e0.setOffset(0)
+  e0.setSize(usize.toU64(UNIFORM_BYTES))
+
+  let mut e1 = BindGroupEntry.default().withSampler(sampler)
+  e1.setBinding(1)
+
+  let mut e2 = BindGroupEntry.default().withTextureView(&coarseView)
+  e2.setBinding(2)
+
+  let mut e3 = BindGroupEntry.default().withTextureView(&sharpView)
+  e3.setBinding(3)
+
+  let mut e4 = BindGroupEntry.default().withTextureView(&lutView)
+  e4.setBinding(4)
+
+  let mut e5 = BindGroupEntry.default().withTextureView(&liveView)
+  e5.setBinding(5)
+
+  let entries = [e0, e1, e2, e3, e4, e5]
+  let desc = BindGroupDescriptor.default()
+    .withLabel(b"spectrogram bg")
+    .withLayout(layout)
+    .withEntries(&entries)
+  return run gpu.createBindGroup(&device.device, &desc)
+}
+
+impl GpuSpectrogram {
+  pub effect fn open(presenter: &CanvasPresenter, width: u32, height: u32) -> GpuSpectrogram
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    let device = run CanvasGpu.open()
+    let mut canvas = run GpuCanvas.makeIn(&device, presenter, width, height, CANVAS_FORMAT_BGRA)
+    canvas.opaque = true
+
+    let shader = run gpu.createShaderModule(&device.device, b"spectrogram wgsl", SPECTROGRAM_WGSL)
+    let bgl = run makeBindGroupLayout(&device)
+    let bglRefs = [bgl.reference()]
+    let plDesc = PipelineLayoutDescriptor.default()
+      .withLabel(b"spectrogram pipeline layout")
+      .withBindGroupLayouts(&bglRefs)
+    let pipelineLayout = run gpu.createPipelineLayout(&device.device, &plDesc)
+
+    let vertex = VertexState.default().withModule(&shader).withEntryPoint(b"vs")
+    let mut target: ColorTargetState = ColorTargetState.default()
+    target.setFormat(canvas.format())
+    target.setWriteMask(flags.WGPUColorWriteMask_All)
+    let targets = [target]
+    let fragment = FragmentState.default().withModule(&shader).withEntryPoint(b"fs").withTargets(&targets)
+    let mut primitive: PrimitiveState = PrimitiveState.default()
+    primitive.setTopology(flags.WGPUPrimitiveTopology_TriangleList)
+    let mut multisample: MultisampleState = MultisampleState.default()
+    multisample.setCount(1)
+    let mut pipeDesc = RenderPipelineDescriptor.default()
+      .withLabel(b"spectrogram pipeline")
+      .withLayout(&pipelineLayout)
+      .withVertex(vertex)
+      .withFragment(&fragment)
+    pipeDesc.setPrimitive(primitive)
+    pipeDesc.setMultisample(multisample)
+    let pipeline = run gpu.createRenderPipeline(&device.device, &pipeDesc)
+
+    let mut sampDesc = SamplerDescriptor.default().withLabel(b"spectrogram sampler")
+    sampDesc.setMagFilter(flags.WGPUFilterMode_Linear)
+    sampDesc.setMinFilter(flags.WGPUFilterMode_Linear)
+    sampDesc.setAddressModeU(flags.WGPUAddressMode_ClampToEdge)
+    sampDesc.setAddressModeV(flags.WGPUAddressMode_ClampToEdge)
+    sampDesc.setMaxAnisotropy(1)
+    let sampler = run gpu.createSampler(&device.device, &sampDesc)
+
+    let bufDesc = BufferDescriptor.make(
+      b"spectrogram uniforms",
+      usize.toU64(UNIFORM_BYTES),
+      flags.WGPUBufferUsage_Uniform | flags.WGPUBufferUsage_CopyDst,
+      false,
+    )
+    let uniformBuffer = run gpu.createBuffer(&device.device, &bufDesc)
+
+    let lutTexture = run createLutTexture(&device, Palette.Muted)
+    let coarse = run emptyTier(&device, b"coarse empty")
+    let live = run emptyTier(&device, b"live empty")
+    let sharp = run emptyTier(&device, b"sharp empty")
+
+    let bindGroup = run buildBindGroup(
+      &device,
+      &bgl,
+      &uniformBuffer,
+      &sampler,
+      &coarse.texture,
+      &sharp.texture,
+      &lutTexture,
+      &live.texture,
+    )
+
+    return GpuSpectrogram {
+      gpu: move device,
+      canvas: move canvas,
+      pipeline: move pipeline,
+      bindGroupLayout: move bgl,
+      sampler: move sampler,
+      uniformBuffer: move uniformBuffer,
+      lutTexture: move lutTexture,
+      coarse: move coarse,
+      live: move live,
+      sharp: move sharp,
+      coarseStepSec: 0.0,
+      coarseHzPerBin: 0.0,
+      sharpStepSec: 0.0,
+      bindGroup: move bindGroup,
+      recordingWidth: 0,
+      recordingWritten: 0,
+      liveWidth: 0,
+      liveWritten: 0,
+      liveFirstColumn: 0,
+      liveHop: 0,
+      liveSampleRate: 0.0,
+      brightness: 0.0,
+      contrast: 1.0,
+      displayFloorDb: DEFAULT_DISPLAY_FLOOR_DB,
+      displayCeilingDb: DEFAULT_DISPLAY_CEILING_DB,
+      palette: Palette.Muted,
+      uploadScratch: List<u8>.make(),
+    }
+  }
+
+  pub fn surfaceId(self: &Self) -> u32 {
+    return self.canvas.surface()
+  }
+
+  pub fn width(self: &Self) -> u32 {
+    return self.canvas.width()
+  }
+
+  pub fn height(self: &Self) -> u32 {
+    return self.canvas.height()
+  }
+
+  effect fn rebuildBindGroup(self: &mut Self) -> ()
+    ! GpuError {
+    self.bindGroup = run buildBindGroup(
+      &self.gpu,
+      &self.bindGroupLayout,
+      &self.uniformBuffer,
+      &self.sampler,
+      &self.coarse.texture,
+      &self.sharp.texture,
+      &self.lutTexture,
+      &self.live.texture,
+    )
+  }
+
+  pub effect fn resize(self: &mut Self, width: u32, height: u32) -> bool
+    ! GpuError | OutOfMemoryError {
+    let w = if width < 16 { 16 } else { width }
+    let h = if height < 16 { 16 } else { height }
+    if w == self.canvas.width() && h == self.canvas.height() {
+      return false
+    }
+    run self.canvas.resize(&self.gpu, w, h)
+    return true
+  }
+
+  pub effect fn setPalette(self: &mut Self, palette: Palette) -> ()
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    self.palette = palette
+    self.lutTexture = run createLutTexture(&self.gpu, palette)
+    run self.rebuildBindGroup()
+  }
+
+  effect fn uploadTier(self: &mut Self, columns: &ColumnData, label: &[u8]) -> Tier
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    let cols = if columns.columns > MAX_TEX_DIM { MAX_TEX_DIM } else { if columns.columns < 1 { 1 } else { columns.columns } }
+    let bins = if columns.bins < 1 { 1 } else { columns.bins }
+    let step = if columns.columns > 1 {
+      (columns.endTime - columns.startTime) / usize.toF64(columns.columns - 1)
+    } else {
+      0.0
+    }
+    let t1 = columns.startTime + usize.toF64(cols - 1) * step
+
+    run columnsToRgba(
+      columns.data.asSlice(),
+      0,
+      cols,
+      bins,
+      self.displayFloorDb,
+      self.displayCeilingDb,
+      &mut self.uploadScratch,
+    )
+
+    let tex = run createRgbaTexture(&self.gpu, usize.toU32(cols), usize.toU32(bins), label)
+    let dest = TexelCopyTextureInfo.default().withTexture(&tex)
+    let mut layout = TexelCopyBufferLayout.default()
+    layout.setBytesPerRow(usize.toU32(cols * 4))
+    layout.setRowsPerImage(usize.toU32(bins))
+    let mut extent = Extent3D.default()
+    extent.setWidth(usize.toU32(cols))
+    extent.setHeight(usize.toU32(bins))
+    extent.setDepthOrArrayLayers(1)
+    let bytes = self.uploadScratch.asSlice()
+    self.gpu.queue.writeTexture(&dest, bytes, &layout, &extent)
+
+    return Tier {
+      texture: move tex,
+      t0: columns.startTime,
+      t1: t1,
+      maxHz: usize.toF64(bins) * columns.hzPerBin,
+      valid: true,
+      uScale: uScaleOf(cols, cols),
+      uOffset: uOffsetOf(cols),
+    }
+  }
+
+  pub fn coarseCovers(
+    self: &Self,
+    vp: &Viewport,
+    desiredStepSec: f64,
+    desiredHzPerBin: f64,
+  ) -> bool {
+    if !self.coarse.valid || self.coarseStepSec <= 0.0 || self.coarseHzPerBin <= 0.0 {
+      return false
+    }
+    return vp.f1 <= self.coarse.maxHz + 1.0
+      && self.coarseHzPerBin <= desiredHzPerBin * 1.1
+      && self.coarseStepSec <= desiredStepSec * 1.25
+  }
+
+  pub fn sharpCovers(self: &Self, vp: &Viewport, desiredStepSec: f64) -> bool {
+    if !self.sharp.valid || self.sharpStepSec <= 0.0 {
+      return false
+    }
+    return vp.t0 >= self.sharp.t0 - 0.000001
+      && vp.t1 <= self.sharp.t1 + 0.000001
+      && vp.f1 <= self.sharp.maxHz + 1.0
+      && self.sharpStepSec <= desiredStepSec * 1.25
+      && desiredStepSec <= self.sharpStepSec * 3.0
+  }
+
+  pub effect fn setCoarseTier(self: &mut Self, columns: &ColumnData) -> ()
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    self.recordingWidth = 0
+    self.recordingWritten = 0
+    self.coarseStepSec = if columns.columns > 1 {
+      (columns.endTime - columns.startTime) / usize.toF64(columns.columns - 1)
+    } else {
+      0.0
+    }
+    self.coarseHzPerBin = columns.hzPerBin
+    self.coarse = run self.uploadTier(columns, b"coarse tier")
+    run self.rebuildBindGroup()
+  }
+
+  pub effect fn setSharpTier(self: &mut Self, columns: &ColumnData) -> ()
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    self.sharpStepSec = if columns.columns > 1 {
+      (columns.endTime - columns.startTime) / usize.toF64(columns.columns - 1)
+    } else {
+      0.0
+    }
+    self.sharp = run self.uploadTier(columns, b"sharp tier")
+    run self.rebuildBindGroup()
+  }
+
+  pub effect fn clearSharpTier(self: &mut Self) -> ()
+    ! GpuError {
+    self.sharpStepSec = 0.0
+    if !self.sharp.valid {
+      return ()
+    }
+    self.sharp = run emptyTier(&self.gpu, b"sharp empty")
+    run self.rebuildBindGroup()
+  }
+
+  pub effect fn beginRecordingSession(
+    self: &mut Self,
+    sampleRate: f64,
+    capSeconds: f64,
+    hop: usize,
+    windowSize: usize,
+  ) -> ()
+    ! GpuError {
+    let bins = windowSize / 2
+    let rawW = f64.toUsize(f64.ceil((capSeconds * sampleRate) / usize.toF64(hop))) + 1
+    let width = if rawW > MAX_TEX_DIM { MAX_TEX_DIM } else { if rawW < 16 { 16 } else { rawW } }
+    let tex = run createRgbaTexture(&self.gpu, usize.toU32(width), usize.toU32(bins), b"coarse recording")
+    self.coarse = Tier {
+      texture: move tex,
+      t0: 0.0,
+      t1: 0.0,
+      maxHz: usize.toF64(bins) * (sampleRate / usize.toF64(windowSize)),
+      valid: false,
+      uScale: 0.0,
+      uOffset: uOffsetOf(width),
+    }
+    self.coarseStepSec = usize.toF64(hop) / f64.max(sampleRate, 1.0)
+    self.coarseHzPerBin = sampleRate / usize.toF64(windowSize)
+    self.recordingWidth = width
+    self.recordingWritten = 0
+    self.sharpStepSec = 0.0
+    self.sharp = run emptyTier(&self.gpu, b"sharp empty")
+    run self.rebuildBindGroup()
+  }
+
+  pub effect fn appendCoarseColumns(self: &mut Self, startColumn: usize, columns: &ColumnData) -> ()
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.recordingWidth == 0 || startColumn >= self.recordingWidth || columns.columns == 0 {
+      return ()
+    }
+    let avail = self.recordingWidth - startColumn
+    let cols = if columns.columns < avail { columns.columns } else { avail }
+    if cols == 0 {
+      return ()
+    }
+    let bins = columns.bins
+    run columnsToRgba(
+      columns.data.asSlice(),
+      0,
+      cols,
+      bins,
+      self.displayFloorDb,
+      self.displayCeilingDb,
+      &mut self.uploadScratch,
+    )
+
+    let mut origin = Origin3D.default()
+    origin.setX(usize.toU32(startColumn))
+    origin.setY(0)
+    origin.setZ(0)
+    let mut dest = TexelCopyTextureInfo.default().withTexture(&self.coarse.texture)
+    dest.setOrigin(origin)
+    let mut layout = TexelCopyBufferLayout.default()
+    layout.setBytesPerRow(usize.toU32(cols * 4))
+    layout.setRowsPerImage(usize.toU32(bins))
+    let mut extent = Extent3D.default()
+    extent.setWidth(usize.toU32(cols))
+    extent.setHeight(usize.toU32(bins))
+    extent.setDepthOrArrayLayers(1)
+    self.gpu.queue.writeTexture(&dest, self.uploadScratch.asSlice(), &layout, &extent)
+
+    let newEnd = startColumn + cols
+    if newEnd > self.recordingWritten {
+      self.recordingWritten = newEnd
+    }
+    self.coarse.t1 = columns.endTime
+    self.coarse.valid = true
+    self.coarse.uScale = uScaleOf(self.recordingWritten, self.recordingWidth)
+    self.coarse.uOffset = uOffsetOf(self.recordingWidth)
+  }
+
+  pub effect fn beginLiveTier(
+    self: &mut Self,
+    sampleRate: f64,
+    hop: usize,
+    bins: usize,
+    hzPerBin: f64,
+  ) -> ()
+    ! GpuError {
+    let width = LIVE_TEXTURE_COLUMNS
+    let safeBins = if bins < 1 { 1 } else { bins }
+    let tex = run createRgbaTexture(&self.gpu, usize.toU32(width), usize.toU32(safeBins), b"live tier")
+    self.live = Tier {
+      texture: move tex,
+      t0: 0.0,
+      t1: 0.0,
+      maxHz: usize.toF64(safeBins) * hzPerBin,
+      valid: false,
+      uScale: 0.0,
+      uOffset: uOffsetOf(width),
+    }
+    self.liveWidth = width
+    self.liveWritten = 0
+    self.liveFirstColumn = 0
+    self.liveHop = hop
+    self.liveSampleRate = sampleRate
+    run self.rebuildBindGroup()
+  }
+
+  pub effect fn appendLiveColumns(self: &mut Self, startColumn: usize, columns: &ColumnData) -> ()
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.liveWidth == 0 || columns.columns == 0 {
+      return ()
+    }
+    let endCol = startColumn + columns.columns
+    if endCol > self.liveFirstColumn + self.liveWidth {
+      self.liveFirstColumn = endCol - self.liveWidth
+      self.liveWritten = 0
+    }
+    let skip: usize = if startColumn < self.liveFirstColumn {
+      self.liveFirstColumn - startColumn
+    } else {
+      0
+    }
+    let writeAt: usize = if startColumn > self.liveFirstColumn {
+      startColumn - self.liveFirstColumn
+    } else {
+      0
+    }
+    if skip >= columns.columns || writeAt >= self.liveWidth {
+      return ()
+    }
+    let remIn = columns.columns - skip
+    let remOut = self.liveWidth - writeAt
+    let cols = if remIn < remOut { remIn } else { remOut }
+    if cols == 0 {
+      return ()
+    }
+
+    let bins = columns.bins
+    run columnsToRgba(
+      columns.data.asSlice(),
+      skip,
+      cols,
+      bins,
+      self.displayFloorDb,
+      self.displayCeilingDb,
+      &mut self.uploadScratch,
+    )
+
+    let mut origin = Origin3D.default()
+    origin.setX(usize.toU32(writeAt))
+    origin.setY(0)
+    origin.setZ(0)
+    let mut dest = TexelCopyTextureInfo.default().withTexture(&self.live.texture)
+    dest.setOrigin(origin)
+    let mut layout = TexelCopyBufferLayout.default()
+    layout.setBytesPerRow(usize.toU32(cols * 4))
+    layout.setRowsPerImage(usize.toU32(bins))
+    let mut extent = Extent3D.default()
+    extent.setWidth(usize.toU32(cols))
+    extent.setHeight(usize.toU32(bins))
+    extent.setDepthOrArrayLayers(1)
+    self.gpu.queue.writeTexture(&dest, self.uploadScratch.asSlice(), &layout, &extent)
+
+    let newEnd = writeAt + cols
+    if newEnd > self.liveWritten {
+      self.liveWritten = newEnd
+    }
+    let sr = self.liveSampleRate
+    self.live.t0 = usize.toF64(self.liveFirstColumn * self.liveHop) / sr
+    if self.liveWritten > 0 {
+      self.live.t1 = usize.toF64((self.liveFirstColumn + self.liveWritten - 1) * self.liveHop) / sr
+    }
+    self.live.valid = self.liveWritten > 1
+    self.live.uScale = uScaleOf(self.liveWritten, self.liveWidth)
+    self.live.uOffset = uOffsetOf(self.liveWidth)
+  }
+
+  pub effect fn clearLiveTier(self: &mut Self) -> ()
+    ! GpuError {
+    if self.liveWidth == 0 {
+      return ()
+    }
+    self.live = run emptyTier(&self.gpu, b"live empty")
+    self.liveWidth = 0
+    self.liveWritten = 0
+    self.liveFirstColumn = 0
+    run self.rebuildBindGroup()
+  }
+
+  /// Writes the 25-float uniform buffer, renders the fullscreen spectrogram triangle,
+  /// and presents zero-copy to the window's compositor.
+  pub effect fn draw(self: &mut Self, vp: &Viewport) -> ()
+    ! GpuError | OutOfMemoryError {
+    let mut uBytes: [u8; UNIFORM_BYTES] = [0; UNIFORM_BYTES]
+    writeF32Le(&mut uBytes, 0, f64.toF32(vp.t0))
+    writeF32Le(&mut uBytes, 1, f64.toF32(vp.t1))
+    writeF32Le(&mut uBytes, 2, f64.toF32(vp.f0))
+    writeF32Le(&mut uBytes, 3, f64.toF32(vp.f1))
+    writeF32Le(&mut uBytes, 4, f64.toF32(self.coarse.t0))
+    writeF32Le(&mut uBytes, 5, f64.toF32(self.coarse.t1))
+    writeF32Le(&mut uBytes, 6, f64.toF32(self.live.t0))
+    writeF32Le(&mut uBytes, 7, f64.toF32(self.live.t1))
+    writeF32Le(&mut uBytes, 8, f64.toF32(self.sharp.t0))
+    writeF32Le(&mut uBytes, 9, f64.toF32(self.sharp.t1))
+    writeF32Le(&mut uBytes, 10, f64.toF32(self.coarse.maxHz))
+    writeF32Le(&mut uBytes, 11, f64.toF32(self.live.maxHz))
+    writeF32Le(&mut uBytes, 12, f64.toF32(self.sharp.maxHz))
+    writeF32Le(&mut uBytes, 13, if vp.isLog() { 1.0 } else { 0.0 })
+    writeF32Le(&mut uBytes, 14, if self.live.valid { 1.0 } else { 0.0 })
+    writeF32Le(&mut uBytes, 15, if self.sharp.valid { 1.0 } else { 0.0 })
+    writeF32Le(&mut uBytes, 16, self.brightness)
+    writeF32Le(&mut uBytes, 17, self.contrast)
+    writeF32Le(&mut uBytes, 18, f64.toF32(MIN_LOG_FREQ_HZ))
+    writeF32Le(&mut uBytes, 19, self.coarse.uScale)
+    writeF32Le(&mut uBytes, 20, self.coarse.uOffset)
+    writeF32Le(&mut uBytes, 21, self.live.uScale)
+    writeF32Le(&mut uBytes, 22, self.live.uOffset)
+    writeF32Le(&mut uBytes, 23, self.sharp.uScale)
+    writeF32Le(&mut uBytes, 24, self.sharp.uOffset)
+
+    self.gpu.queue.writeBuffer(&self.uniformBuffer, 0, &uBytes)
+
+    let view = run self.canvas.texture().createView(&TextureViewDescriptor.default())
+    let mut clear = Color.default()
+    clear.setR(0.02)
+    clear.setG(0.02)
+    clear.setB(0.04)
+    clear.setA(1.0)
+    let mut attachment = RenderPassColorAttachment.default().withView(&view)
+    attachment.setClearValue(clear)
+    attachment.setLoadOp(flags.WGPULoadOp_Clear)
+    attachment.setStoreOp(flags.WGPUStoreOp_Store)
+    let attachments = [attachment]
+    let passDesc = RenderPassDescriptor.default().withColorAttachments(&attachments)
+
+    let mut encoder = run gpu.createCommandEncoder(&self.gpu.device, b"spectrogram draw")
+    let mut pass = run encoder.beginRenderPass(&passDesc)
+    pass.setPipeline(&self.pipeline)
+    pass.setBindGroup(0, &self.bindGroup, &[])
+    pass.draw(3, 1, 0, 0)
+    pass.end()
+    let cmd = run encoder.finish(b"spectrogram draw")
+    self.gpu.queue.submit(&[cmd.reference()])
+    run self.canvas.present(&self.gpu)
+  }
+}

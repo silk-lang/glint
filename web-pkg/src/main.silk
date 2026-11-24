@@ -1,0 +1,368 @@
+//! Browser WASM entry point for Glint (`wasm32-unknown-unknown` + `loom-dom`).
+//!
+//! Exports `silk_ui_open` and `silk_ui_call` consumed by `silk-ui-dom.js`, driving
+//! `Runtime<Overtone, Message, Command>` + `Dom` + `WasmSpectrogram` (WebGL2).
+import dsp { COARSE_HOP, COARSE_WINDOW_SIZE, LIVE_HOP, TierUpdate, computeColumns }
+import studio { Command, Message, Overtone }
+import wasm_spec { WasmSpectrogram }
+import loom.backend { TreeError }
+import loom.runtime { Runtime, drain, pump, resize, tick }
+import loom_dom.dom { Dom }
+import loom_dom.page {
+  CALL_DEADLINE,
+  CALL_EVENT,
+  CALL_FRAMES,
+  CALL_LOCATION,
+  CALL_POST,
+  CALL_RESIZE,
+  CALL_SCRATCH,
+  CALL_START,
+  CALL_TICK,
+  CALL_VIRTUAL
+}
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.box { Box }
+import silk.mem.pointer { Pointer }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String }
+
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  unsafe extern "C" fn js_open_file_picker() -> () as "glint#open_file_picker"
+  unsafe extern "C" fn js_export_wav_download(
+    name: ?[*]const u8,
+    nameLen: usize,
+    samples: ?[*]const f32,
+    count: i32,
+    sampleRate: i32,
+  ) -> () as "glint#export_wav_download"
+}
+
+struct Unrooted {}
+
+struct Root {
+  storage: Box<GlintPage>,
+}
+
+struct GlintPage {
+  host: Runtime<Overtone, Message, Command>,
+  dom: Dom,
+  spec: WasmSpectrogram,
+  lastTime: f64,
+  root: Unrooted | Root,
+}
+
+impl GlintPage {
+  effect fn syncSpec(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let model = &mut self.host.model
+    let g = &mut self.spec
+
+    if model.gpuNeedPalette {
+      model.gpuNeedPalette = false
+      run g.setPalette(model.palette)
+      model.gpuNeedRedraw = true
+    }
+
+    g.brightness = model.brightness
+    g.contrast = model.contrast
+    g.displayFloorDb = model.displayFloorDb
+    g.displayCeilingDb = model.displayCeilingDb
+
+    if model.gpuNeedClear {
+      model.gpuNeedClear = false
+      g.clearLiveTier()
+      g.clearSharpTier()
+      g.beginRecordingSession(model.sampleRate, 60.0, COARSE_HOP, COARSE_WINDOW_SIZE)
+      model.gpuNeedRedraw = true
+    }
+
+    if model.gpuNeedBeginRec {
+      model.gpuNeedBeginRec = false
+      g.beginRecordingSession(model.sampleRate, 300.0, COARSE_HOP, COARSE_WINDOW_SIZE)
+      let probe = run computeColumns(
+        &[0.0; 16],
+        model.sampleRate,
+        0.0,
+        0.0,
+        1,
+        &model.sharpWin,
+        model.liveTracker.maxHz,
+        LIVE_HOP,
+      )
+      g.beginLiveTier(model.sampleRate, LIVE_HOP, probe.bins, probe.hzPerBin)
+      if model.samples.length() > 0 {
+        model.gpuNeedRecAppend = true
+      }
+      model.gpuNeedRedraw = true
+    }
+
+    if model.gpuNeedRecAppend {
+      model.gpuNeedRecAppend = false
+      let samples = model.samples.asSlice()
+      if let Option<TierUpdate>.Some { value: cu } = run model.coarseTracker.update(samples, model.sampleRate, &model.coarseWin) {
+        run g.appendCoarseColumns(cu.startColumn, &cu.data)
+        model.gpuNeedRedraw = true
+      }
+      if let Option<TierUpdate>.Some { value: lu } = run model.liveTracker.update(samples, model.sampleRate, &model.sharpWin) {
+        run g.appendLiveColumns(lu.startColumn, &lu.data)
+        model.gpuNeedRedraw = true
+      }
+    }
+
+    if model.gpuNeedFullReload {
+      model.gpuNeedFullReload = false
+      g.clearLiveTier()
+      g.clearSharpTier()
+      let dur = model.gpuDuration()
+      let sr = model.gpuSampleRate()
+      if dur > 0.0 {
+        let hopF = f64.max(384.0, f64.ceil((dur * sr) / 720.0))
+        let baseHop = f64.toUsize(hopF)
+        let baseMaxHz = f64.min(sr * 0.5, f64.max(10000.0, model.vp.f1 * 1.25))
+        let coarseCols = run computeColumns(
+          model.gpuSamples(),
+          sr,
+          0.0,
+          dur,
+          0,
+          &model.coarseWin,
+          baseMaxHz,
+          baseHop,
+        )
+        run g.setCoarseTier(&coarseCols)
+        model.gpuNeedRedraw = true
+      }
+    }
+
+    if model.gpuNeedSharp && !model.recording && self.lastTime >= model.sharpDueTime {
+      model.gpuNeedSharp = false
+      let dur = model.gpuDuration()
+      let sr = model.gpuSampleRate()
+      let src = model.gpuSamples()
+      if dur > 0.0 && src.length > 0 {
+        let span = f64.max(model.vp.t1 - model.vp.t0, 0.005)
+        let cssW = f32.toUsize(f32.max(200.0, f32.min(720.0, model.specRect.width())))
+        let desiredStepSec = span / usize.toF64(cssW)
+        let desiredHzPerBin = sr / usize.toF64(model.sharpWin.size)
+        if g.coarseCovers(&model.vp, desiredStepSec, desiredHzPerBin) {
+          g.clearSharpTier()
+          model.gpuNeedRedraw = true
+        } else if !g.sharpCovers(&model.vp, desiredStepSec) {
+          let margin = span * 0.25
+          let t0 = f64.max(0.0, model.vp.t0 - margin)
+          let t1 = f64.min(dur, model.vp.t1 + margin)
+          let rawCols = f64.toUsize(f64.round(usize.toF64(cssW) * ((t1 - t0) / span)))
+          let targetCols = if rawCols < 48 { 48 } else if rawCols > 720 { 720 } else { rawCols }
+          let sharpMaxHz = f64.min(sr * 0.5, f64.max(model.vp.f1 * 1.4, 10000.0))
+          let sharpCols = run computeColumns(
+            src,
+            sr,
+            t0,
+            t1,
+            targetCols,
+            &model.sharpWin,
+            sharpMaxHz,
+            0,
+          )
+          run g.setSharpTier(&sharpCols)
+          model.gpuNeedRedraw = true
+        }
+      }
+    }
+
+    if model.gpuNeedRedraw || model.gpuNeedResize {
+      model.gpuNeedRedraw = false
+      model.gpuNeedResize = false
+      g.draw(&model.vp)
+    }
+
+    // Handle browser Open File / Export WAV requests
+    if model.pendingOpenDialog {
+      model.pendingOpenDialog = false
+      static if Intrinsic.targetArchitecture() == "wasm32" {
+        unsafe js_open_file_picker()
+      }
+    }
+    if model.pendingSaveDialog {
+      model.pendingSaveDialog = false
+      let src = model.samples.asSlice()
+      if src.length > 0 {
+        let name = String.view(&model.clipName)
+        static if Intrinsic.targetArchitecture() == "wasm32" {
+          unsafe js_export_wav_download(
+            Pointer.fromSlice(String.utf8Bytes(name)),
+            String.byteLength(name),
+            Pointer.fromSlice(src),
+            usize.toI32(src.length),
+            f64.toI32(model.sampleRate),
+          )
+        }
+      }
+    }
+  }
+}
+
+effect fn openInner() -> ?*mut u8
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let model = run Overtone.init()
+  let host = Runtime<Overtone, Message, Command>.make(move model)
+  let spec = run WasmSpectrogram.open()
+  let mut storage = run Box<GlintPage>.make(
+    GlintPage { host: move host, dom: Dom.make(), spec: move spec, lastTime: 0.0, root: Unrooted {} },
+  )
+  let pinned = Pointer.fromMutRef(&mut storage.getMut()[0])
+  let mut anchor = ()
+  let fresh = unsafe Pointer.borrowMut(&mut anchor, pinned)
+  fresh.root = Root { storage: move storage }
+  return unsafe Intrinsic.pointerReinterpret<*mut GlintPage, *mut u8>(pinned)
+}
+
+effect fn unopened<E>(error: E) -> ?*mut u8 {
+  drop error
+  return Pointer.null<u8>()
+}
+
+effect fn failed<E>(error: E) -> f64 {
+  drop error
+  return -2.0
+}
+
+fn parseUint(s: string) -> u32 {
+  let bytes = String.utf8Bytes(s)
+  let mut val: u32 = 0
+  let mut i: usize = 0
+  while i < bytes.length {
+    let b = bytes[i]
+    if b >= 48 && b <= 57 {
+      val = val * 10 + u8.toU32(b - 48)
+    }
+    i = i + 1
+  }
+  return val
+}
+
+effect fn callInner(token: ?*mut u8, op: u32, a: f64, b: f64, c: f64) -> f64
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  if Pointer.isNull(token) {
+    return -2.0
+  }
+  let pointer = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(token)
+  let pinned = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut GlintPage>(pointer)
+  let mut anchor = ()
+  let page = unsafe Pointer.borrowMut(&mut anchor, pinned)
+
+  if op == CALL_START {
+    page.dom.setViewport(f64.toF32(a), f64.toF32(b))
+    page.host.time = c
+    page.lastTime = c
+    run page.host.start(&mut page.dom, c)
+    run drain<Overtone, Message, Command, OutOfMemoryError, Dom, &mut Allocator>(&mut page.host, &mut page.dom)
+    page.dom.cloning = true
+    run page.syncSpec()
+  } else if op == CALL_LOCATION {
+    drop a
+  } else if op == CALL_POST {
+    let name = run String.copy(page.dom.written(f64.toUsize(a)))
+    let payload = run String.copy(page.dom.writtenAt(f64.toUsize(a), f64.toUsize(b)))
+    let ns = String.view(&name)
+    if ns == "file_chosen" {
+      page.host.send(Message.FileChosen { path: move payload })
+      run drain<Overtone, Message, Command, OutOfMemoryError, Dom, &mut Allocator>(&mut page.host, &mut page.dom)
+      run page.syncSpec()
+    } else if ns == "global_key" {
+      // payload format: "<mods>|<key>"
+      let ps = String.view(&payload)
+      let bytes = String.utf8Bytes(ps)
+      let mut sep: usize = 0
+      while sep < bytes.length && bytes[sep] != 124 {
+        sep = sep + 1
+      }
+      if sep < bytes.length && !page.host.model.textInputFocused {
+        let mods = parseUint(String.slice(ps, 0, sep))
+        let kStr = String.slice(ps, sep + 1, bytes.length - sep - 1)
+        if page.host.model.handlesGlobalKey(kStr, mods) {
+          let kCopy = run String.copy(kStr)
+          page.host.send(Message.GlobalKeyDown { key: move kCopy, modifiers: mods })
+          run drain<Overtone, Message, Command, OutOfMemoryError, Dom, &mut Allocator>(&mut page.host, &mut page.dom)
+          run page.syncSpec()
+          return 1.0
+        }
+      }
+    } else if ns == "refresh_devices" {
+      page.host.send(Message.RefreshAudioDevices)
+      run drain<Overtone, Message, Command, OutOfMemoryError, Dom, &mut Allocator>(&mut page.host, &mut page.dom)
+    } else if ns == "redraw_spec" {
+      page.host.model.gpuNeedRedraw = true
+      run page.syncSpec()
+    }
+  } else if op == CALL_SCRATCH {
+    return usize.toF64(run page.dom.reserve(f64.toUsize(a)))
+  } else if op == CALL_EVENT {
+    page.host.time = b
+    page.lastTime = b
+    page.host.model.nowTime = b
+    run page.dom.receive(f64.toUsize(a))
+    drop run pump<Overtone, Message, Command, OutOfMemoryError, Dom, &mut Allocator>(&mut page.host, &mut page.dom)
+    run page.syncSpec()
+    if page.host.takePrevented() {
+      return 1.0
+    }
+  } else if op == CALL_TICK {
+    page.lastTime = a
+    page.host.model.nowTime = a
+    run tick<Overtone, Message, Command, OutOfMemoryError, Dom, &mut Allocator>(
+      &mut page.host,
+      &mut page.dom,
+      a,
+      b != 0.0,
+    )
+    run page.syncSpec()
+  } else if op == CALL_RESIZE {
+    page.dom.setViewport(f64.toF32(a), f64.toF32(b))
+    run resize<Overtone, Message, Command, OutOfMemoryError, Dom, &mut Allocator>(
+      &mut page.host,
+      &mut page.dom,
+      f64.toF32(a),
+      f64.toF32(b),
+    )
+    page.host.model.gpuNeedRedraw = true
+    run page.syncSpec()
+  } else if op == CALL_VIRTUAL {
+    if run page.dom.reportVirtual(f64.toUsize(a)) {
+      drop run page.host.syncVirtual(&mut page.dom)
+    }
+    run page.dom.flushVirtual()
+  } else if op == CALL_DEADLINE {
+    return page.host.nextDeadline().unwrapOr(-1.0)
+  } else if op == CALL_FRAMES {
+    if page.host.wantsFrames() {
+      return 1.0
+    }
+  }
+  return 0.0
+}
+
+export "C" fn open() -> ?*mut u8 as "silk_ui_open" {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(openInner(), unopened)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+export "C" fn call(token: ?*mut u8, op: u32, a: f64, b: f64, c: f64) -> f64 as "silk_ui_call" {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(callInner(token, op, a, b, c), failed)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+pub fn main() -> i32 {
+  return 0
+}

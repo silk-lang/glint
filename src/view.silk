@@ -1,0 +1,1978 @@
+//! Glint Loom UI built with Tailwind CSS 4.
+//!
+//! Muted light-chrome studio + darkroom spectrogram well.
+import audio_native { SORT_ALPHA, SORT_OVERALL, SORT_PITCH, SORT_SIZE, SORT_VOWEL, SORT_WEIGHT }
+import colormap { paletteIndex, paletteName }
+import formants { VOWELS_FEM, VOWELS_MASC, VOWEL_MODE_BOTH, VOWEL_MODE_FEM, VOWEL_MODE_MASC }
+import overlays { AxisTick, GuideBadge, vowelX, vowelY }
+import studio {
+  AXIS_W,
+  CTX_AUDIO,
+  CTX_LIB_SORT,
+  CTX_PALETTE,
+  CTX_SPEED,
+  DRAG_EXPLORER_SCROLL,
+  DRAG_GUIDE,
+  DRAG_NONE,
+  DRAG_OVERVIEW,
+  DRAG_OVERVIEW_LEFT,
+  DRAG_OVERVIEW_RIGHT,
+  DRAG_PAN,
+  DRAG_RESIZE_LIB,
+  DRAG_RESIZE_READOUTS,
+  DRAG_SCRUB,
+  DRAG_SELECT,
+  DRAG_TIME_RULER,
+  ExplorerRowSlot,
+  FILTER_ALL,
+  FILTER_STARRED,
+  METRICS_H,
+  Message,
+  Overtone,
+  PAD_H,
+  PHASE_LISTEN_SPEECH,
+  PHASE_PLAY_REF,
+  PHASE_REC_SPEECH,
+  PIANO_W,
+  PRACTICE_DRILL,
+  PRACTICE_OFF,
+  SET_COMPARE,
+  SLIDER_BRIGHTNESS,
+  SLIDER_CEILING_DB,
+  SLIDER_CLARITY,
+  SLIDER_CONTRAST,
+  SLIDER_FLOOR_DB,
+  SLIDER_SPEC_OPACITY,
+  SLIDER_VOLUME,
+  VOWEL_H
+}
+import view_components {
+  compactSlider,
+  paletteSwatch,
+  pctDigits,
+  toggleSwitch,
+  txt,
+  txtA
+}
+import view_overlays {
+  renderContextMenu,
+  renderDragGhost,
+  renderGuidesPopover,
+  renderSettingsModal
+}
+import loom.css
+import loom.css { percent, px }
+import loom.lib { Cursor, DefaultAction, Document, Node, Reply }
+import silk.color.rgba { Rgba }
+import silk.num.f32
+import silk.num.f64
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String }
+
+fn levelPct(db: f32) -> f32 {
+  let n = (db + 60.0) / 60.0
+  return f32.max(0.0, f32.min(1.0, n)) * 100.0
+}
+
+fn sortLabel(mode: i32) -> string<'static> {
+  if mode == SORT_OVERALL {
+    return "Match"
+  }
+  if mode == SORT_PITCH {
+    return "Pitch"
+  }
+  if mode == SORT_SIZE {
+    return "Size"
+  }
+  if mode == SORT_WEIGHT {
+    return "Wt"
+  }
+  if mode == SORT_VOWEL {
+    return "Vowel"
+  }
+  return "A–Z"
+}
+
+pub fn render(m: &Overtone, h: &Document<Message>) -> Node {
+  return h.column(
+    &[
+      h.class("w-full h-full glint-root text-[13px] select-none overflow-hidden relative"),
+      h.onPointerMove(|e| Reply<Message>.Emit { message: Message.ExplorerPointerMove { x: e.x, y: e.y } }),
+      h.onPointerUp(|_| Reply<Message>.Emit { message: Message.ExplorerPointerUp }),
+    ],
+    &[
+      renderTopBar(m, h),
+      renderToolbar(m, h),
+      renderErrorBanner(m, h),
+      h.row(
+        &[h.class("flex-1 min-h-0 overflow-hidden")],
+        &[
+          if m.showLibrary {
+            renderLibraryRail(m, h)
+          } else {
+            collapsedEdgeTab(h, true, Message.ToggleLibrary)
+          },
+          if m.showLibrary {
+            sidebarResizeHandle(m, h, false)
+          } else {
+            h.empty()
+          },
+          renderCenterStage(m, h),
+          if m.showReadouts {
+            sidebarResizeHandle(m, h, true)
+          } else {
+            h.empty()
+          },
+          if m.showReadouts {
+            renderReadoutsRail(m, h)
+          } else {
+            collapsedEdgeTab(h, false, Message.ToggleReadouts)
+          },
+        ],
+      ),
+      renderStatusBar(m, h),
+      renderGuidesPopover(m, h),
+      renderSettingsModal(m, h),
+      renderContextMenu(m, h),
+      renderDragGhost(m, h),
+    ],
+  )
+}
+
+// ============================================================================
+// Top Bar (44px)
+// ============================================================================
+
+fn topBarPadClass() -> string<'static> {
+  static if Intrinsic.targetArchitecture() != "wasm32" {
+    return "h-[44px] shrink-0 items-center pl-[78px] pr-[16px] border-b border-[#E6E6E8] bg-white gap-[20px]"
+  } else {
+    return "h-[44px] shrink-0 items-center px-[16px] border-b border-[#E6E6E8] bg-white gap-[20px]"
+  }
+}
+
+fn renderSpecSurface(m: &Overtone, h: &Document<Message>) -> Node {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    return h.box(&[h.testId("spectrogram-stage"), h.class("absolute inset-0")], &[])
+  } else {
+    if m.showSpectrogram {
+      return h.surface(m.surface, &[h.class("absolute inset-0")])
+    }
+    return h.empty()
+  }
+}
+
+fn renderTopBar(m: &Overtone, h: &Document<Message>) -> Node {
+  let barPadCls = topBarPadClass()
+  let folderTxt = if String.byteLength(String.view(&m.activeClipDir)) > 0 {
+    String.view(&m.activeClipDir)
+  } else if String.byteLength(String.view(&m.selectedFolderRel)) > 0 {
+    String.view(&m.selectedFolderRel)
+  } else {
+    "Library"
+  }
+  return h.row(
+    &[h.class(barPadCls)],
+    &[
+      txt(h, "Glint", "text-[16px] leading-[20px] font-extrabold tracking-[-0.03em] text-[#0B0B0C] shrink-0"),
+      h.row(
+        &[h.class("items-center gap-[2px] text-[13px] font-medium shrink-0")],
+        &[
+          topNavPill(h, "Practice", !m.showNotesPanel, Message.ResetView),
+          topNavPill(h, "Library", m.showLibrary, Message.ToggleLibrary),
+          topNavPill(h, "Readouts", m.showReadouts, Message.ToggleReadouts),
+          topNavPill(h, "Script", m.showNotesPanel, Message.ToggleNotesPanel),
+          topNavPill(h, "Demo", m.isDemoClip, Message.LoadDemo),
+        ],
+      ),
+      h.row(
+        &[h.class("flex-1 min-w-0 items-center justify-center gap-[7px] text-[13px] text-[#6B6B70] overflow-hidden")],
+        &[
+          txt(h, folderTxt, "truncate max-w-[140px]"),
+          txt(h, "/", "text-[#C4C4C8]"),
+          txt(h, String.view(&m.clipName), "text-[#0B0B0C] font-semibold truncate max-w-[180px]"),
+          if m.refClip.active {
+            h.row(
+              &[h.class("items-center gap-[7px] shrink-0")],
+              &[
+                txt(h, "vs", "text-[#C4C4C8]"),
+                txt(h, String.view(&m.refClip.name), "text-[#0B0B0C] font-semibold truncate max-w-[140px]"),
+                h.box(
+                  &[
+                    h.class("px-[6px] py-[2px] border border-[#E6E6E8] rounded-[4px] bg-white glint-btn-hover"),
+                    h.cursor(Cursor.Pointer),
+                    h.onClick(Message.PinReference),
+                  ],
+                  &[txt(h, "Change", "text-[11px] leading-[14px] text-[#6B6B70]")],
+                ),
+              ],
+            )
+          } else {
+            h.box(
+              &[
+                h.class("px-[6px] py-[2px] border border-[#E6E6E8] rounded-[4px] bg-white glint-btn-hover shrink-0"),
+                h.cursor(Cursor.Pointer),
+                h.onClick(Message.PinReference),
+              ],
+              &[txt(h, "Pin as ref", "text-[11px] leading-[14px] text-[#6B6B70]")],
+            )
+          },
+        ],
+      ),
+      h.row(
+        &[h.class("items-center gap-[12px] text-[13px] text-[#6B6B70] shrink-0")],
+        &[
+          topAction(h, "New", Message.NewDocument),
+          topAction(h, "Open", Message.AskOpenFile),
+          topAction(h, "Save", Message.SaveCurrentClip),
+          topAction(h, "Export WAV", Message.AskSaveWav),
+          h.box(&[h.class("w-[1px] h-[16px] bg-[#E6E6E8]")], &[]),
+          topAction(h, "Settings", Message.ToggleSettings),
+        ],
+      ),
+    ],
+  )
+}
+
+fn topNavPill(h: &Document<Message>, label: string, active: bool, msg: Message) -> Node {
+  return h.box(
+    &[
+      h.class("px-[10px] py-[5px] rounded-[6px]"),
+      h.classSelect(active, "bg-[#F1F1F2] text-[#0B0B0C]", "text-[#6B6B70] glint-btn-hover"),
+      h.cursor(Cursor.Pointer),
+      h.onClick(move msg),
+    ],
+    &[txt(h, label, "text-[13px] leading-[16px] font-medium")],
+  )
+}
+
+fn topAction(h: &Document<Message>, label: string, msg: Message) -> Node {
+  return txtA(
+    h,
+    label,
+    &[
+      h.class("text-[13px] leading-[16px] text-[#6B6B70] hover:text-[#0B0B0C]"),
+      h.cursor(Cursor.Pointer),
+      h.onClick(move msg),
+    ],
+  )
+}
+
+// ============================================================================
+// Toolbar (40px) — 3 States: Normal / Recording / Drill or Echo
+// ============================================================================
+
+fn renderToolbar(m: &Overtone, h: &Document<Message>) -> Node {
+  if m.practiceMode != PRACTICE_OFF {
+    return renderDrillToolbar(m, h)
+  }
+  if m.recording {
+    return renderRecordingToolbar(m, h)
+  }
+  let guideCount = m.guides.length()
+  return h.row(
+    &[h.class("h-[40px] shrink-0 items-center px-[12px] border-b border-[#E6E6E8] bg-white gap-[10px] text-[12px] font-medium")],
+    &[
+      h.row(
+        &[h.class("items-center gap-[4px] shrink-0")],
+        &[
+          h.row(
+            &[
+              h.class("items-center gap-[6px] h-[28px] px-[10px] rounded-[6px] bg-[#0B0B0C] text-white"),
+              h.cursor(Cursor.Pointer),
+              h.onClick(Message.ToggleRecord),
+            ],
+            &[
+              h.box(&[h.class("w-[8px] h-[8px] rounded-[4px] bg-[#FF4D3A]")], &[]),
+              txt(h, "Rec", "text-[12px] leading-[16px] font-medium text-white"),
+            ],
+          ),
+          h.row(
+            &[
+              h.class("items-center gap-[5px] h-[28px] px-[10px] rounded-[6px] border border-[#E6E6E8]"),
+              h.classSelect(m.playing && !m.playingRefOnly, "bg-[#F1F1F2] text-[#0B0B0C]", "bg-white text-[#0B0B0C] glint-btn-hover"),
+              h.cursor(Cursor.Pointer),
+              h.onClick(Message.TogglePlay),
+            ],
+            &[
+              txt(h, if m.playing && !m.playingRefOnly { "❚❚" } else { "▶" }, "text-[9px] text-[#0B0B0C]"),
+              txt(h, if m.playing && !m.playingRefOnly { "Pause" } else { "Play" }, "text-[12px] leading-[16px] text-[#0B0B0C]"),
+            ],
+          ),
+          h.row(
+            &[
+              h.class("items-center gap-[5px] h-[28px] px-[10px] rounded-[6px] border border-[#E6E6E8]"),
+              h.classSelect(m.playingRefOnly, "bg-[#F1F1F2] text-[#0B0B0C]", "bg-white text-[#0B0B0C] glint-btn-hover"),
+              h.classWhen(!m.refClip.active, "opacity-40"),
+              h.cursor(Cursor.Pointer),
+              h.onClick(Message.PlayReferenceOnce),
+            ],
+            &[
+              txt(h, "▷", "text-[10px] text-[#0B0B0C]"),
+              txt(h, "Ref", "text-[12px] leading-[16px] text-[#0B0B0C]"),
+            ],
+          ),
+          h.box(
+            &[
+              h.class("flex items-center h-[28px] px-[9px] rounded-[6px]"),
+              h.classSelect(m.loopSelection, "bg-[#F1F1F2] text-[#0B0B0C]", "text-[#6B6B70] glint-btn-hover"),
+              h.cursor(Cursor.Pointer),
+              h.onClick(Message.ToggleLoop),
+            ],
+            &[txt(h, "Loop", "text-[12px] leading-[16px]")],
+          ),
+          h.box(
+            &[
+              h.class("flex items-center h-[28px] px-[8px] rounded-[6px] glint-btn-hover"),
+              h.cursor(Cursor.Pointer),
+              h.onClick(Message.OpenContextMenu { kind: CTX_SPEED, x: 248.0, y: 84.0 }),
+            ],
+            &[txt(h, String.view(&m.readoutSpeedStr), "glint-mono text-[11px] leading-[14px] text-[#0B0B0C]")],
+          ),
+        ],
+      ),
+      h.box(&[h.class("w-[1px] h-[20px] bg-[#E6E6E8] shrink-0")], &[]),
+      h.row(
+        &[h.class("items-center gap-[2px] shrink-0")],
+        &[
+          overlayPill(h, "Pitch", m.showPitch, Message.TogglePitch),
+          overlayPill(h, "Formants", m.showFormants, Message.ToggleFormants),
+          overlayPill(h, "Overtones", m.showHarmonics, Message.ToggleHarmonics),
+          overlayPill(h, "Size/Wt", m.showMetricsLane, Message.ToggleMetricsLane),
+          overlayPill(h, "Grid", m.showNoteGrid, Message.ToggleNoteGrid),
+          overlayPill(h, if guideCount > 0 { "Guides ·" } else { "Guides" }, m.showGuidesPanel || guideCount > 0, Message.ToggleGuidesPanel),
+          overlayPill(h, "DTW", m.useDtwAlign, Message.ToggleDtwAlign),
+          if m.refClip.active {
+            overlayPill(h, "Ref wave", m.showRefWave, Message.ToggleRefWave)
+          } else {
+            h.empty()
+          },
+          if m.refClip.active {
+            overlayPill(h, "On ref", m.plotOnRef, Message.TogglePlotOnRef)
+          } else {
+            h.empty()
+          },
+        ],
+      ),
+      h.box(&[h.class("flex-1")], &[]),
+      h.row(
+        &[h.class("items-center gap-[12px] text-[#6B6B70] shrink-0")],
+        &[
+          h.row(
+            &[
+              h.class("items-center gap-[6px]"),
+              h.cursor(Cursor.Pointer),
+              h.onClick(Message.ToggleDrillMode),
+            ],
+            &[
+              toggleSwitch(h, false, false, Message.ToggleDrillMode),
+              txt(h, "Repeat drill", "text-[12px] leading-[16px] text-[#0B0B0C]"),
+            ],
+          ),
+          h.row(
+            &[
+              h.class("items-center gap-[6px]"),
+              h.cursor(Cursor.Pointer),
+              h.onClick(Message.ToggleEchoMode),
+            ],
+            &[
+              toggleSwitch(h, false, false, Message.ToggleEchoMode),
+              txt(h, "Echo mirror", "text-[12px] leading-[16px] text-[#6B6B70]"),
+            ],
+          ),
+          h.row(
+            &[
+              h.class("items-center gap-[4px]"),
+              h.cursor(Cursor.Pointer),
+              h.onClick(Message.OpenSettingsTab { tab: 0 }),
+            ],
+            &[
+              txt(h, "Silence", "text-[11px] text-[#6B6B70]"),
+              txt(h, String.view(&m.readoutSilenceStr), "glint-mono text-[11px] text-[#0B0B0C]"),
+            ],
+          ),
+          h.row(
+            &[
+              h.class("items-center gap-[4px]"),
+              h.cursor(Cursor.Pointer),
+              h.onClick(Message.OpenSettingsTab { tab: 0 }),
+            ],
+            &[
+              txt(h, "Gate", "text-[11px] text-[#6B6B70]"),
+              txt(h, String.view(&m.readoutVadStr), "glint-mono text-[11px] text-[#0B0B0C]"),
+            ],
+          ),
+        ],
+      ),
+    ],
+  )
+}
+
+fn overlayPill(h: &Document<Message>, label: string, active: bool, msg: Message) -> Node {
+  return h.box(
+    &[
+      h.class("px-[8px] py-[4px] rounded-[5px]"),
+      h.classSelect(active, "bg-[#F1F1F2] text-[#0B0B0C]", "text-[#6B6B70] glint-btn-hover"),
+      h.cursor(Cursor.Pointer),
+      h.onClick(move msg),
+    ],
+    &[txt(h, label, "text-[12px] leading-[16px] font-medium")],
+  )
+}
+
+fn renderRecordingToolbar(m: &Overtone, h: &Document<Message>) -> Node {
+  let lvl = levelPct(m.inputLevelDb)
+  return h.row(
+    &[h.class("h-[40px] shrink-0 items-center gap-[10px] px-[12px] border-b border-[#E6E6E8] bg-white")],
+    &[
+      h.row(
+        &[
+          h.class("items-center gap-[6px] px-[10px] py-[5px] rounded-[5px] bg-[#D9381E] shrink-0"),
+          h.cursor(Cursor.Pointer),
+          h.onClick(Message.ToggleRecord),
+        ],
+        &[
+          h.box(&[h.class("w-[8px] h-[8px] rounded-[1px] bg-white")], &[]),
+          txt(h, "Stop", "text-[13px] leading-[16px] font-semibold text-white"),
+        ],
+      ),
+      txt(h, String.view(&m.readoutDuration), "glint-mono text-[12px] leading-[16px] text-[#0B0B0C] shrink-0"),
+      h.box(
+        &[h.class("w-[120px] h-[4px] rounded-[2px] bg-[#E6E6E8] flex overflow-hidden shrink-0")],
+        &[h.box(&[h.class("h-full rounded-[2px] bg-[#0E0E10]"), h.style(&[css.width(percent(lvl))])], &[])],
+      ),
+      txt(h, String.view(&m.readoutDb), "glint-mono text-[11px] leading-[14px] text-[#6B6B70] shrink-0"),
+      h.row(
+        &[h.class("items-center gap-[4px] text-[12px] leading-[16px] text-[#6B6B70] truncate")],
+        &[
+          h.text("Recording into "),
+          txt(h, String.view(&m.clipName), "text-[#0B0B0C] font-medium"),
+          h.text(" · ⌘R for a new take"),
+        ],
+      ),
+      h.box(&[h.class("flex-1")], &[]),
+      txtA(
+        h,
+        if m.followRecording { "Following live" } else { "Follow paused" },
+        &[
+          h.class("text-[12px] leading-[16px] text-[#6B6B70] hover:text-[#0B0B0C] shrink-0"),
+          h.cursor(Cursor.Pointer),
+          h.onClick(Message.ToggleFollowRecording),
+        ],
+      ),
+    ],
+  )
+}
+
+fn renderDrillToolbar(m: &Overtone, h: &Document<Message>) -> Node {
+  let isDrill = m.practiceMode == PRACTICE_DRILL
+  let lvl = levelPct(m.inputLevelDb)
+  let p1 = m.practicePhase == PHASE_PLAY_REF || (!isDrill && m.practicePhase == PHASE_LISTEN_SPEECH)
+  let p2 = (isDrill && (m.practicePhase == PHASE_LISTEN_SPEECH || m.practicePhase == PHASE_REC_SPEECH)) || (!isDrill && m.practicePhase == PHASE_REC_SPEECH)
+  let p3 = !p1 && !p2
+  return h.row(
+    &[h.class("h-[40px] shrink-0 items-center gap-[10px] px-[12px] bg-[#0E0E10]")],
+    &[
+      h.row(
+        &[
+          h.class("items-center gap-[6px] px-[10px] py-[5px] rounded-[5px] bg-white shrink-0"),
+          h.cursor(Cursor.Pointer),
+          h.onClick(Message.StopPractice),
+        ],
+        &[
+          h.box(&[h.class("w-[8px] h-[8px] rounded-[1px] bg-[#0B0B0C]")], &[]),
+          txt(h, if isDrill { "Stop drill" } else { "Stop echo" }, "text-[13px] leading-[16px] font-semibold text-[#0B0B0C]"),
+        ],
+      ),
+      h.row(
+        &[h.class("items-center gap-[4px] shrink-0")],
+        &[
+          drillPhaseChip(h, if isDrill { "1 Ref plays" } else { "1 Listening" }, p1),
+          txt(h, "→", "text-[#5A5A60] text-[11px]"),
+          drillPhaseChip(h, if isDrill { "2 Your turn — speak now" } else { "2 Recording" }, p2),
+          txt(h, "→", "text-[#5A5A60] text-[11px]"),
+          drillPhaseChip(h, if isDrill { "3 Score" } else { "3 Echo playback" }, p3),
+        ],
+      ),
+      h.box(
+        &[h.class("w-[90px] h-[4px] rounded-[2px] bg-white/15 flex overflow-hidden shrink-0")],
+        &[h.box(&[h.class("h-full rounded-[2px] bg-white"), h.style(&[css.width(percent(lvl))])], &[])],
+      ),
+      h.row(
+        &[h.class("items-center gap-[4px] glint-mono text-[11px] leading-[14px] text-[#9A9AA2] shrink-0")],
+        &[
+          h.text("gate "),
+          h.text(String.view(&m.readoutVadStr)),
+        ],
+      ),
+      h.box(&[h.class("flex-1")], &[]),
+      if m.drillRound > 0 {
+        h.row(
+          &[h.class("items-center gap-[6px] text-[12px] leading-[16px] text-[#9A9AA2] shrink-0")],
+          &[
+            h.text("Round "),
+            txt(h, pctDigits(u32.toI32(m.drillRound)), "glint-mono text-white"),
+            h.text(" · last "),
+            txt(h, pctDigits(m.drillLastScore), "glint-mono text-white"),
+            h.text("% · best "),
+            txt(h, pctDigits(m.drillBestScore), "glint-mono text-white"),
+            h.text("%"),
+          ],
+        )
+      } else {
+        txt(h, String.view(&m.practiceStatus), "text-[12px] leading-[16px] text-[#9A9AA2] truncate")
+      },
+    ],
+  )
+}
+
+fn drillPhaseChip(h: &Document<Message>, label: string, active: bool) -> Node {
+  return h.box(
+    &[
+      h.class("px-[8px] py-[2px] rounded-[10px]"),
+      h.classSelect(active, "bg-white", "bg-white/12"),
+    ],
+    &[
+      txtA(
+        h,
+        label,
+        &[
+          h.class("text-[12px] leading-[16px]"),
+          h.classSelect(active, "font-semibold text-[#0B0B0C]", "text-[#9A9AA2]"),
+        ],
+      ),
+    ],
+  )
+}
+
+// ============================================================================
+// Error Banner
+// ============================================================================
+
+fn renderErrorBanner(m: &Overtone, h: &Document<Message>) -> Node {
+  if String.byteLength(String.view(&m.errorMsg)) == 0 {
+    return h.empty()
+  }
+  return h.row(
+    &[h.class("shrink-0 items-center gap-[10px] px-[14px] py-[7px] bg-white border-b border-[#E6E6E8] border-l-[3px] border-l-[#D9381E]")],
+    &[
+      txt(h, "Error", "text-[12px] leading-[16px] font-semibold text-[#D9381E] shrink-0"),
+      txt(h, String.view(&m.errorMsg), "flex-1 text-[12px] leading-[16px] text-[#3A3A3F] truncate"),
+      txtA(
+        h,
+        "Dismiss",
+        &[
+          h.class("text-[12px] leading-[16px] text-[#6B6B70] underline hover:text-[#0B0B0C] shrink-0"),
+          h.cursor(Cursor.Pointer),
+          h.onClick(Message.ClearError),
+        ],
+      ),
+    ],
+  )
+}
+
+// ============================================================================
+// Left Library Rail (216px)
+// ============================================================================
+
+fn sidebarResizeHandle(m: &Overtone, h: &Document<Message>, isRight: bool) -> Node {
+  let active = if isRight { m.drag == DRAG_RESIZE_READOUTS } else { m.drag == DRAG_RESIZE_LIB }
+  return h.box(
+    &[
+      h.class("w-[5px] shrink-0 h-full flex items-center justify-center bg-transparent hover:bg-[#E6E6E8]/70 relative z-10"),
+      h.classWhen(active, "bg-[#D9381E]/25"),
+      h.cursor(Cursor.ResizeHorizontal),
+      if active { h.capturePointer() } else { h.none() },
+      h.onPointerDown(|e| Reply<Message>.EmitAndStop { message: Message.ResizeSidebarDown { isRight: isRight, x: e.x } }),
+    ],
+    &[
+      h.box(
+        &[
+          h.class("w-[1px] h-full"),
+          h.classSelect(active, "bg-[#D9381E]", "bg-[#E6E6E8]"),
+        ],
+        &[],
+      ),
+    ],
+  )
+}
+
+fn collapsedEdgeTab(h: &Document<Message>, isLeft: bool, msg: Message) -> Node {
+  return h.box(
+    &[
+      h.class("w-[18px] shrink-0 h-full bg-[#FAFAFA] hover:bg-[#F1F1F2] flex items-center justify-center"),
+      h.classSelect(isLeft, "border-r border-[#E6E6E8]", "border-l border-[#E6E6E8]"),
+      h.cursor(Cursor.Pointer),
+      h.onClick(move msg),
+    ],
+    &[txt(h, if isLeft { "›" } else { "‹" }, "text-[12px] font-semibold text-[#6B6B70]")],
+  )
+}
+
+fn renderLibraryRail(m: &Overtone, h: &Document<Message>) -> Node {
+  let nodes = m.libTree.asSlice()
+  let slots = m.explorerVisibleRows.asSlice()
+  let hasItems = nodes.length > 0
+  let totalH: f32 = f32.max(m.explorerTotalH, 120.0)
+  let treeH: f32 = f32.max(1.0, m.explorerTreeRect.height())
+  let showScroll = totalH > treeH + 4.0
+  let thumbH: f32 = if showScroll { f32.max(24.0, (treeH / totalH) * treeH) } else { 0.0 }
+  let maxScroll: f32 = f32.max(1.0, totalH - treeH)
+  let trackRoom: f32 = f32.max(0.0, treeH - thumbH)
+  let thumbTop: f32 = if showScroll { (m.explorerScrollY / maxScroll) * trackRoom } else { 0.0 }
+
+  return h.column(
+    &[
+      h.class("shrink-0 bg-white overflow-hidden"),
+      h.style(&[css.width(px(m.libWidth))]),
+      h.onLayout(|r| Message.ExplorerPanelLayout { rect: r }),
+    ],
+    &[
+      h.row(
+        &[h.class("h-[36px] shrink-0 items-center justify-between pl-[14px] pr-[8px] border-b border-[#F1F1F2]")],
+        &[
+          txt(h, "Library", "text-[11px] leading-[14px] font-semibold tracking-[0.06em] uppercase text-[#6B6B70]"),
+          h.row(
+            &[h.class("items-center gap-[2px] text-[11px] text-[#6B6B70]")],
+            &[
+              railHeaderBtn(h, "All", m.libFilter == FILTER_ALL, Message.SetLibFilter { filter: FILTER_ALL }),
+              railHeaderBtn(h, "★", m.libFilter == FILTER_STARRED, Message.SetLibFilter { filter: FILTER_STARRED }),
+              railHeaderBtn(h, sortLabel(m.libSortMode), m.libSortMode != SORT_ALPHA, Message.OpenContextMenu { kind: CTX_LIB_SORT, x: 112.0, y: 120.0 }),
+              railHeaderBtn(h, "+", m.showNewFolderInput, Message.ToggleNewFolderInput),
+              railHeaderBtn(h, "‹", false, Message.ToggleLibrary),
+            ],
+          ),
+        ],
+      ),
+      if m.refClip.active {
+        h.row(
+          &[h.class("items-center gap-[8px] px-[14px] py-[6px] bg-[#0E0E10] shrink-0")],
+          &[
+            txt(h, "REF", "glint-mono text-[9px] leading-[12px] tracking-[0.08em] text-[#9A9AA2] shrink-0"),
+            txtA(
+              h,
+              String.view(&m.refClip.name),
+              &[
+                h.class("flex-1 text-[12px] leading-[16px] font-semibold text-white truncate"),
+                h.cursor(Cursor.Pointer),
+                h.onClick(Message.PlayReferenceOnce),
+              ],
+            ),
+            txt(h, String.view(&m.readoutRefDuration), "glint-mono text-[10px] leading-[12px] text-[#9A9AA2] shrink-0"),
+            txtA(
+              h,
+              "×",
+              &[
+                h.class("text-[13px] leading-[14px] text-[#9A9AA2] hover:text-white px-[2px] shrink-0"),
+                h.cursor(Cursor.Pointer),
+                h.onClick(Message.ClearReference),
+              ],
+            ),
+          ],
+        )
+      } else {
+        h.empty()
+      },
+      if m.showNewFolderInput {
+        let nfRel = String.view(&m.newFolderTargetRel)
+        let nfIsRoot = String.byteLength(nfRel) == 0
+        h.column(
+          &[h.class("py-[4px] border-b border-[#F1F1F2] bg-[#FAFAFA] shrink-0")],
+          &[
+            h.row(
+              &[h.class("items-center gap-[5px] h-[28px] px-[10px]")],
+              &[
+                txt(h, "▾", "text-[10px] text-[#8A8A90] shrink-0"),
+                h.input(
+                  String.view(&m.newFolderDraft),
+                  &[
+                    h.class("flex-1 min-w-0 px-[6px] py-[2px] border-[1.5px] border-[#0E0E10] rounded-[4px] bg-white text-[12px] leading-[16px] text-[#0B0B0C]"),
+                    h.placeholder("Folder name"),
+                    h.onInput(|t| Message.NewFolderNameInput { text: move t }),
+                    h.onEnter(Message.CreateNewFolder),
+                    h.onFocus(Message.TextFocusChanged { focused: true }),
+                    h.onBlur(Message.TextFocusChanged { focused: false }),
+                  ],
+                ),
+                txtA(
+                  h,
+                  "✓",
+                  &[
+                    h.class("text-[12px] text-[#0B0B0C] px-[2px] shrink-0"),
+                    h.cursor(Cursor.Pointer),
+                    h.onClick(Message.CreateNewFolder),
+                  ],
+                ),
+                txtA(
+                  h,
+                  "×",
+                  &[
+                    h.class("text-[12px] text-[#8A8A90] px-[2px] shrink-0"),
+                    h.cursor(Cursor.Pointer),
+                    h.onClick(Message.ToggleNewFolderInput),
+                  ],
+                ),
+              ],
+            ),
+            if nfIsRoot {
+              txt(h, "New folder in /", "text-[10px] leading-[12px] text-[#8A8A90] pl-[24px] pr-[10px] pb-[2px] truncate")
+            } else {
+              txt(h, nfRel, "text-[10px] leading-[12px] text-[#8A8A90] pl-[24px] pr-[10px] pb-[2px] truncate")
+            },
+          ],
+        )
+      } else {
+        h.empty()
+      },
+      if m.bgScoreActive && String.byteLength(String.view(&m.readoutBgScore)) > 0 {
+        h.box(
+          &[h.class("px-[14px] py-[4px] bg-[#FAFAFA] border-b border-[#F1F1F2] shrink-0")],
+          &[txt(h, String.view(&m.readoutBgScore), "glint-mono text-[10px] leading-[12px] text-[#6B6B70]")],
+        )
+      } else {
+        h.empty()
+      },
+      if hasItems {
+        h.box(
+          &[
+            h.class("flex-1 min-h-0 relative overflow-hidden"),
+            h.prevent(&[DefaultAction.Scroll]),
+            h.onLayout(|r| Message.ExplorerTreeLayout { rect: r }),
+            h.onWheel(|e| Reply<Message>.EmitAndStop { message: Message.ExplorerWheel { dy: e.deltaY } }),
+            h.onPointerDown(|e| Reply<Message>.Emit { message: Message.ExplorerEmptyDown { x: e.x, y: e.y, button: e.button } }),
+          ],
+          &[
+            h.box(
+              &[h.class("relative w-full h-full")],
+              &[
+                h.each<ExplorerRowSlot>(
+                  slots,
+                  |slot| if slot.idx < nodes.length { renderExplorerRow(m, h, slot.idx, slot.y) } else { h.empty() },
+                ),
+              ],
+            ),
+            if showScroll {
+              h.box(
+                &[
+                  h.class("absolute right-[2px] top-0 bottom-0 w-[6px]"),
+                  if m.drag == DRAG_EXPLORER_SCROLL { h.capturePointer() } else { h.none() },
+                  h.onPointerDown(|e| Reply<Message>.EmitAndStop { message: Message.ExplorerScrollTrackDown { y: e.y } }),
+                  h.onPointerMove(|e| Reply<Message>.EmitAndStop { message: Message.ExplorerScrollMove { y: e.y } }),
+                  h.onPointerUp(|_| Reply<Message>.EmitAndStop { message: Message.ExplorerScrollUp }),
+                ],
+                &[
+                  h.box(
+                    &[
+                      h.class("absolute left-[1px] w-[4px] rounded-[2px] bg-[#D4D4D8]"),
+                      h.style(&[css.top(px(thumbTop)), css.height(px(thumbH))]),
+                    ],
+                    &[],
+                  ),
+                ],
+              )
+            } else {
+              h.empty()
+            },
+          ],
+        )
+      } else {
+        h.column(
+          &[
+            h.class("flex-1 items-center justify-center gap-[8px] px-[20px]"),
+            h.onPointerDown(|e| Reply<Message>.Emit { message: Message.ExplorerEmptyDown { x: e.x, y: e.y, button: e.button } }),
+          ],
+          &[
+            txt(h, "No takes yet", "text-[13px] leading-[16px] font-semibold text-[#0B0B0C]"),
+            txt(h, "Press R to record, or drop audio files and folders here.", "text-[12px] leading-[16px] text-[#6B6B70] text-center"),
+            h.row(
+              &[h.class("gap-[6px] pt-[4px]")],
+              &[
+                h.box(
+                  &[
+                    h.class("px-[10px] py-[4px] rounded-[4px] bg-[#0E0E10]"),
+                    h.cursor(Cursor.Pointer),
+                    h.onClick(Message.ToggleRecord),
+                  ],
+                  &[txt(h, "Record", "text-[12px] leading-[16px] text-white")],
+                ),
+                h.box(
+                  &[
+                    h.class("px-[10px] py-[4px] rounded-[4px] border border-[#DCDCDF] bg-white glint-btn-hover"),
+                    h.cursor(Cursor.Pointer),
+                    h.onClick(Message.OpenNewFolderAtRoot),
+                  ],
+                  &[txt(h, "New folder", "text-[12px] leading-[16px] text-[#3A3A3F]")],
+                ),
+              ],
+            ),
+          ],
+        )
+      },
+      if m.activeClipInLib {
+        h.column(
+          &[h.class("shrink-0 border-t border-[#E6E6E8] px-[12px] py-[8px] gap-[5px] bg-[#FAFAFA]")],
+          &[
+            h.row(
+              &[h.class("items-center justify-between")],
+              &[
+                txt(h, "Note & rating", "text-[10px] leading-[12px] font-semibold uppercase tracking-[0.06em] text-[#8A8A90]"),
+                h.row(
+                  &[h.class("gap-[2px]")],
+                  &[
+                    starBtn(h, m, 1),
+                    starBtn(h, m, 2),
+                    starBtn(h, m, 3),
+                    starBtn(h, m, 4),
+                    starBtn(h, m, 5),
+                  ],
+                ),
+              ],
+            ),
+            h.input(
+              String.view(&m.activeCommentDraft),
+              &[
+                h.class("w-full px-[7px] py-[4px] border border-[#E6E6E8] rounded-[4px] bg-white text-[11px] leading-[14px] text-[#0B0B0C]"),
+                h.placeholder("Add note for this take…"),
+                h.onInput(|t| Message.EditCommentInput { text: move t }),
+                h.onFocus(Message.TextFocusChanged { focused: true }),
+                h.onBlur(Message.TextFocusChanged { focused: false }),
+              ],
+            ),
+          ],
+        )
+      } else {
+        h.empty()
+      },
+    ],
+  )
+}
+
+fn railHeaderBtn(h: &Document<Message>, label: string, active: bool, msg: Message) -> Node {
+  return h.box(
+    &[
+      h.class("px-[6px] py-[3px] rounded-[4px]"),
+      h.classSelect(active, "bg-[#F1F1F2] text-[#0B0B0C] font-medium", "text-[#6B6B70] glint-btn-hover"),
+      h.cursor(Cursor.Pointer),
+      h.onClick(move msg),
+    ],
+    &[txt(h, label, "text-[11px] leading-[14px]")],
+  )
+}
+
+fn starBtn(h: &Document<Message>, m: &Overtone, r: i32) -> Node {
+  let active = m.activeItemRating >= r
+  let nextVal = if m.activeItemRating == r { 0 } else { r }
+  let activeIdx = findActiveLibIdx(m)
+  return txtA(
+    h,
+    "★",
+    &[
+      h.class("text-[11px] leading-[12px]"),
+      h.classSelect(active, "text-[#0B0B0C]", "text-[#D4D4D8]"),
+      h.cursor(Cursor.Pointer),
+      h.onClick(Message.SetRatingLibClip { idx: activeIdx, rating: nextVal }),
+    ],
+  )
+}
+
+fn findActiveLibIdx(m: &Overtone) -> usize {
+  let nodes = m.libTree.asSlice()
+  let active = String.view(&m.activeClipPath)
+  let mut i: usize = 0
+  while i < nodes.length {
+    if !nodes[i].isDir && String.view(&nodes[i].fullPath) == active {
+      return i
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+fn renderExplorerRow(m: &Overtone, h: &Document<Message>, idx: usize, topY: f32) -> Node {
+  let node = &m.libTree.asSlice()[idx]
+  let isRenaming = String.byteLength(String.view(&m.renamingRel)) > 0
+    && String.view(&m.renamingRel) == String.view(&node.relPath)
+  let indentPx = 12.0 + u32.toF32(node.depth) * 14.0
+
+  if isRenaming {
+    return h.row(
+      &[
+        h.class("absolute left-0 right-0 h-[26px] items-center gap-[4px] bg-[#F2F2F3] pr-[8px]"),
+        h.style(&[css.top(px(topY)), css.paddingLeft(px(indentPx))]),
+      ],
+      &[
+        h.input(
+          String.view(&m.renameDraft),
+          &[
+            h.class("flex-1 min-w-0 px-[6px] py-[1px] border-[1.5px] border-[#0E0E10] rounded-[4px] bg-white text-[12px] leading-[16px] text-[#0B0B0C]"),
+            h.onInput(|t| Message.RenameEntryInput { text: move t }),
+            h.onEnter(Message.CommitRenameEntry),
+            h.onFocus(Message.TextFocusChanged { focused: true }),
+            h.onBlur(Message.TextFocusChanged { focused: false }),
+          ],
+        ),
+        txtA(h, "✓", &[h.class("text-[12px] text-[#0B0B0C] px-[2px]"), h.cursor(Cursor.Pointer), h.onClick(Message.CommitRenameEntry)]),
+        txtA(h, "×", &[h.class("text-[12px] text-[#8A8A90] px-[2px]"), h.cursor(Cursor.Pointer), h.onClick(Message.CancelRenameEntry)]),
+      ],
+    )
+  }
+
+  let isDropTarget = m.explorerDragActive && m.explorerDropValid
+    && String.view(&m.explorerDropTargetRel) == String.view(&node.relPath)
+
+  if node.isDir {
+    let selectedFolder = String.view(&m.selectedFolderRel) == String.view(&node.relPath)
+    return h.row(
+      &[
+        h.class("absolute left-0 right-0 h-[26px] items-center gap-[6px] pr-[12px] glint-btn-hover"),
+        h.classSelect(selectedFolder, "font-semibold text-[#0B0B0C]", "text-[#6B6B70]"),
+        h.classWhen(isDropTarget, "border-t-2 border-t-[#0E0E10] bg-[#F1F1F2]"),
+        h.style(&[css.top(px(topY)), css.paddingLeft(px(indentPx))]),
+        h.cursor(Cursor.Pointer),
+        h.onLayout(|r| Message.ExplorerRowLayout { idx: idx, rect: r }),
+        h.onPointerDown(|e| Reply<Message>.EmitAndStop { message: Message.ExplorerRowDown { idx: idx, x: e.x, y: e.y, button: e.button } }),
+      ],
+      &[
+        txt(h, if node.expanded { "▾" } else { "▸" }, "w-[10px] shrink-0 text-[9px]"),
+        txt(h, String.view(&node.displayName), "flex-1 text-[12px] leading-[16px] truncate"),
+      ],
+    )
+  }
+
+  let isActive = String.view(&node.fullPath) == String.view(&m.activeClipPath)
+  let isRef = m.refClip.active && String.view(&node.fullPath) == String.view(&m.refClip.fullPath)
+  let score = node.scoreOverall
+  let hasScore = score >= 0
+  let barPct: f32 = if hasScore { i32.toF32(if score > 100 { 100 } else { score }) } else { 0.0 }
+  let barColorCls = if score >= 60 { "bg-[#0B0B0C]" } else { "bg-[#B9B9BE]" }
+
+  return h.row(
+    &[
+      h.class("absolute left-0 right-0 h-[26px] items-center gap-[6px] pr-[12px]"),
+      h.classSelect(isActive, "bg-[#F1F1F2] text-[#0B0B0C] font-semibold", "text-[#3A3A40] glint-btn-hover"),
+      h.style(&[css.top(px(topY)), css.paddingLeft(px(indentPx + 14.0))]),
+      h.cursor(Cursor.Pointer),
+      h.onLayout(|r| Message.ExplorerRowLayout { idx: idx, rect: r }),
+      h.onPointerDown(|e| Reply<Message>.EmitAndStop { message: Message.ExplorerRowDown { idx: idx, x: e.x, y: e.y, button: e.button } }),
+    ],
+    &[
+      txt(h, String.view(&node.displayName), "flex-1 text-[12px] leading-[16px] truncate"),
+      if isRef {
+        txt(h, "REF", "glint-mono text-[9px] px-[4px] py-[1px] rounded-[3px] bg-[#0E0E10] text-white shrink-0")
+      } else {
+        txt(h, if node.starred { "★" } else { "" }, "w-[11px] shrink-0 text-[10px] text-[#0B0B0C]")
+      },
+      if hasScore && !isRef {
+        h.row(
+          &[h.class("items-center gap-[6px] shrink-0")],
+          &[
+            h.box(
+              &[h.class("w-[32px] h-[3px] rounded-[2px] bg-[#ECECEE] flex overflow-hidden")],
+              &[h.box(&[h.class(barColorCls), h.class("h-full rounded-[2px]"), h.style(&[css.width(percent(barPct))])], &[])],
+            ),
+            txt(h, pctDigits(score), "w-[18px] text-right glint-mono text-[11px] leading-[14px]"),
+          ],
+        )
+      } else {
+        h.empty()
+      },
+    ],
+  )
+}
+
+// ============================================================================
+// Center Stage: Script Strip + Darkroom Spectrogram Well + Size/Wt Lane + Display Strip
+// ============================================================================
+
+fn renderCenterStage(m: &Overtone, h: &Document<Message>) -> Node {
+  return h.column(
+    &[h.class("flex-1 min-w-0 min-h-0 px-[16px] pt-[12px] gap-[8px] bg-white overflow-hidden")],
+    &[
+      if m.showNotesPanel { renderScriptStrip(m, h) } else { h.empty() },
+      renderSpectrogramWell(m, h),
+      if m.showMetricsLane { renderSizeWeightLane(m, h) } else { h.empty() },
+      renderDisplayStrip(m, h),
+    ],
+  )
+}
+
+fn renderScriptStrip(m: &Overtone, h: &Document<Message>) -> Node {
+  return h.column(
+    &[h.class("shrink-0 rounded-[8px] border border-[#E6E6E8] bg-white overflow-hidden")],
+    &[
+      h.row(
+        &[h.class("items-center gap-[6px] px-[14px] py-[6px] border-b border-[#ECECEE]")],
+        &[
+          txt(h, "Script", "flex-1 text-[11px] leading-[14px] font-semibold tracking-[0.06em] uppercase text-[#6B6B70]"),
+          scriptPresetBtn(h, "Rainbow passage", Message.InsertNotesPreset { preset: 1 }),
+          scriptPresetBtn(h, "Vowel warm-up", Message.InsertNotesPreset { preset: 2 }),
+          txtA(
+            h,
+            "Clear",
+            &[
+              h.class("px-[6px] py-[2px] text-[12px] text-[#6B6B70] hover:text-[#0B0B0C]"),
+              h.cursor(Cursor.Pointer),
+              h.onClick(Message.InsertNotesPreset { preset: 0 }),
+            ],
+          ),
+          txtA(
+            h,
+            "Hide",
+            &[
+              h.class("px-[6px] py-[2px] text-[12px] text-[#6B6B70] hover:text-[#0B0B0C]"),
+              h.cursor(Cursor.Pointer),
+              h.onClick(Message.ToggleNotesPanel),
+            ],
+          ),
+        ],
+      ),
+      h.input(
+        String.view(&m.sessionNotes),
+        &[
+          h.class("w-full h-[54px] px-[14px] py-[8px] text-[13px] leading-[18px] text-[#0B0B0C] bg-white"),
+          h.multiline(true),
+          h.placeholder("Paste a practice passage or vocal notes here (saved per folder)…"),
+          h.onInput(|t| Message.EditSessionNotes { text: move t }),
+          h.onFocus(Message.TextFocusChanged { focused: true }),
+          h.onBlur(Message.TextFocusChanged { focused: false }),
+        ],
+      ),
+    ],
+  )
+}
+
+fn scriptPresetBtn(h: &Document<Message>, label: string, msg: Message) -> Node {
+  return h.box(
+    &[
+      h.class("px-[8px] py-[2px] border border-[#DCDCDF] rounded-[4px] bg-white glint-btn-hover"),
+      h.cursor(Cursor.Pointer),
+      h.onClick(move msg),
+    ],
+    &[txt(h, label, "text-[12px] leading-[16px] text-[#3A3A3F]")],
+  )
+}
+
+fn renderSpectrogramWell(m: &Overtone, h: &Document<Message>) -> Node {
+  let onRef = m.isPlottingOnRef()
+  let sw = f32.max(1.0, m.specRect.width())
+  let sh = f32.max(1.0, m.specRect.height())
+
+  // Selection overlay coordinates
+  let selLo = f64.min(m.selStart, m.selEnd)
+  let selHi = f64.max(m.selStart, m.selEnd)
+  let selValid = m.hasSelection && (selHi - selLo) >= 0.015
+  let selLeftPct = f64.toF32(f64.max(0.0, f64.min(1.0, m.vp.timeToNormAt(selLo)))) * 100.0
+  let selRightPct = f64.toF32(f64.max(0.0, f64.min(1.0, m.vp.timeToNormAt(selHi)))) * 100.0
+  let selWidthPct = f32.max(0.0, selRightPct - selLeftPct)
+  let selLeftPx = f32.max(6.0, f32.min(sw - 340.0, (selLeftPct * 0.01) * sw + 4.0))
+
+  // Playhead position
+  let playNorm = m.vp.timeToNormAt(m.cursorSec)
+  let showPlayhead = playNorm >= 0.0 && playNorm <= 1.0
+  let playPct = f64.toF32(playNorm) * 100.0
+
+  // Overview viewport window
+  let ovDur = f64.max(0.05, m.vp.duration)
+  let ovL = f64.toF32(f64.max(0.0, f64.min(1.0, m.vp.t0 / ovDur))) * 100.0
+  let ovR = f64.toF32(f64.max(0.0, f64.min(1.0, m.vp.t1 / ovDur))) * 100.0
+  let ovW = f32.max(2.0, ovR - ovL)
+  let ovPlayPct = f64.toF32(f64.max(0.0, f64.min(1.0, m.cursorSec / ovDur))) * 100.0
+
+  // Hover readout pill position
+  let hoverPillX = if m.hoverX > sw - 160.0 { f32.max(8.0, m.hoverX - 150.0) } else { m.hoverX + 10.0 }
+  let hoverPillY = f32.max(40.0, f32.min(sh - 44.0, m.hoverY - 14.0))
+
+  // Spectrogram opacity dimming scrim
+  let dimAlpha: f32 = if !m.showSpectrogram { 1.0 } else { f32.max(0.0, f32.min(1.0, 1.0 - m.specOpacity)) }
+  let dimColor = Rgba<f32> { r: 0.055, g: 0.055, b: 0.063, a: dimAlpha }
+
+  let specSurfaceNode: Node = renderSpecSurface(m, h)
+
+  return h.column(
+    &[h.class("flex-1 min-h-0 bg-[#0E0E10] rounded-[8px] pt-[6px] pr-[8px] pb-[6px] overflow-hidden")],
+    &[
+      if onRef {
+        h.row(
+          &[h.class("h-[26px] shrink-0 items-center gap-[10px] pl-[46px] pr-[8px] mb-[4px] bg-[#141416] border-b border-white/10")],
+          &[
+            txt(h, "BASE · REF", "glint-mono text-[10px] leading-[12px] tracking-[0.06em] text-white shrink-0"),
+            txt(h, String.view(&m.refClip.name), "glint-mono text-[10px] leading-[12px] text-[#9A9AA2] truncate max-w-[160px]"),
+            txt(h, "White line = your pitch, DTW-aligned", "text-[11px] leading-[14px] text-[#C8C8CC]"),
+            h.box(&[h.class("flex-1")], &[]),
+            txtA(
+              h,
+              "Back to my take",
+              &[
+                h.class("text-[11px] leading-[14px] text-white underline shrink-0"),
+                h.cursor(Cursor.Pointer),
+                h.onClick(Message.TogglePlotOnRef),
+              ],
+            ),
+          ],
+        )
+      } else {
+        h.empty()
+      },
+      h.row(
+        &[h.class("flex-1 min-h-0")],
+        &[
+          h.box(
+            &[
+              h.class("shrink-0 h-full overflow-hidden"),
+              h.style(&[css.width(px(PIANO_W))]),
+            ],
+            &[h.drawing(&m.pianoDrawing, &[h.class("w-full h-full")])],
+          ),
+          h.box(
+            &[
+              h.class("shrink-0 h-full relative overflow-hidden"),
+              h.style(&[css.width(px(AXIS_W))]),
+            ],
+            &[
+              h.each<AxisTick>(
+                m.freqTicks.asSlice(),
+                |tk| txtA(
+                  h,
+                  String.view(&tk.label),
+                  &[
+                    h.class("absolute right-[6px] glint-mono text-[10px] leading-[12px] text-[#6E6E76]"),
+                    h.style(&[css.top(px(tk.pos - 6.0))]),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          h.box(
+            &[
+              h.testId("spectrogram-hit"),
+              h.class("flex-1 min-w-0 h-full relative rounded-[3px] overflow-hidden bg-[#0E0E10]"),
+              h.cursor(Cursor.Crosshair),
+              h.prevent(&[DefaultAction.Scroll]),
+              if m.drag == DRAG_SCRUB || m.drag == DRAG_SELECT || m.drag == DRAG_PAN || m.drag == DRAG_GUIDE { h.capturePointer() } else { h.none() },
+              h.onLayout(|r| Message.SpecLayout { rect: r }),
+              h.onPointerDown(|e| Reply<Message>.EmitAndStop { message: Message.SpecDown { x: e.x, y: e.y, button: e.button, modifiers: e.modifiers } }),
+              h.onPointerMove(|e| Reply<Message>.EmitAndStop { message: Message.SpecMove { x: e.x, y: e.y, modifiers: e.modifiers } }),
+              h.onPointerUp(|e| Reply<Message>.EmitAndStop { message: Message.SpecUp { x: e.x, y: e.y } }),
+              h.onPointerLeave(Message.SpecLeave),
+              h.onWheel(|e| Reply<Message>.EmitAndStop { message: Message.SpecWheel { x: e.x, y: e.y, dx: e.deltaX, dy: e.deltaY, modifiers: e.modifiers } }),
+            ],
+            &[
+              specSurfaceNode,
+              if dimAlpha > 0.01 {
+                h.box(
+                  &[
+                    h.class("absolute inset-0 pointer-events-none"),
+                    h.style(&[css.backgroundColor(dimColor)]),
+                  ],
+                  &[],
+                )
+              } else {
+                h.empty()
+              },
+              h.drawing(&m.overlayDrawing, &[h.class("absolute inset-0 w-full h-full pointer-events-none")]),
+              if m.refClip.active && m.showRefWave {
+                txt(
+                  h,
+                  if m.useDtwAlign { "REF · DTW" } else { "REF" },
+                  "absolute left-[6px] top-[3px] pointer-events-none glint-mono text-[9px] leading-[10px] tracking-[0.06em] text-white/70",
+                )
+              } else {
+                h.empty()
+              },
+              if selValid && selWidthPct > 0.05 {
+                h.box(
+                  &[
+                    h.class("absolute top-0 bottom-0 pointer-events-none border-l-[1.5px] border-r-[1.5px] border-white bg-white/10"),
+                    h.style(&[css.left(percent(selLeftPct)), css.width(percent(selWidthPct))]),
+                  ],
+                  &[],
+                )
+              } else {
+                h.empty()
+              },
+              if selValid && String.byteLength(String.view(&m.readoutSelSpan)) > 0 {
+                h.row(
+                  &[
+                    h.class("absolute top-[40px] px-[7px] py-[3px] rounded-[4px] bg-[#0E0E10] border border-white/15 gap-[6px] items-center pointer-events-none"),
+                    h.style(&[css.left(px(selLeftPx))]),
+                  ],
+                  &[
+                    txt(h, String.view(&m.readoutSelSpan), "glint-mono text-[10px] leading-[12px] text-[#9A9AA2]"),
+                    if String.byteLength(String.view(&m.readoutDeltaWeight)) > 0 {
+                      txt(h, String.view(&m.readoutDeltaWeight), "glint-mono text-[10px] leading-[12px] font-semibold text-[#FF7A66]")
+                    } else {
+                      h.empty()
+                    },
+                  ],
+                )
+              } else {
+                h.empty()
+              },
+              if selValid {
+                h.row(
+                  &[
+                    h.class("absolute bottom-[8px] items-center gap-[2px] p-[3px] bg-[#0E0E10] rounded-[5px] border border-white/15 text-[11px] leading-[14px] text-[#E8E8EA]"),
+                    h.style(&[css.left(px(selLeftPx))]),
+                  ],
+                  &[
+                    if m.refClip.active {
+                      selActBtn(h, "▶ Ref slice", true, Message.PlayRefSelection)
+                    } else {
+                      h.empty()
+                    },
+                    selActBtn(h, "Copy", false, Message.CopySelection),
+                    selActBtn(h, "Cut", false, Message.CutSelection),
+                    selActBtn(h, "Delete", false, Message.DeleteSelection),
+                    h.box(&[h.class("w-[1px] h-[14px] bg-white/20 mx-[2px]")], &[]),
+                    selActBtn(h, "Save as take", false, Message.SaveSelectionAsClip),
+                    if String.byteLength(String.view(&m.readoutSelPitchChip)) > 0 {
+                      h.row(
+                        &[h.class("items-center")],
+                        &[
+                          h.box(&[h.class("w-[1px] h-[14px] bg-white/20 mx-[2px]")], &[]),
+                          txt(h, String.view(&m.readoutSelPitchChip), "px-[6px] py-[2px] glint-mono text-[10px] text-[#9A9AA2]"),
+                        ],
+                      )
+                    } else {
+                      h.empty()
+                    },
+                  ],
+                )
+              } else {
+                h.empty()
+              },
+              // Draggable white guide pills
+              h.each<GuideBadge>(
+                m.guideLabels.asSlice(),
+                |gb| if gb.visible {
+                  let gidx = gb.idx
+                  h.row(
+                    &[
+                      h.class("absolute right-[6px] items-center gap-[5px] px-[6px] py-[2px] bg-white rounded-[3px] shadow-sm"),
+                      h.style(&[css.top(px(gb.y - 10.0))]),
+                      h.cursor(Cursor.ResizeVertical),
+                      h.onPointerDown(|e| Reply<Message>.EmitAndStop { message: Message.StartGuideDrag { idx: gidx, y: e.y } }),
+                    ],
+                    &[
+                      txt(h, "⋮", "glint-mono text-[10px] leading-[12px] text-[#8A8A90]"),
+                      txt(h, String.view(&gb.label), "glint-mono text-[10px] leading-[12px] font-semibold text-[#0B0B0C]"),
+                      txtA(
+                        h,
+                        "×",
+                        &[
+                          h.class("text-[11px] leading-[12px] text-[#8A8A90] hover:text-[#0B0B0C] pl-[2px]"),
+                          h.cursor(Cursor.Pointer),
+                          h.onClick(Message.RemoveGuide { idx: gidx }),
+                        ],
+                      ),
+                    ],
+                  )
+                } else {
+                  h.empty()
+                },
+              ),
+              if showPlayhead {
+                h.box(
+                  &[
+                    h.class("absolute top-0 bottom-0 w-[1.5px] bg-white pointer-events-none"),
+                    h.style(&[css.left(percent(playPct))]),
+                  ],
+                  &[],
+                )
+              } else {
+                h.empty()
+              },
+              if m.hoverValid && m.drag == DRAG_NONE && String.byteLength(String.view(&m.hoverReadout)) > 0 {
+                h.box(
+                  &[h.class("absolute inset-0 pointer-events-none")],
+                  &[
+                    h.box(&[h.class("absolute top-0 bottom-0 w-[1px] bg-white/20"), h.style(&[css.left(px(m.hoverX))])], &[]),
+                    h.box(&[h.class("absolute left-0 right-0 h-[1px] bg-white/20"), h.style(&[css.top(px(m.hoverY))])], &[]),
+                    h.box(
+                      &[
+                        h.class("absolute px-[7px] py-[4px] rounded-[4px] bg-white shadow-sm"),
+                        h.style(&[css.left(px(hoverPillX)), css.top(px(hoverPillY))]),
+                      ],
+                      &[txt(h, String.view(&m.hoverReadout), "glint-mono text-[10px] leading-[12px] text-[#0B0B0C]")],
+                    ),
+                  ],
+                )
+              } else {
+                h.empty()
+              },
+            ],
+          ),
+        ],
+      ),
+      h.box(
+        &[
+          h.class("h-[18px] shrink-0 ml-[46px] relative overflow-hidden"),
+          h.cursor(Cursor.ResizeHorizontal),
+          if m.drag == DRAG_TIME_RULER { h.capturePointer() } else { h.none() },
+          h.onPointerDown(|e| Reply<Message>.EmitAndStop { message: Message.TimeRulerDown { x: e.x, y: e.y } }),
+          h.onPointerMove(|e| Reply<Message>.EmitAndStop { message: Message.TimeRulerMove { x: e.x, y: e.y } }),
+          h.onPointerUp(|_| Reply<Message>.EmitAndStop { message: Message.TimeRulerUp }),
+        ],
+        &[
+          h.each<AxisTick>(
+            m.timeTicks.asSlice(),
+            |tk| txtA(
+              h,
+              String.view(&tk.label),
+              &[
+                h.class("absolute top-[4px] glint-mono text-[10px] leading-[12px] text-[#6E6E76]"),
+                h.style(&[css.left(px(tk.pos - 12.0))]),
+              ],
+            ),
+          ),
+        ],
+      ),
+      h.row(
+        &[h.class("items-center gap-[8px] pl-[46px] pt-[2px] shrink-0")],
+        &[
+          h.box(
+            &[
+              h.class("flex-1 h-[22px] rounded-[3px] bg-[#1C1C1F] relative overflow-hidden"),
+              h.cursor(Cursor.Pointer),
+              if m.drag == DRAG_OVERVIEW || m.drag == DRAG_OVERVIEW_LEFT || m.drag == DRAG_OVERVIEW_RIGHT { h.capturePointer() } else { h.none() },
+              h.onLayout(|r| Message.OverviewLayout { rect: r }),
+              h.onPointerDown(|e| Reply<Message>.EmitAndStop { message: Message.OverviewDown { x: e.x } }),
+              h.onPointerMove(|e| Reply<Message>.EmitAndStop { message: Message.OverviewMove { x: e.x } }),
+              h.onPointerUp(|_| Reply<Message>.EmitAndStop { message: Message.OverviewUp }),
+            ],
+            &[
+              h.drawing(&m.overviewDrawing, &[h.class("absolute inset-0 w-full h-full pointer-events-none")]),
+              h.box(
+                &[
+                  h.class("absolute top-0 bottom-0 border border-white/75 bg-white/10 rounded-[2px] pointer-events-none"),
+                  h.style(&[css.left(percent(ovL)), css.width(percent(ovW))]),
+                ],
+                &[],
+              ),
+              h.box(
+                &[
+                  h.class("absolute top-0 bottom-0 w-[1.5px] bg-white pointer-events-none"),
+                  h.style(&[css.left(percent(ovPlayPct))]),
+                ],
+                &[],
+              ),
+            ],
+          ),
+          txt(h, String.view(&m.readoutDuration), "glint-mono text-[10px] leading-[12px] text-[#6E6E76] shrink-0"),
+        ],
+      ),
+    ],
+  )
+}
+
+fn selActBtn(h: &Document<Message>, label: string, primary: bool, msg: Message) -> Node {
+  return h.box(
+    &[
+      h.class("px-[7px] py-[3px] rounded-[3px]"),
+      h.classSelect(primary, "bg-white/15 text-white font-medium", "text-[#E8E8EA] hover:bg-white/10"),
+      h.cursor(Cursor.Pointer),
+      h.onClick(move msg),
+    ],
+    &[txt(h, label, "text-[11px] leading-[14px]")],
+  )
+}
+
+// ============================================================================
+// Size & Weight Lane (64px light #F7F7F8)
+// ============================================================================
+
+fn renderSizeWeightLane(m: &Overtone, h: &Document<Message>) -> Node {
+  let playNorm = m.vp.timeToNormAt(m.cursorSec)
+  let showPlay = playNorm >= 0.0 && playNorm <= 1.0
+  let playPct = f64.toF32(playNorm) * 100.0
+  let selLo = f64.min(m.selStart, m.selEnd)
+  let selHi = f64.max(m.selStart, m.selEnd)
+  let selValid = m.hasSelection && (selHi - selLo) >= 0.015
+  let selL = f64.toF32(f64.max(0.0, f64.min(1.0, m.vp.timeToNormAt(selLo)))) * 100.0
+  let selR = f64.toF32(f64.max(0.0, f64.min(1.0, m.vp.timeToNormAt(selHi)))) * 100.0
+  let selW = f32.max(0.0, selR - selL)
+
+  return h.column(
+    &[h.class("shrink-0 gap-[4px]")],
+    &[
+      h.row(
+        &[h.class("items-center gap-[14px] pl-[46px] text-[11px] leading-[14px] text-[#6B6B70]")],
+        &[
+          txt(h, "Size & weight", "font-semibold text-[#0B0B0C]"),
+          h.row(
+            &[h.class("items-center gap-[5px]")],
+            &[
+              h.box(&[h.class("w-[12px] h-[2px] bg-[#0B0B0C]")], &[]),
+              h.text("You"),
+            ],
+          ),
+          h.row(
+            &[h.class("items-center gap-[5px]")],
+            &[
+              h.box(&[h.class("w-[12px] h-[1.5px] bg-[#8A8A90]")], &[]),
+              h.text("Ref"),
+            ],
+          ),
+          h.box(&[h.class("flex-1")], &[]),
+          h.text("Small / light ↑"),
+        ],
+      ),
+      h.row(
+        &[h.class("items-stretch")],
+        &[
+          h.column(
+            &[h.class("w-[46px] shrink-0 justify-between items-end pr-[8px] py-[4px] text-[10px] leading-[12px] text-[#9A9AA0]")],
+            &[
+              h.text("Size"),
+              h.text("Wt"),
+            ],
+          ),
+          h.box(
+            &[
+              h.class("flex-1 rounded-[4px] bg-[#F7F7F8] relative overflow-hidden"),
+              h.style(&[css.height(px(METRICS_H))]),
+            ],
+            &[
+              h.drawing(&m.metricsLaneDrawing, &[h.class("absolute inset-0 w-full h-full pointer-events-none")]),
+              if selValid && selW > 0.05 {
+                h.box(
+                  &[
+                    h.class("absolute top-0 bottom-0 bg-[#0B0B0C]/5 pointer-events-none"),
+                    h.style(&[css.left(percent(selL)), css.width(percent(selW))]),
+                  ],
+                  &[],
+                )
+              } else {
+                h.empty()
+              },
+              if showPlay {
+                h.box(
+                  &[
+                    h.class("absolute top-0 bottom-0 w-[1px] bg-[#0B0B0C] pointer-events-none"),
+                    h.style(&[css.left(percent(playPct))]),
+                  ],
+                  &[],
+                )
+              } else {
+                h.empty()
+              },
+            ],
+          ),
+        ],
+      ),
+    ],
+  )
+}
+
+// ============================================================================
+// Display Strip (40px)
+// ============================================================================
+
+fn renderDisplayStrip(m: &Overtone, h: &Document<Message>) -> Node {
+  let curPal = paletteIndex(m.palette)
+  let fc = m.formantCeilingHz
+  let brNorm = m.brightness + 0.5
+  let ctNorm = (m.contrast - 0.4) / 2.2
+  let flNorm = (m.displayFloorDb + 150.0) / 70.0
+  let clNorm = (m.displayCeilingDb + 60.0) / 60.0
+  let claNorm = f64.toF32((m.displayClarity - 0.1) / 0.7)
+
+  return h.row(
+    &[h.class("h-[40px] shrink-0 items-center gap-[14px] border-t border-[#E6E6E8] text-[11px] text-[#6B6B70]")],
+    &[
+      h.row(
+        &[h.class("items-center gap-[6px] shrink-0")],
+        &[
+          h.text("Colormap"),
+          h.row(
+            &[
+              h.class("items-center gap-[5px] px-[7px] py-[3px] border border-[#E6E6E8] rounded-[5px] bg-white text-[#0B0B0C] glint-btn-hover"),
+              h.cursor(Cursor.Pointer),
+              h.onClick(Message.OpenContextMenu { kind: CTX_PALETTE, x: 260.0, y: 460.0 }),
+            ],
+            &[
+              paletteSwatch(h, curPal, 26.0, 8.0),
+              txt(h, paletteName(m.palette), "text-[11px] leading-[14px] text-[#0B0B0C]"),
+              txt(h, "▾", "text-[10px] text-[#8A8A90]"),
+            ],
+          ),
+        ],
+      ),
+      compactSlider(m, h, SLIDER_SPEC_OPACITY, "α", 42.0, m.specOpacity),
+      compactSlider(m, h, SLIDER_BRIGHTNESS, "Bright", 42.0, brNorm),
+      compactSlider(m, h, SLIDER_CONTRAST, "Contrast", 42.0, ctNorm),
+      compactSlider(m, h, SLIDER_FLOOR_DB, "Floor", 42.0, flNorm),
+      compactSlider(m, h, SLIDER_CEILING_DB, "Ceil", 42.0, clNorm),
+      compactSlider(m, h, SLIDER_CLARITY, "Clarity", 42.0, claNorm),
+      h.box(&[h.class("flex-1")], &[]),
+      h.row(
+        &[h.class("items-center gap-[6px] shrink-0")],
+        &[
+          h.text("Formant max"),
+          h.row(
+            &[h.class("glint-mono text-[10px] border border-[#E6E6E8] rounded-[5px] overflow-hidden")],
+            &[
+              fcBtn(h, "5.0k", f64.abs(fc - 5000.0) < 100.0, 5000.0),
+              fcBtn(h, "5.5k", f64.abs(fc - 5500.0) < 100.0, 5500.0),
+              fcBtn(h, "6.0k", f64.abs(fc - 6000.0) < 100.0, 6000.0),
+            ],
+          ),
+        ],
+      ),
+      compactSlider(m, h, SLIDER_VOLUME, "Vol", 38.0, m.volume),
+    ],
+  )
+}
+
+fn fcBtn(h: &Document<Message>, label: string, active: bool, hz: f64) -> Node {
+  return h.box(
+    &[
+      h.class("px-[6px] py-[3px]"),
+      h.classSelect(active, "bg-[#0B0B0C] text-white", "bg-white text-[#3A3A3F] glint-btn-hover"),
+      h.cursor(Cursor.Pointer),
+      h.onClick(Message.SetFormantCeilingPreset { hz: hz }),
+    ],
+    &[txt(h, label, "glint-mono text-[10px] leading-[12px]")],
+  )
+}
+
+// ============================================================================
+// Right Readouts Rail (300px)
+// ============================================================================
+
+fn renderReadoutsRail(m: &Overtone, h: &Document<Message>) -> Node {
+  return h.column(
+    &[
+      h.class("shrink-0 bg-white overflow-y-auto"),
+      h.style(&[css.width(px(m.readoutsWidth))]),
+    ],
+    &[
+      renderMatchCard(m, h),
+      renderMetricsRow(m, h),
+      renderPitchTuner(m, h),
+      renderSizeWeightPad(m, h),
+      renderVowelsCard(m, h),
+      renderSpectrumCard(m, h),
+    ],
+  )
+}
+
+fn renderMatchCard(m: &Overtone, h: &Document<Message>) -> Node {
+  let useSel = m.hasSelection && m.selCompare.valid
+  let sc = if useSel { m.selCompare.score } else { m.compare.score }
+  let valid = m.refClip.active && sc.valid
+  let overallNum = if valid { pctDigits(u32.toI32(sc.overall)) } else { "—" }
+
+  return h.column(
+    &[h.class("px-[16px] pt-[12px] pb-[12px] gap-[10px] border-b border-[#E6E6E8] shrink-0")],
+    &[
+      h.row(
+        &[h.class("items-center justify-between")],
+        &[
+          txt(
+            h,
+            if useSel { "Match vs ref · sel" } else { "Match vs ref" },
+            "text-[11px] leading-[14px] font-semibold tracking-[0.06em] uppercase text-[#6B6B70]",
+          ),
+          h.row(
+            &[h.class("items-center gap-[8px]")],
+            &[
+              txtA(
+                h,
+                if m.refClip.active { "Weights ▾" } else { "Pin ref" },
+                &[
+                  h.class("text-[11px] leading-[14px] text-[#6B6B70] hover:text-[#0B0B0C]"),
+                  h.cursor(Cursor.Pointer),
+                  h.onClick(if m.refClip.active { Message.OpenSettingsTab { tab: SET_COMPARE } } else { Message.PinReference }),
+                ],
+              ),
+              railHeaderBtn(h, "›", false, Message.ToggleReadouts),
+            ],
+          ),
+        ],
+      ),
+      if valid {
+        h.row(
+          &[h.class("items-center gap-[16px]")],
+          &[
+            h.row(
+              &[h.class("items-baseline gap-[2px] shrink-0")],
+              &[
+                txt(h, overallNum, "text-[46px] leading-[44px] font-extrabold tracking-[-0.05em] text-[#0B0B0C]"),
+                txt(h, "%", "text-[16px] font-semibold text-[#6B6B70]"),
+              ],
+            ),
+            h.column(
+              &[h.class("flex-1 gap-[5px]")],
+              &[
+                scoreBarRow(h, "Pitch", u32.toI32(sc.pitchScore), m.readoutWeakestMetric == 1),
+                scoreBarRow(h, "Size", u32.toI32(sc.sizeScore), m.readoutWeakestMetric == 2),
+                scoreBarRow(h, "Weight", u32.toI32(sc.weightScore), m.readoutWeakestMetric == 3),
+                scoreBarRow(h, "Vowels", u32.toI32(sc.vowelScore), m.readoutWeakestMetric == 4),
+              ],
+            ),
+          ],
+        )
+      } else {
+        txt(
+          h,
+          "Pin any take as a reference (P) to score pitch, vocal tract size, weight, and vowel match.",
+          "text-[12px] leading-[17px] text-[#6B6B70]",
+        )
+      },
+      if valid && String.byteLength(String.view(&m.readoutCoachHint)) > 0 {
+        txt(h, String.view(&m.readoutCoachHint), "text-[12px] leading-[16px] text-[#3A3A40]")
+      } else {
+        h.empty()
+      },
+    ],
+  )
+}
+
+fn scoreBarRow(h: &Document<Message>, label: string, val: i32, alert: bool) -> Node {
+  let pct = i32.toF32(if val < 0 { 0 } else if val > 100 { 100 } else { val })
+  return h.row(
+    &[h.class("items-center gap-[8px]")],
+    &[
+      txtA(
+        h,
+        label,
+        &[
+          h.class("w-[42px] shrink-0 text-[11px] leading-[13px]"),
+          h.classSelect(alert, "text-[#D9381E] font-semibold", "text-[#6B6B70]"),
+        ],
+      ),
+      h.box(
+        &[h.class("flex-1 h-[3px] bg-[#ECECEE] flex overflow-hidden rounded-[2px]")],
+        &[
+          h.box(
+            &[
+              h.class("h-full rounded-[2px]"),
+              h.classSelect(alert, "bg-[#D9381E]", "bg-[#0B0B0C]"),
+              h.style(&[css.width(percent(pct))]),
+            ],
+            &[],
+          ),
+        ],
+      ),
+      txtA(
+        h,
+        pctDigits(val),
+        &[
+          h.class("w-[20px] shrink-0 text-right glint-mono text-[10px] leading-[12px]"),
+          h.classSelect(alert, "text-[#D9381E] font-semibold", "text-[#0B0B0C]"),
+        ],
+      ),
+    ],
+  )
+}
+
+fn renderMetricsRow(m: &Overtone, h: &Document<Message>) -> Node {
+  return h.row(
+    &[h.class("px-[16px] py-[10px] border-b border-[#E6E6E8] gap-[6px] shrink-0")],
+    &[
+      metricCol(h, "F0", String.view(&m.readoutHz), String.view(&m.readoutDeltaPitch), m.readoutWeakestMetric == 1),
+      metricCol(h, "VTL", String.view(&m.readoutVtl), String.view(&m.readoutDeltaVtl), m.readoutWeakestMetric == 2),
+      metricCol(h, "H1–H2", String.view(&m.readoutH1H2), String.view(&m.readoutDeltaWeight), m.readoutWeakestMetric == 3),
+      metricCol(h, "HNR", String.view(&m.readoutHnr), if m.readoutVoiced { "ok" } else { "—" }, false),
+    ],
+  )
+}
+
+fn metricCol(h: &Document<Message>, label: string, val: string, delta: string, alert: bool) -> Node {
+  let hasDelta = String.byteLength(delta) > 0
+  return h.column(
+    &[h.class("flex-1 min-w-0 gap-[1px]")],
+    &[
+      txt(h, label, "text-[10px] leading-[12px] text-[#6B6B70]"),
+      txt(h, val, "text-[13px] leading-[17px] font-bold tracking-[-0.01em] text-[#0B0B0C] truncate"),
+      txtA(
+        h,
+        if hasDelta { delta } else { "—" },
+        &[
+          h.class("glint-mono text-[10px] leading-[12px] truncate"),
+          h.classSelect(alert && hasDelta, "text-[#D9381E]", "text-[#6B6B70]"),
+        ],
+      ),
+    ],
+  )
+}
+
+fn renderPitchTuner(m: &Overtone, h: &Document<Message>) -> Node {
+  let centsClamped = f32.max(-50.0, f32.min(50.0, i32.toF32(m.readoutCentsVal)))
+  let needlePct = 50.0 + centsClamped
+  let barLeft = f32.min(50.0, needlePct)
+  let barWidth = f32.abs(needlePct - 50.0)
+  return h.row(
+    &[h.class("items-center gap-[12px] px-[16px] py-[8px] border-b border-[#E6E6E8] shrink-0")],
+    &[
+      h.row(
+        &[h.class("items-baseline gap-[4px] w-[62px] shrink-0")],
+        &[
+          txt(h, String.view(&m.readoutNote), "text-[19px] leading-[22px] font-bold tracking-[-0.02em] text-[#0B0B0C]"),
+          txt(h, String.view(&m.readoutCents), "glint-mono text-[10px] leading-[12px] text-[#6B6B70]"),
+        ],
+      ),
+      h.column(
+        &[h.class("flex-1 gap-[3px]")],
+        &[
+          h.box(
+            &[h.class("relative h-[12px] flex")],
+            &[
+              h.box(&[h.class("absolute left-0 right-0 top-[5px] h-[2px] bg-[#E6E6E8] rounded-[1px]")], &[]),
+              h.box(&[h.class("absolute left-[50%] top-[1px] w-[1px] h-[10px] bg-[#9A9AA2]")], &[]),
+              if m.readoutVoiced {
+                h.box(
+                  &[
+                    h.class("absolute top-[5px] h-[2px] bg-[#0B0B0C]"),
+                    h.style(&[css.left(percent(barLeft)), css.width(percent(barWidth))]),
+                  ],
+                  &[],
+                )
+              } else {
+                h.empty()
+              },
+              if m.readoutVoiced {
+                h.box(
+                  &[
+                    h.class("absolute top-[1px] w-[3px] h-[10px] bg-[#0B0B0C] rounded-[1px]"),
+                    h.style(&[css.left(percent(f32.max(1.0, f32.min(97.0, needlePct - 1.0))))]),
+                  ],
+                  &[],
+                )
+              } else {
+                h.empty()
+              },
+            ],
+          ),
+          h.row(
+            &[h.class("w-full justify-between glint-mono text-[9px] leading-[10px] text-[#9A9AA2]")],
+            &[
+              h.text("−50"),
+              h.text(if m.readoutVoiced { "0¢" } else { "unvoiced" }),
+              h.text("+50"),
+            ],
+          ),
+        ],
+      ),
+    ],
+  )
+}
+
+fn renderSizeWeightPad(m: &Overtone, h: &Document<Message>) -> Node {
+  return h.column(
+    &[h.class("px-[16px] py-[10px] gap-[6px] border-b border-[#E6E6E8] shrink-0")],
+    &[
+      h.row(
+        &[h.class("items-center justify-between")],
+        &[
+          txt(h, "Size × weight", "text-[11px] leading-[14px] font-semibold tracking-[0.06em] uppercase text-[#6B6B70]"),
+          txt(h, "● you ○ ref", "text-[10px] leading-[12px] text-[#6B6B70]"),
+        ],
+      ),
+      h.column(
+        &[h.class("w-full gap-[2px]")],
+        &[
+          h.row(
+            &[h.class("w-full justify-between text-[9px] leading-[11px] text-[#9A9AA0]")],
+            &[h.text("Hollow"), h.text("Light + small")],
+          ),
+          h.box(
+            &[
+              h.class("w-full rounded-[4px] bg-[#F7F7F8] overflow-hidden"),
+              h.style(&[css.height(px(PAD_H))]),
+            ],
+            &[h.drawing(&m.sizeWeightDrawing, &[h.class("w-full h-full")])],
+          ),
+          h.row(
+            &[h.class("w-full justify-between text-[9px] leading-[11px] text-[#9A9AA0]")],
+            &[h.text("Heavy + big"), h.text("Overfull")],
+          ),
+        ],
+      ),
+    ],
+  )
+}
+
+fn vowelLabelNode(h: &Document<Message>, idx: usize, useMasc: bool, plotW: f32) -> Node {
+  let v = if useMasc { VOWELS_MASC[idx] } else { VOWELS_FEM[idx] }
+  let vx = f32.max(4.0, f32.min(plotW - 18.0, vowelX(v.f2, plotW) - 6.0))
+  let vy = f32.max(2.0, f32.min(VOWEL_H - 14.0, vowelY(v.f1, VOWEL_H) - 12.0))
+  return txtA(
+    h,
+    v.ipa,
+    &[
+      h.class("absolute text-[10px] leading-[12px] font-semibold text-[#3A3A40] hover:text-[#D9381E]"),
+      h.style(&[css.left(px(vx)), css.top(px(vy))]),
+      h.cursor(Cursor.Pointer),
+      h.onClick(Message.ApplyVowelGuides { idx: idx, useMasc: useMasc }),
+    ],
+  )
+}
+
+fn renderVowelsCard(m: &Overtone, h: &Document<Message>) -> Node {
+  let vowelAlert = m.readoutWeakestMetric == 4
+  let useMasc = m.vowelMode == VOWEL_MODE_MASC
+  let plotW = f32.max(180.0, m.readoutsWidth - 32.0)
+  return h.column(
+    &[h.class("px-[16px] py-[10px] gap-[6px] border-b border-[#E6E6E8] shrink-0")],
+    &[
+      h.row(
+        &[h.class("items-center justify-between")],
+        &[
+          h.row(
+            &[h.class("items-center gap-[6px]")],
+            &[
+              txt(h, "Vowels", "text-[11px] leading-[14px] font-semibold tracking-[0.06em] uppercase text-[#6B6B70]"),
+              if m.readoutVowel != "—" {
+                txt(h, m.readoutVowel, "glint-mono text-[11px] font-semibold text-[#0B0B0C]")
+              } else {
+                h.empty()
+              },
+            ],
+          ),
+          h.row(
+            &[h.class("gap-[2px] text-[10px] text-[#6B6B70]")],
+            &[
+              miniTabBtn(h, "Fem", m.vowelMode == VOWEL_MODE_FEM, Message.SetVowelMode { mode: VOWEL_MODE_FEM }),
+              miniTabBtn(h, "Masc", m.vowelMode == VOWEL_MODE_MASC, Message.SetVowelMode { mode: VOWEL_MODE_MASC }),
+              miniTabBtn(h, "Both", m.vowelMode == VOWEL_MODE_BOTH, Message.SetVowelMode { mode: VOWEL_MODE_BOTH }),
+            ],
+          ),
+        ],
+      ),
+      h.row(
+        &[h.class("gap-[4px]")],
+        &[
+          formantChip(h, "F1", String.view(&m.readoutF1), false),
+          formantChip(h, "F2", String.view(&m.readoutF2), vowelAlert),
+          formantChip(h, "F3", String.view(&m.readoutF3), false),
+        ],
+      ),
+      h.box(
+        &[
+          h.class("w-full relative rounded-[4px] bg-[#F7F7F8] overflow-hidden"),
+          h.style(&[css.height(px(VOWEL_H))]),
+        ],
+        &[
+          h.drawing(&m.vowelDrawing, &[h.class("absolute inset-0 w-full h-full pointer-events-none")]),
+          vowelLabelNode(h, 0, useMasc, plotW),
+          vowelLabelNode(h, 1, useMasc, plotW),
+          vowelLabelNode(h, 3, useMasc, plotW),
+          vowelLabelNode(h, 4, useMasc, plotW),
+          vowelLabelNode(h, 5, useMasc, plotW),
+          vowelLabelNode(h, 6, useMasc, plotW),
+          vowelLabelNode(h, 9, useMasc, plotW),
+        ],
+      ),
+    ],
+  )
+}
+
+fn miniTabBtn(h: &Document<Message>, label: string, active: bool, msg: Message) -> Node {
+  return h.box(
+    &[
+      h.class("px-[5px] py-[2px] rounded-[4px]"),
+      h.classSelect(active, "bg-[#F1F1F2] text-[#0B0B0C] font-medium", "text-[#6B6B70] glint-btn-hover"),
+      h.cursor(Cursor.Pointer),
+      h.onClick(move msg),
+    ],
+    &[txt(h, label, "text-[10px] leading-[12px]")],
+  )
+}
+
+fn formantChip(h: &Document<Message>, label: string, val: string, alert: bool) -> Node {
+  return h.row(
+    &[
+      h.class("flex-1 px-[6px] py-[4px] rounded-[4px] justify-between items-center"),
+      h.classSelect(alert, "bg-[#FDECE8]", "bg-[#F7F7F8]"),
+    ],
+    &[
+      txtA(h, label, &[h.class("text-[10px] leading-[12px]"), h.classSelect(alert, "text-[#D9381E]", "text-[#6B6B70]")]),
+      txtA(h, val, &[h.class("glint-mono text-[10px] leading-[12px]"), h.classSelect(alert, "text-[#D9381E]", "text-[#0B0B0C]")]),
+    ],
+  )
+}
+
+fn renderSpectrumCard(m: &Overtone, h: &Document<Message>) -> Node {
+  return h.column(
+    &[h.class("px-[16px] py-[10px] gap-[6px] flex-1 shrink-0")],
+    &[
+      h.row(
+        &[h.class("items-center justify-between")],
+        &[
+          txt(
+            h,
+            if m.showLtasTab { "LTAS · long-term" } else { "Slice + LPC" },
+            "text-[11px] leading-[14px] font-semibold tracking-[0.06em] uppercase text-[#6B6B70]",
+          ),
+          h.row(
+            &[h.class("gap-[2px]")],
+            &[
+              miniTabBtn(h, "Slice", !m.showLtasTab, Message.SetSpectrumTab { ltas: false }),
+              miniTabBtn(h, "LTAS", m.showLtasTab, Message.SetSpectrumTab { ltas: true }),
+            ],
+          ),
+        ],
+      ),
+      h.box(
+        &[
+          h.class("w-full rounded-[4px] bg-[#F7F7F8] overflow-hidden"),
+          h.style(&[css.height(px(96.0))]),
+          h.onLayout(|r| Message.SliceLayout { rect: r }),
+        ],
+        &[
+          if m.showLtasTab {
+            h.drawing(&m.ltasDrawing, &[h.class("w-full h-full")])
+          } else {
+            h.drawing(&m.sliceDrawing, &[h.class("w-full h-full")])
+          },
+        ],
+      ),
+    ],
+  )
+}
+
+// ============================================================================
+// Bottom Status Bar (24px)
+// ============================================================================
+
+fn renderStatusBar(m: &Overtone, h: &Document<Message>) -> Node {
+  let lvl = levelPct(m.inputLevelDb)
+  return h.row(
+    &[h.class("h-[24px] shrink-0 items-center gap-[14px] px-[12px] border-t border-[#E6E6E8] bg-[#FAFAFA] glint-mono text-[10px] leading-[12px] text-[#6B6B70]")],
+    &[
+      h.row(
+        &[
+          h.class("items-center gap-[6px] shrink-0 px-[6px] py-[2px] rounded-[4px] border border-[#E2E2E5] bg-white glint-btn-hover"),
+          h.cursor(Cursor.Pointer),
+          h.onClick(Message.OpenContextMenu { kind: CTX_AUDIO, x: 12.0, y: -1.0 }),
+        ],
+        &[
+          txt(h, "Mic", "text-[10px] font-semibold text-[#6B6B70]"),
+          txt(h, String.view(&m.readoutActiveMic), "text-[11px] text-[#0B0B0C] max-w-[160px] truncate"),
+          txt(h, "▾", "text-[10px] text-[#6B6B70]"),
+          h.box(
+            &[h.class("w-[48px] h-[4px] bg-[#E6E6E8] rounded-[2px] flex overflow-hidden")],
+            &[h.box(&[h.class("h-full bg-[#0B0B0C] rounded-[2px]"), h.style(&[css.width(percent(lvl))])], &[])],
+          ),
+          txt(h, String.view(&m.readoutDb), "glint-mono text-[10px] text-[#6B6B70]"),
+        ],
+      ),
+      h.box(&[h.class("w-[1px] h-[12px] bg-[#E0E0E2] shrink-0")], &[]),
+      txt(
+        h,
+        if String.byteLength(String.view(&m.readoutCursorLine)) > 0 {
+          String.view(&m.readoutCursorLine)
+        } else {
+          String.view(&m.statusMsg)
+        },
+        "text-[#0B0B0C] truncate",
+      ),
+      h.box(&[h.class("flex-1")], &[]),
+      txt(h, "Right-click for menu · ⇧-drag select · G guide · F5 pitch · ⌘, settings", "text-[#6B6B70] shrink-0"),
+    ],
+  )
+}

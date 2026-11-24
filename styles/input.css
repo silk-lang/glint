@@ -1,0 +1,61 @@
+@import "tailwindcss" source(none);
+@source "../src/**/*.silk";
+
+@theme {
+  --font-sans: "Inter Tight", "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+}
+
+@layer components {
+  .glint-root {
+    font-family: "Inter Tight", "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
+    background-color: #ffffff;
+    color: #0b0b0c;
+  }
+
+  .glint-mono {
+    font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  }
+
+  .glint-menu {
+    background-color: #ffffff;
+    border-radius: 8px;
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.16);
+  }
+
+  .glint-modal {
+    background-color: #ffffff;
+    border-radius: 10px;
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.28);
+  }
+
+  .glint-keycap {
+    padding: 1px 5px;
+    border: 1px solid #dcdcdf;
+    border-bottom-width: 2px;
+    border-radius: 3px;
+    font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+    font-size: 10px;
+    line-height: 14px;
+    color: #0b0b0c;
+    background-color: #ffffff;
+  }
+
+  .glint-drag-ghost {
+    background-color: #0e0e10;
+    border-radius: 6px;
+    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.25);
+    color: #ffffff;
+  }
+
+  .glint-btn-hover:hover {
+    background-color: #f1f1f2;
+  }
+
+  .glint-menu-item:hover {
+    background-color: #0e0e10;
+    color: #ffffff;
+  }
+}

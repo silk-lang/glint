@@ -1,0 +1,42 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  web:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: silk-lang/action@main
+        with:
+          cache-paths: |
+            build
+            web-pkg/build
+
+      - name: Build Glint web bundle
+        run: ./scripts/build-web.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glint-web
+          path: dist/web
+
+      - name: Deploy to Cloudflare
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: npx --yes wrangler@4 deploy
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

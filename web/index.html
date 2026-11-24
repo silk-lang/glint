@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Glint — Voice Analysis Studio</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./app.css" />
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #ffffff;
+      color: #0b0b0c;
+      font-family: "Inter Tight", "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    #app {
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+      position: relative;
+    }
+    #glint-loading {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      background: #ffffff;
+      color: #0b0b0c;
+      z-index: 999;
+      font-size: 13px;
+    }
+    #glint-loading .brand {
+      font-size: 20px;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+    }
+    #glint-loading .sub {
+      color: #6b6b70;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+    }
+    #glint-drop-overlay {
+      position: fixed;
+      inset: 12px;
+      border: 2px dashed #0e0e10;
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.92);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      gap: 6px;
+      z-index: 900;
+      pointer-events: none;
+    }
+    #glint-drop-overlay.visible {
+      display: flex;
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="glint-loading">
+    <div class="brand">Glint</div>
+    <div class="sub">Loading WASM studio &amp; browser library…</div>
+  </div>
+  <div id="glint-drop-overlay">
+    <div style="font-size:16px;font-weight:700;color:#0b0b0c;">Drop audio file to analyse</div>
+    <div style="font-size:12px;color:#6b6b70;">WAV · MP3 · M4A · FLAC · OGG · WebM</div>
+  </div>
+  <input id="glint-file-input" type="file" accept="audio/*,.wav,.mp3,.m4a,.flac,.aiff,.ogg,.webm" style="display:none" />
+  <script type="module" src="./glint-host.js"></script>
+</body>
+</html>

@@ -1,0 +1,1191 @@
+//! Glint floating overlays: Guides popover, all 8 Context Menus, Settings Modal (7 tabs), and Drag Ghost.
+import audio_native { AudioDeviceInfo, SORT_ALPHA, SORT_OVERALL, SORT_PITCH, SORT_SIZE, SORT_VOWEL, SORT_WEIGHT }
+import colormap { paletteIndex }
+import formants { VOWEL_MODE_BOTH, VOWEL_MODE_FEM, VOWEL_MODE_MASC }
+import overlays { GuideBadge }
+import studio {
+  CTX_AUDIO,
+  CTX_EXPLORER_DIR,
+  CTX_EXPLORER_FILE,
+  CTX_EXPLORER_ROOT,
+  CTX_LIB_SORT,
+  CTX_NONE,
+  CTX_PALETTE,
+  CTX_SPEC,
+  CTX_SPEED,
+  Message,
+  Overtone,
+  SET_ANALYZER,
+  SET_AUDIO,
+  SET_COMPARE,
+  SET_DISPLAY,
+  SET_GUIDES,
+  SET_PLAYBACK,
+  SET_SHORTCUTS,
+  SLIDER_BRIGHTNESS,
+  SLIDER_CEILING_DB,
+  SLIDER_CLARITY,
+  SLIDER_CONTRAST,
+  SLIDER_FLOOR_DB,
+  SLIDER_FORMANT_CEIL,
+  SLIDER_PITCH_CEIL,
+  SLIDER_PITCH_FLOOR,
+  SLIDER_PLAY_SPEED,
+  SLIDER_SILENCE_HOLD,
+  SLIDER_SPEC_OPACITY,
+  SLIDER_VAD_THRESH,
+  SLIDER_VOLUME,
+  SLIDER_W_PITCH,
+  SLIDER_W_SIZE,
+  SLIDER_W_VOWEL,
+  SLIDER_W_WEIGHT
+}
+import view_components {
+  countStr,
+  menuHeader,
+  menuItem,
+  menuPaletteItem,
+  menuSep,
+  menuSpeedItem,
+  paletteSwatch,
+  segOption,
+  settingsSection,
+  settingsSliderRow,
+  shortcutRow,
+  toggleSwitch,
+  txt,
+  txtA
+}
+import loom.css
+import loom.css { px }
+import loom.lib { Cursor, Document, Node }
+import silk.num.f32
+import silk.num.f64
+import silk.num.i32
+import silk.num.u32
+import silk.text.string { String }
+
+fn clampMenuX(x: f32, menuW: f32) -> f32 {
+  let maxX = f32.max(12.0, 1420.0 - menuW)
+  return f32.max(8.0, f32.min(maxX, x))
+}
+
+fn clampMenuY(y: f32, menuH: f32) -> f32 {
+  let maxY = f32.max(48.0, 840.0 - menuH)
+  return f32.max(44.0, f32.min(maxY, y))
+}
+
+/// Anchored floating Guides Popover (320px white card under Toolbar -> Guides).
+pub fn renderGuidesPopover(m: &Overtone, h: &Document<Message>) -> Node {
+  if !m.showGuidesPanel {
+    return h.empty()
+  }
+  let badges = m.guideLabels.asSlice()
+  let hasGuides = badges.length > 0
+  return h.box(
+    &[h.class("fixed inset-0 z-40")],
+    &[
+      h.box(
+        &[
+          h.class("absolute inset-0"),
+          h.onClick(Message.ToggleGuidesPanel),
+        ],
+        &[],
+      ),
+      h.column(
+        &[
+          h.class("absolute z-10 top-[86px] left-[470px] w-[320px] glint-menu p-[12px] gap-[10px]"),
+        ],
+        &[
+          h.row(
+            &[h.class("gap-[6px]")],
+            &[
+              h.input(
+                String.view(&m.guideInputDraft),
+                &[
+                  h.class("flex-1 px-[8px] py-[5px] border-[1.5px] border-[#0E0E10] rounded-[5px] glint-mono text-[12px] leading-[16px] text-[#0B0B0C] bg-white"),
+                  h.placeholder("220, A3, C#4, 1.8k"),
+                  h.onInput(|t| Message.GuideInputChanged { text: move t }),
+                  h.onEnter(Message.AddGuideFromInput),
+                  h.onFocus(Message.TextFocusChanged { focused: true }),
+                  h.onBlur(Message.TextFocusChanged { focused: false }),
+                ],
+              ),
+              h.box(
+                &[
+                  h.class("px-[12px] py-[5px] rounded-[5px] bg-[#0E0E10] flex items-center justify-center shrink-0"),
+                  h.cursor(Cursor.Pointer),
+                  h.onClick(Message.AddGuideFromInput),
+                ],
+                &[txt(h, "Add", "text-[12px] leading-[16px] font-semibold text-white")],
+              ),
+            ],
+          ),
+          txt(h, "Hz or note — 220, A3, C#4, 1.8k", "text-[11px] leading-[14px] text-[#8A8A90]"),
+          h.row(
+            &[h.class("flex-wrap gap-[5px]")],
+            &[
+              guideQuickChip(h, "at cursor F0", Message.AddGuideAtCursor),
+              if m.refClip.active {
+                guideQuickChip(h, "ref average", Message.AddGuideAtRefMean)
+              } else {
+                h.empty()
+              },
+              guideQuickChip(h, "G3", Message.AddGuideHz { hz: 196.0 }),
+              guideQuickChip(h, "A3", Message.AddGuideHz { hz: 220.0 }),
+              guideQuickChip(h, "C4", Message.AddGuideHz { hz: 261.63 }),
+              guideQuickChip(h, "500", Message.AddGuideHz { hz: 500.0 }),
+              guideQuickChip(h, "1.8k", Message.AddGuideHz { hz: 1800.0 }),
+            ],
+          ),
+          h.box(&[h.class("h-[1px] bg-[#ECECEE]")], &[]),
+          h.row(
+            &[h.class("items-center justify-between")],
+            &[
+              h.row(
+                &[h.class("items-center gap-[4px]")],
+                &[
+                  txt(h, "On spectrogram · ", "text-[10px] leading-[12px] font-semibold tracking-[0.07em] uppercase text-[#8A8A90]"),
+                  txt(h, countStr(badges.length), "glint-mono text-[10px] leading-[12px] font-semibold text-[#8A8A90]"),
+                ],
+              ),
+              if hasGuides {
+                txtA(
+                  h,
+                  "Clear all",
+                  &[
+                    h.class("text-[11px] leading-[14px] text-[#6B6B70] underline"),
+                    h.cursor(Cursor.Pointer),
+                    h.onClick(Message.ClearGuides),
+                  ],
+                )
+              } else {
+                h.empty()
+              },
+            ],
+          ),
+          if hasGuides {
+            h.column(
+              &[h.class("gap-[2px]")],
+              &[
+                h.each<GuideBadge>(
+                  badges,
+                  |gb| h.row(
+                    &[h.class("items-center justify-between py-[3px]")],
+                    &[
+                      txt(h, String.view(&gb.label), "glint-mono text-[12px] leading-[16px] text-[#0B0B0C]"),
+                      txtA(
+                        h,
+                        "×",
+                        &[
+                          h.class("text-[13px] leading-[16px] text-[#8A8A90] px-[4px] hover:text-[#0B0B0C]"),
+                          h.cursor(Cursor.Pointer),
+                          h.onClick(Message.RemoveGuide { idx: gb.idx }),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            )
+          } else {
+            txt(h, "No guide lines yet. Press G on the spectrogram or click a preset above.", "text-[11px] leading-[15px] text-[#8A8A90]")
+          },
+        ],
+      ),
+    ],
+  )
+}
+
+fn guideQuickChip(h: &Document<Message>, label: string, msg: Message) -> Node {
+  return h.box(
+    &[
+      h.class("px-[7px] py-[2px] border border-[#DCDCDF] rounded-[4px] bg-white glint-btn-hover"),
+      h.cursor(Cursor.Pointer),
+      h.onClick(move msg),
+    ],
+    &[txt(h, label, "glint-mono text-[11px] leading-[16px] text-[#3A3A3F]")],
+  )
+}
+
+/// All 8 floating context / dropdown menus matching the Glint Context Menus board.
+pub fn renderContextMenu(m: &Overtone, h: &Document<Message>) -> Node {
+  if m.ctxMenuKind == CTX_NONE {
+    return h.empty()
+  }
+
+  let content: Node = if m.ctxMenuKind == CTX_SPEC {
+    let menuX = clampMenuX(m.ctxMenuX, 254.0)
+    let menuY = clampMenuY(m.ctxMenuY, 440.0)
+    let nearGuide = m.ctxMenuGuideIdx >= 0
+    h.column(
+      &[
+        h.class("absolute w-[250px] p-[4px] glint-menu"),
+        h.style(&[css.left(px(menuX)), css.top(px(menuY))]),
+      ],
+      &[
+        menuHeader(h, String.view(&m.ctxMenuHeader)),
+        menuItem(h, false, "Add guide here", "G", false, true, Message.AddGuideHz { hz: m.ctxMenuFreqHz }),
+        if nearGuide {
+          menuItem(h, false, "Remove this guide", "", false, false, Message.RemoveGuide { idx: i32.toUsize(m.ctxMenuGuideIdx) })
+        } else {
+          h.empty()
+        },
+        if m.guides.length() > 0 {
+          menuItem(h, false, "Clear all guides", "", false, false, Message.ClearGuides)
+        } else {
+          h.empty()
+        },
+        menuSep(h),
+        menuItem(h, false, "Play from here", "Space", false, false, Message.PlayFromTime { sec: m.ctxMenuTimeSec }),
+        menuItem(h, false, "Average pitch of selection", "F5", false, false, Message.QuerySelectionPitch),
+        menuItem(h, false, "Pin take as reference", "P", false, false, Message.PinReference),
+        menuItem(h, false, "Reset zoom", "0", false, false, Message.ResetView),
+        menuSep(h),
+        menuItem(h, false, "Select all", "⌘A", false, false, Message.SelectAll),
+        menuItem(h, false, "Copy", "⌘C", false, false, Message.CopySelection),
+        menuItem(h, false, "Cut", "⌘X", false, false, Message.CutSelection),
+        menuItem(h, false, "Paste here", "⌘V", false, false, Message.PasteAtTime { sec: m.ctxMenuTimeSec }),
+        menuItem(h, false, "Delete", "⌫", false, false, Message.DeleteSelection),
+        menuItem(h, false, "Undo edit", "⌘Z", false, false, Message.UndoEdit),
+        if m.hasSelection {
+          menuItem(h, false, "Save selection as take", "", false, false, Message.SaveSelectionAsClip)
+        } else {
+          h.empty()
+        },
+        menuSep(h),
+        menuItem(h, false, "Settings…", "⌘,", false, false, Message.ToggleSettings),
+      ],
+    )
+  } else if m.ctxMenuKind == CTX_AUDIO {
+    let menuX = clampMenuX(m.ctxMenuX, 260.0)
+    let fromBottom = m.ctxMenuY < 0.0
+    let menuY: f32 = if fromBottom { 0.0 } else { clampMenuY(m.ctxMenuY, 320.0) }
+    let ins = m.inputDevices.asSlice()
+    let outs = m.outputDevices.asSlice()
+    let selIn = m.selectedInputId
+    let selOut = m.selectedOutputId
+    h.column(
+      &[
+        h.class("absolute w-[250px] p-[4px] glint-menu"),
+        if fromBottom {
+          h.class("bottom-[30px]")
+        } else {
+          h.style(&[css.top(px(menuY))])
+        },
+        h.style(&[css.left(px(menuX))]),
+      ],
+      &[
+        menuHeader(h, "Microphone"),
+        if ins.length > 0 {
+          h.each<AudioDeviceInfo>(
+            ins,
+            |d| menuItem(h, d.id == selIn, String.view(&d.name), "", false, false, Message.SelectInputDevice { id: d.id }),
+          )
+        } else {
+          menuItem(h, true, "Default Microphone", "", false, false, Message.CloseContextMenu)
+        },
+        menuSep(h),
+        menuHeader(h, "Output"),
+        if outs.length > 0 {
+          h.each<AudioDeviceInfo>(
+            outs,
+            |d| menuItem(h, d.id == selOut, String.view(&d.name), "", false, false, Message.SelectOutputDevice { id: d.id }),
+          )
+        } else {
+          menuItem(h, true, "Default Output", "", false, false, Message.CloseContextMenu)
+        },
+        menuSep(h),
+        menuItem(h, false, "Rescan devices", "", false, false, Message.RefreshAudioDevices),
+        menuItem(h, false, "Audio settings…", "⌘,", false, false, Message.OpenSettingsTab { tab: SET_AUDIO }),
+      ],
+    )
+  } else if m.ctxMenuKind == CTX_PALETTE {
+    let menuX = clampMenuX(m.ctxMenuX, 236.0)
+    let menuY = clampMenuY(m.ctxMenuY, 380.0)
+    let cur = paletteIndex(m.palette)
+    let isDim = m.showSpectrogram && m.specOpacity < 0.5
+    let isFull = m.showSpectrogram && m.specOpacity >= 0.85
+    h.column(
+      &[
+        h.class("absolute w-[230px] p-[4px] glint-menu"),
+        h.style(&[css.left(px(menuX)), css.top(px(menuY))]),
+      ],
+      &[
+        menuHeader(h, "Colormap"),
+        menuPaletteItem(h, cur == 0, 0, "Muted", "new", Message.SelectPalette { idx: 0 }),
+        menuPaletteItem(h, cur == 1, 1, "VoceVista", "", Message.SelectPalette { idx: 1 }),
+        menuPaletteItem(h, cur == 2, 2, "Inferno", "", Message.SelectPalette { idx: 2 }),
+        menuPaletteItem(h, cur == 3, 3, "Magma", "", Message.SelectPalette { idx: 3 }),
+        menuPaletteItem(h, cur == 4, 4, "Viridis", "", Message.SelectPalette { idx: 4 }),
+        menuPaletteItem(h, cur == 5, 5, "Ocean", "", Message.SelectPalette { idx: 5 }),
+        menuPaletteItem(h, cur == 6, 6, "Grayscale", "", Message.SelectPalette { idx: 6 }),
+        menuPaletteItem(h, cur == 7, 7, "Praat light", "", Message.SelectPalette { idx: 7 }),
+        menuSep(h),
+        menuItem(h, isDim, "Dim to 35%", "", false, false, Message.SetSpecOpacityPreset { opacity: 0.35 }),
+        menuItem(h, isFull, "Full strength", "", false, false, Message.SetSpecOpacityPreset { opacity: 1.0 }),
+        menuItem(h, !m.showSpectrogram, "Hide spectrogram", "H", false, false, Message.ToggleSpectrogram),
+        menuSep(h),
+        menuItem(h, false, "Display settings…", "", false, false, Message.OpenSettingsTab { tab: SET_DISPLAY }),
+      ],
+    )
+  } else if m.ctxMenuKind == CTX_SPEED {
+    let menuX = clampMenuX(m.ctxMenuX, 216.0)
+    let menuY = clampMenuY(m.ctxMenuY, 320.0)
+    let sp = m.playSpeed
+    h.column(
+      &[
+        h.class("absolute w-[210px] p-[4px] glint-menu"),
+        h.style(&[css.left(px(menuX)), css.top(px(menuY))]),
+      ],
+      &[
+        menuHeader(h, "Speed · pitch locked"),
+        menuSpeedItem(h, f32.abs(sp - 0.25) < 0.03, "0.25×", "Ultra slow", Message.SetPlaySpeed { speed: 0.25 }),
+        menuSpeedItem(h, f32.abs(sp - 0.50) < 0.03, "0.5×", "Half", Message.SetPlaySpeed { speed: 0.50 }),
+        menuSpeedItem(h, f32.abs(sp - 0.75) < 0.03, "0.75×", "Practice", Message.SetPlaySpeed { speed: 0.75 }),
+        menuSpeedItem(h, f32.abs(sp - 0.85) < 0.03, "0.85×", "Slightly slow", Message.SetPlaySpeed { speed: 0.85 }),
+        menuSpeedItem(h, f32.abs(sp - 1.00) < 0.03, "1.0×", "Normal", Message.SetPlaySpeed { speed: 1.00 }),
+        menuSpeedItem(h, f32.abs(sp - 1.25) < 0.03, "1.25×", "Fast", Message.SetPlaySpeed { speed: 1.25 }),
+        menuSpeedItem(h, f32.abs(sp - 1.50) < 0.03, "1.5×", "Faster", Message.SetPlaySpeed { speed: 1.50 }),
+        menuSpeedItem(h, f32.abs(sp - 2.00) < 0.03, "2.0×", "Double", Message.SetPlaySpeed { speed: 2.00 }),
+        menuSep(h),
+        menuItem(h, m.scrubAudio, "Scrub audio on drag", "", false, false, Message.ToggleScrubAudio),
+        menuItem(h, false, "Playback settings…", "", false, false, Message.OpenSettingsTab { tab: SET_PLAYBACK }),
+      ],
+    )
+  } else if m.ctxMenuKind == CTX_EXPLORER_FILE {
+    let menuX = clampMenuX(m.ctxMenuX, 224.0)
+    let menuY = clampMenuY(m.ctxMenuY, 240.0)
+    let idx = m.ctxExplorerIdx
+    let inSub = String.byteLength(String.view(&m.ctxExplorerParentRel)) > 0
+    h.column(
+      &[
+        h.class("absolute w-[220px] p-[4px] glint-menu"),
+        h.style(&[css.left(px(menuX)), css.top(px(menuY))]),
+      ],
+      &[
+        menuHeader(h, String.view(&m.ctxExplorerDisplayName)),
+        menuItem(h, false, "Open", "", false, false, Message.OpenLibClip { idx: idx }),
+        menuItem(h, m.ctxExplorerIsRef, "Set as reference", "P", false, false, Message.SetLibClipAsRef { idx: idx }),
+        menuItem(h, false, "Rename", "F2", false, false, Message.StartRenameEntry { idx: idx }),
+        menuItem(h, m.ctxExplorerStarred, if m.ctxExplorerStarred { "Unstar" } else { "Star" }, "", false, false, Message.ToggleStarLibClip { idx: idx }),
+        if inSub {
+          menuItem(h, false, "Move to root", "", false, false, Message.MoveEntryToRoot { idx: idx })
+        } else {
+          h.empty()
+        },
+        menuSep(h),
+        menuItem(h, false, "Reveal in Finder", "", false, false, Message.RevealEntryInFinder { idx: idx }),
+        menuItem(h, false, "Move to Trash", "", true, false, Message.DeleteLibEntry { idx: idx }),
+      ],
+    )
+  } else if m.ctxMenuKind == CTX_EXPLORER_DIR {
+    let menuX = clampMenuX(m.ctxMenuX, 224.0)
+    let menuY = clampMenuY(m.ctxMenuY, 220.0)
+    let idx = m.ctxExplorerIdx
+    let inSub = String.byteLength(String.view(&m.ctxExplorerParentRel)) > 0
+    h.column(
+      &[
+        h.class("absolute w-[220px] p-[4px] glint-menu"),
+        h.style(&[css.left(px(menuX)), css.top(px(menuY))]),
+      ],
+      &[
+        menuHeader(h, String.view(&m.ctxExplorerDisplayName)),
+        menuItem(h, false, if m.ctxExplorerExpanded { "Collapse" } else { "Expand" }, "", false, false, Message.ToggleLibFolder { idx: idx }),
+        menuItem(h, false, "New subfolder…", "", false, false, Message.OpenNewFolderInEntry { idx: idx }),
+        menuItem(h, false, "Rename", "F2", false, false, Message.StartRenameEntry { idx: idx }),
+        if inSub {
+          menuItem(h, false, "Move to root", "", false, false, Message.MoveEntryToRoot { idx: idx })
+        } else {
+          h.empty()
+        },
+        menuSep(h),
+        menuItem(h, false, "Reveal in Finder", "", false, false, Message.RevealEntryInFinder { idx: idx }),
+        menuItem(h, false, "Move to Trash", "", true, false, Message.DeleteLibEntry { idx: idx }),
+      ],
+    )
+  } else if m.ctxMenuKind == CTX_EXPLORER_ROOT {
+    let menuX = clampMenuX(m.ctxMenuX, 244.0)
+    let menuY = clampMenuY(m.ctxMenuY, 320.0)
+    let isRootSelected = String.byteLength(String.view(&m.selectedFolderRel)) == 0
+    h.column(
+      &[
+        h.class("absolute w-[240px] p-[4px] glint-menu"),
+        h.style(&[css.left(px(menuX)), css.top(px(menuY))]),
+      ],
+      &[
+        menuHeader(h, "Glint library"),
+        menuItem(h, false, "New folder…", "", false, false, Message.OpenNewFolderAtRoot),
+        menuItem(h, isRootSelected, "Save new takes here", "", false, false, Message.SelectRootFolder),
+        menuSep(h),
+        menuHeader(h, "Sort"),
+        menuItem(h, m.libSortMode == SORT_ALPHA, "Name A–Z", "", false, false, Message.SetLibSortMode { mode: SORT_ALPHA }),
+        menuItem(h, m.libSortMode == SORT_OVERALL, "Overall match", "", false, false, Message.SetLibSortMode { mode: SORT_OVERALL }),
+        menuItem(h, m.libSortMode == SORT_WEIGHT, "Weight score", "", false, false, Message.SetLibSortMode { mode: SORT_WEIGHT }),
+        menuItem(h, false, "Re-score visible takes", "", false, false, Message.RescoreVisibleClips),
+        menuSep(h),
+        menuItem(h, false, "Refresh", "", false, false, Message.RefreshLibDir),
+        menuItem(h, false, "Reveal library in Finder", "", false, false, Message.RevealDirInFinder),
+      ],
+    )
+  } else if m.ctxMenuKind == CTX_LIB_SORT {
+    let menuX = clampMenuX(m.ctxMenuX, 214.0)
+    let menuY = clampMenuY(m.ctxMenuY, 260.0)
+    h.column(
+      &[
+        h.class("absolute w-[210px] p-[4px] glint-menu"),
+        h.style(&[css.left(px(menuX)), css.top(px(menuY))]),
+      ],
+      &[
+        menuHeader(h, "Sort takes in each folder"),
+        menuItem(h, m.libSortMode == SORT_ALPHA, "Name A–Z", "", false, false, Message.SetLibSortMode { mode: SORT_ALPHA }),
+        menuItem(h, m.libSortMode == SORT_OVERALL, "Overall match ↓", "", false, false, Message.SetLibSortMode { mode: SORT_OVERALL }),
+        menuItem(h, m.libSortMode == SORT_PITCH, "Pitch ↓", "", false, false, Message.SetLibSortMode { mode: SORT_PITCH }),
+        menuItem(h, m.libSortMode == SORT_SIZE, "Size · resonance ↓", "", false, false, Message.SetLibSortMode { mode: SORT_SIZE }),
+        menuItem(h, m.libSortMode == SORT_WEIGHT, "Weight ↓", "", false, false, Message.SetLibSortMode { mode: SORT_WEIGHT }),
+        menuItem(h, m.libSortMode == SORT_VOWEL, "Vowels · LTAS ↓", "", false, false, Message.SetLibSortMode { mode: SORT_VOWEL }),
+        menuSep(h),
+        menuItem(h, false, "Re-score all visible", "", false, false, Message.RescoreVisibleClips),
+      ],
+    )
+  } else {
+    h.empty()
+  }
+
+  return h.box(
+    &[
+      h.class("fixed inset-0 z-50"),
+      h.onClick(Message.CloseContextMenu),
+    ],
+    &[content],
+  )
+}
+
+/// Centered 840x640 Settings Modal with 200px #F6F6F7 sidebar and all 7 tabs.
+pub fn renderSettingsModal(m: &Overtone, h: &Document<Message>) -> Node {
+  if !m.showSettings {
+    return h.empty()
+  }
+
+  let tab = m.settingsTab
+  let tabTitle = if tab == SET_AUDIO {
+    "Audio & recording"
+  } else if tab == SET_PLAYBACK {
+    "Playback"
+  } else if tab == SET_ANALYZER {
+    "Analysis"
+  } else if tab == SET_DISPLAY {
+    "Display"
+  } else if tab == SET_GUIDES {
+    "Frequency & guides"
+  } else if tab == SET_COMPARE {
+    "Match scoring"
+  } else {
+    "Shortcuts"
+  }
+
+  let tabSub = if tab == SET_AUDIO {
+    "Microphone input, recording appends, and voice detection gate."
+  } else if tab == SET_PLAYBACK {
+    "Output device, pitch-locked speed presets, and scrub behavior."
+  } else if tab == SET_ANALYZER {
+    "How pitch and formants are measured. Changes re-analyse the open take."
+  } else if tab == SET_DISPLAY {
+    "Spectrogram colormap, opacity, contrast, and dynamic range."
+  } else if tab == SET_GUIDES {
+    "Frequency scale, zoom range presets, and draggable reference guides."
+  } else if tab == SET_COMPARE {
+    "Metric weights and DTW alignment for Match vs Ref scoring."
+  } else {
+    "Keyboard shortcuts for transport, editing, overlays, and views."
+  }
+
+  let body: Node = if tab == SET_AUDIO {
+    renderSettingsAudio(m, h)
+  } else if tab == SET_PLAYBACK {
+    renderSettingsPlayback(m, h)
+  } else if tab == SET_ANALYZER {
+    renderSettingsAnalysis(m, h)
+  } else if tab == SET_DISPLAY {
+    renderSettingsDisplay(m, h)
+  } else if tab == SET_GUIDES {
+    renderSettingsGuides(m, h)
+  } else if tab == SET_COMPARE {
+    renderSettingsCompare(m, h)
+  } else {
+    renderSettingsShortcuts(h)
+  }
+
+  return h.box(
+    &[h.class("fixed inset-0 z-50 flex items-center justify-center")],
+    &[
+      h.box(
+        &[
+          h.class("absolute inset-0 bg-[#0E0E10]/45"),
+          h.onClick(Message.CloseSettings),
+        ],
+        &[],
+      ),
+      h.row(
+        &[
+          h.class("relative z-10 w-[840px] h-[640px] max-w-[94vw] max-h-[90vh] glint-modal overflow-hidden"),
+        ],
+        &[
+          h.column(
+            &[h.class("w-[200px] shrink-0 bg-[#F6F6F7] border-r border-[#E6E6E8] py-[16px] px-[8px] gap-[1px]")],
+            &[
+              txt(h, "Settings", "px-[10px] pb-[12px] text-[15px] leading-[20px] font-bold tracking-[-0.01em] text-[#0B0B0C]"),
+              settingsNavBtn(h, "Audio & recording", tab == SET_AUDIO, SET_AUDIO),
+              settingsNavBtn(h, "Playback", tab == SET_PLAYBACK, SET_PLAYBACK),
+              settingsNavBtn(h, "Analysis", tab == SET_ANALYZER, SET_ANALYZER),
+              settingsNavBtn(h, "Display", tab == SET_DISPLAY, SET_DISPLAY),
+              settingsNavBtn(h, "Frequency & guides", tab == SET_GUIDES, SET_GUIDES),
+              settingsNavBtn(h, "Match scoring", tab == SET_COMPARE, SET_COMPARE),
+              settingsNavBtn(h, "Shortcuts", tab == SET_SHORTCUTS, SET_SHORTCUTS),
+            ],
+          ),
+          h.column(
+            &[h.class("flex-1 min-w-0 bg-white")],
+            &[
+              h.row(
+                &[h.class("items-center justify-between pt-[16px] pb-[12px] px-[24px] border-b border-[#E6E6E8] shrink-0")],
+                &[
+                  h.column(
+                    &[h.class("gap-[2px]")],
+                    &[
+                      txt(h, tabTitle, "text-[15px] leading-[20px] font-bold tracking-[-0.01em] text-[#0B0B0C]"),
+                      txt(h, tabSub, "text-[12px] leading-[16px] text-[#6B6B70]"),
+                    ],
+                  ),
+                  h.box(
+                    &[
+                      h.class("px-[14px] py-[5px] rounded-[5px] bg-[#0E0E10] shrink-0"),
+                      h.cursor(Cursor.Pointer),
+                      h.onClick(Message.CloseSettings),
+                    ],
+                    &[txt(h, "Done", "text-[13px] leading-[16px] font-semibold text-white")],
+                  ),
+                ],
+              ),
+              h.column(
+                &[h.class("flex-1 min-h-0 px-[24px] pt-[4px] pb-[20px] overflow-y-auto")],
+                &[body],
+              ),
+            ],
+          ),
+        ],
+      ),
+    ],
+  )
+}
+
+fn settingsNavBtn(h: &Document<Message>, label: string, active: bool, tab: u32) -> Node {
+  return h.row(
+    &[
+      h.class("items-center justify-between px-[10px] py-[5px] rounded-[5px]"),
+      h.classSelect(active, "bg-[#0E0E10]", "glint-btn-hover"),
+      h.cursor(Cursor.Pointer),
+      h.onClick(Message.OpenSettingsTab { tab: tab }),
+    ],
+    &[
+      txtA(
+        h,
+        label,
+        &[
+          h.class("text-[13px] leading-[16px]"),
+          h.classSelect(active, "font-semibold text-white", "text-[#3A3A3F]"),
+        ],
+      ),
+    ],
+  )
+}
+
+fn renderSettingsAudio(m: &Overtone, h: &Document<Message>) -> Node {
+  let silNorm = f64.toF32((m.silenceHoldSec - 0.35) / 1.65)
+  let vadNorm = (m.vadThresholdDb + 60.0) / 40.0
+  let gap = m.recSilenceGapSec
+  return h.column(
+    &[h.class("w-full")],
+    &[
+      settingsSection(h, "Input"),
+      h.row(
+        &[h.class("items-center gap-[16px] py-[9px] border-b border-[#F0F0F2]")],
+        &[
+          txt(h, "Microphone", "w-[180px] shrink-0 text-[13px] leading-[16px] text-[#0B0B0C]"),
+          h.row(
+            &[
+              h.class("w-[240px] items-center justify-between px-[8px] py-[4px] border border-[#DCDCDF] rounded-[5px] bg-white glint-btn-hover"),
+              h.cursor(Cursor.Pointer),
+              h.onClick(Message.OpenContextMenu { kind: CTX_AUDIO, x: 520.0, y: 240.0 }),
+            ],
+            &[
+              txt(h, String.view(&m.readoutActiveMic), "text-[12px] leading-[16px] text-[#0B0B0C] truncate"),
+              txt(h, "▾", "text-[11px] text-[#8A8A90]"),
+            ],
+          ),
+          txtA(
+            h,
+            "↻ Rescan",
+            &[
+              h.class("text-[12px] leading-[16px] text-[#3A3A3F] hover:text-[#0B0B0C]"),
+              h.cursor(Cursor.Pointer),
+              h.onClick(Message.RefreshAudioDevices),
+            ],
+          ),
+        ],
+      ),
+      settingsSection(h, "Recording"),
+      h.row(
+        &[h.class("items-center gap-[16px] py-[9px] border-b border-[#F0F0F2]")],
+        &[
+          h.column(
+            &[h.class("w-[180px] shrink-0 gap-[1px]")],
+            &[
+              txt(h, "Gap between appends", "text-[13px] leading-[16px] text-[#0B0B0C]"),
+              txt(h, "R appends · ⌘R starts a new take", "text-[11px] leading-[14px] text-[#8A8A90]"),
+            ],
+          ),
+          h.row(
+            &[h.class("border border-[#DCDCDF] rounded-[5px] overflow-hidden")],
+            &[
+              segOption(h, "0s", "", f64.abs(gap - 0.0) < 0.05, true, true, Message.SetRecGapSec { sec: 0.0 }),
+              segOption(h, "0.25s", "", f64.abs(gap - 0.25) < 0.05, true, true, Message.SetRecGapSec { sec: 0.25 }),
+              segOption(h, "0.5s", "", f64.abs(gap - 0.5) < 0.05, true, true, Message.SetRecGapSec { sec: 0.5 }),
+              segOption(h, "1s", "", f64.abs(gap - 1.0) < 0.1, true, false, Message.SetRecGapSec { sec: 1.0 }),
+            ],
+          ),
+        ],
+      ),
+      h.row(
+        &[h.class("items-center gap-[16px] py-[9px] border-b border-[#F0F0F2]")],
+        &[
+          txt(h, "Follow while recording", "w-[180px] shrink-0 text-[13px] leading-[16px] text-[#0B0B0C]"),
+          toggleSwitch(h, m.followRecording, true, Message.ToggleFollowRecording),
+        ],
+      ),
+      settingsSection(h, "Voice detection · drill & echo"),
+      settingsSliderRow(m, h, SLIDER_SILENCE_HOLD, "Silence hold", "Pause before ending take", silNorm, String.view(&m.readoutSilenceStr), false),
+      settingsSliderRow(m, h, SLIDER_VAD_THRESH, "Voice gate", "Minimum input threshold", vadNorm, String.view(&m.readoutVadStr), true),
+    ],
+  )
+}
+
+fn renderSettingsPlayback(m: &Overtone, h: &Document<Message>) -> Node {
+  let sp = m.playSpeed
+  let spNorm = (sp - 0.25) / 1.75
+  let volNorm = m.volume
+  return h.column(
+    &[h.class("w-full")],
+    &[
+      settingsSection(h, "Output"),
+      h.row(
+        &[h.class("items-center gap-[16px] py-[9px] border-b border-[#F0F0F2]")],
+        &[
+          txt(h, "Device", "w-[180px] shrink-0 text-[13px] leading-[16px] text-[#0B0B0C]"),
+          h.row(
+            &[
+              h.class("w-[240px] items-center justify-between px-[8px] py-[4px] border border-[#DCDCDF] rounded-[5px] bg-white glint-btn-hover"),
+              h.cursor(Cursor.Pointer),
+              h.onClick(Message.OpenContextMenu { kind: CTX_AUDIO, x: 520.0, y: 240.0 }),
+            ],
+            &[
+              txt(h, String.view(&m.readoutActiveOut), "text-[12px] leading-[16px] text-[#0B0B0C] truncate"),
+              txt(h, "▾", "text-[11px] text-[#8A8A90]"),
+            ],
+          ),
+          txtA(
+            h,
+            "↻ Rescan",
+            &[
+              h.class("text-[12px] leading-[16px] text-[#3A3A3F] hover:text-[#0B0B0C]"),
+              h.cursor(Cursor.Pointer),
+              h.onClick(Message.RefreshAudioDevices),
+            ],
+          ),
+        ],
+      ),
+      settingsSection(h, "Speed · pitch stays locked"),
+      h.row(
+        &[h.class("items-center gap-[16px] py-[9px] border-b border-[#F0F0F2]")],
+        &[
+          txt(h, "Preset", "w-[180px] shrink-0 text-[13px] leading-[16px] text-[#0B0B0C]"),
+          h.row(
+            &[h.class("border border-[#DCDCDF] rounded-[5px] overflow-hidden")],
+            &[
+              segOption(h, "0.25×", "", f32.abs(sp - 0.25) < 0.03, true, true, Message.SetPlaySpeed { speed: 0.25 }),
+              segOption(h, "0.5×", "", f32.abs(sp - 0.50) < 0.03, true, true, Message.SetPlaySpeed { speed: 0.50 }),
+              segOption(h, "0.75×", "", f32.abs(sp - 0.75) < 0.03, true, true, Message.SetPlaySpeed { speed: 0.75 }),
+              segOption(h, "1×", "", f32.abs(sp - 1.00) < 0.03, true, true, Message.SetPlaySpeed { speed: 1.00 }),
+              segOption(h, "1.25×", "", f32.abs(sp - 1.25) < 0.03, true, true, Message.SetPlaySpeed { speed: 1.25 }),
+              segOption(h, "1.5×", "", f32.abs(sp - 1.50) < 0.03, true, true, Message.SetPlaySpeed { speed: 1.50 }),
+              segOption(h, "2×", "", f32.abs(sp - 2.00) < 0.03, true, false, Message.SetPlaySpeed { speed: 2.00 }),
+            ],
+          ),
+        ],
+      ),
+      settingsSliderRow(m, h, SLIDER_PLAY_SPEED, "Speed", "", spNorm, String.view(&m.readoutSpeedStr), false),
+      settingsSliderRow(m, h, SLIDER_VOLUME, "Volume", "", volNorm, if volNorm >= 0.99 { "100%" } else { "85%" }, false),
+      settingsSection(h, "Behaviour"),
+      h.row(
+        &[h.class("items-center gap-[16px] py-[9px] border-b border-[#F0F0F2]")],
+        &[
+          txt(h, "Scrub audio on drag", "w-[180px] shrink-0 text-[13px] leading-[16px] text-[#0B0B0C]"),
+          toggleSwitch(h, m.scrubAudio, true, Message.ToggleScrubAudio),
+        ],
+      ),
+      h.row(
+        &[h.class("items-center gap-[16px] py-[9px]")],
+        &[
+          h.column(
+            &[h.class("w-[180px] shrink-0 gap-[1px]")],
+            &[
+              txt(h, "Loop selection", "text-[13px] leading-[16px] text-[#0B0B0C]"),
+              txt(h, "L", "glint-mono text-[11px] leading-[14px] text-[#8A8A90]"),
+            ],
+          ),
+          toggleSwitch(h, m.loopSelection, true, Message.ToggleLoop),
+        ],
+      ),
+    ],
+  )
+}
+
+fn renderSettingsAnalysis(m: &Overtone, h: &Document<Message>) -> Node {
+  let fl = m.pitchConfig.floorHz
+  let ce = m.pitchConfig.ceilingHz
+  let flNorm = f64.toF32((fl - 40.0) / 160.0)
+  let ceNorm = f64.toF32((ce - 300.0) / 900.0)
+  let fc = m.formantCeilingHz
+  let fcNorm = f64.toF32((fc - 4000.0) / 2500.0)
+  let clNorm = f64.toF32((m.displayClarity - 0.1) / 0.7)
+  return h.column(
+    &[h.class("w-full")],
+    &[
+      settingsSection(h, "Pitch · Boersma autocorrelation"),
+      h.row(
+        &[h.class("items-center gap-[16px] py-[9px] border-b border-[#F0F0F2]")],
+        &[
+          h.column(
+            &[h.class("w-[180px] shrink-0 gap-[1px]")],
+            &[
+              txt(h, "Range preset", "text-[13px] leading-[16px] text-[#0B0B0C]"),
+              txt(h, "Sets floor and ceiling", "text-[11px] leading-[14px] text-[#8A8A90]"),
+            ],
+          ),
+          h.row(
+            &[h.class("border border-[#DCDCDF] rounded-[5px] overflow-hidden")],
+            &[
+              segOption(h, "Low", "50–500", f64.abs(fl - 50.0) < 5.0 && f64.abs(ce - 500.0) < 20.0, false, true, Message.SetPitchRangePreset { floorHz: 50.0, ceilHz: 500.0 }),
+              segOption(h, "Speech", "75–600", f64.abs(fl - 75.0) < 5.0 && f64.abs(ce - 600.0) < 20.0, false, true, Message.SetPitchRangePreset { floorHz: 75.0, ceilHz: 600.0 }),
+              segOption(h, "High", "100–900", f64.abs(fl - 100.0) < 5.0 && f64.abs(ce - 900.0) < 20.0, false, true, Message.SetPitchRangePreset { floorHz: 100.0, ceilHz: 900.0 }),
+              segOption(h, "Wide", "50–1200", f64.abs(ce - 1200.0) < 20.0, false, false, Message.SetPitchRangePreset { floorHz: 50.0, ceilHz: 1200.0 }),
+            ],
+          ),
+        ],
+      ),
+      settingsSliderRow(m, h, SLIDER_PITCH_FLOOR, "Floor", "", flNorm, String.view(&m.readoutPitchRangeStr), false),
+      settingsSliderRow(m, h, SLIDER_PITCH_CEIL, "Ceiling", "", ceNorm, String.view(&m.readoutPitchRangeStr), false),
+      settingsSliderRow(m, h, SLIDER_CLARITY, "Voicing clarity", "Minimum pitch confidence", clNorm, if m.displayClarity > 0.5 { "High" } else { "Normal" }, false),
+      settingsSection(h, "Formants · Burg LPC, 5 formants"),
+      h.row(
+        &[h.class("items-center gap-[16px] py-[9px] border-b border-[#F0F0F2]")],
+        &[
+          h.column(
+            &[h.class("w-[180px] shrink-0 gap-[1px]")],
+            &[
+              txt(h, "Formant ceiling", "text-[13px] leading-[16px] text-[#0B0B0C]"),
+              txt(h, "5.0k masc · 5.5k fem · 6.0k bright", "text-[11px] leading-[14px] text-[#8A8A90]"),
+            ],
+          ),
+          h.row(
+            &[h.class("border border-[#DCDCDF] rounded-[5px] overflow-hidden")],
+            &[
+              segOption(h, "5.0k", "", f64.abs(fc - 5000.0) < 100.0, true, true, Message.SetFormantCeilingPreset { hz: 5000.0 }),
+              segOption(h, "5.5k", "", f64.abs(fc - 5500.0) < 100.0, true, true, Message.SetFormantCeilingPreset { hz: 5500.0 }),
+              segOption(h, "6.0k", "", f64.abs(fc - 6000.0) < 100.0, true, false, Message.SetFormantCeilingPreset { hz: 6000.0 }),
+            ],
+          ),
+        ],
+      ),
+      settingsSliderRow(m, h, SLIDER_FORMANT_CEIL, "Fine ceiling", "", fcNorm, if fc >= 5800.0 { "6.0 kHz" } else if fc >= 5250.0 { "5.5 kHz" } else { "5.0 kHz" }, false),
+      settingsSection(h, "Vowel chart"),
+      h.row(
+        &[h.class("items-center gap-[16px] py-[9px] border-b border-[#F0F0F2]")],
+        &[
+          h.column(
+            &[h.class("w-[180px] shrink-0 gap-[1px]")],
+            &[
+              txt(h, "Landmarks", "text-[13px] leading-[16px] text-[#0B0B0C]"),
+              txt(h, "IPA targets on F1 × F2", "text-[11px] leading-[14px] text-[#8A8A90]"),
+            ],
+          ),
+          h.row(
+            &[h.class("border border-[#DCDCDF] rounded-[5px] overflow-hidden")],
+            &[
+              segOption(h, "Fem", "", m.vowelMode == VOWEL_MODE_FEM, false, true, Message.SetVowelMode { mode: VOWEL_MODE_FEM }),
+              segOption(h, "Masc", "", m.vowelMode == VOWEL_MODE_MASC, false, true, Message.SetVowelMode { mode: VOWEL_MODE_MASC }),
+              segOption(h, "Both", "", m.vowelMode == VOWEL_MODE_BOTH, false, false, Message.SetVowelMode { mode: VOWEL_MODE_BOTH }),
+            ],
+          ),
+        ],
+      ),
+      h.row(
+        &[h.class("items-center gap-[16px] py-[9px]")],
+        &[
+          txt(h, "Click a vowel", "w-[180px] shrink-0 text-[13px] leading-[16px] text-[#0B0B0C]"),
+          h.row(
+            &[h.class("items-center gap-[8px]")],
+            &[
+              toggleSwitch(h, m.clickVowelAddsGuides, true, Message.ToggleClickVowelGuides),
+              txt(h, "Adds F1 / F2 / F3 guide lines", "text-[12px] leading-[16px] text-[#3A3A3F]"),
+            ],
+          ),
+        ],
+      ),
+    ],
+  )
+}
+
+fn swatchCard(h: &Document<Message>, idx: u32, cur: u32, name: string, badge: string) -> Node {
+  let active = idx == cur
+  let hasBadge = String.byteLength(badge) > 0
+  return h.column(
+    &[
+      h.class("w-[131px] gap-[6px] rounded-[6px]"),
+      h.classSelect(active, "p-[5px] border-2 border-[#0E0E10]", "p-[6px] border border-[#E6E6E8] glint-btn-hover"),
+      h.cursor(Cursor.Pointer),
+      h.onClick(Message.SelectPalette { idx: idx }),
+    ],
+    &[
+      paletteSwatch(h, idx, 117.0, 22.0),
+      h.row(
+        &[h.class("items-center justify-between")],
+        &[
+          txtA(
+            h,
+            name,
+            &[
+              h.class("text-[12px] leading-[16px] text-[#0B0B0C]"),
+              h.classWhen(active, "font-semibold"),
+            ],
+          ),
+          if hasBadge {
+            txt(h, badge, "glint-mono text-[9px] leading-[12px] text-[#8A8A90]")
+          } else {
+            h.empty()
+          },
+        ],
+      ),
+    ],
+  )
+}
+
+fn renderSettingsDisplay(m: &Overtone, h: &Document<Message>) -> Node {
+  let cur = paletteIndex(m.palette)
+  let isOff = !m.showSpectrogram
+  let isDim = m.showSpectrogram && m.specOpacity < 0.5
+  let isFull = m.showSpectrogram && m.specOpacity >= 0.85
+  let brNorm = m.brightness + 0.5
+  let ctNorm = (m.contrast - 0.4) / 2.2
+  let flNorm = (m.displayFloorDb + 150.0) / 70.0
+  let clNorm = (m.displayCeilingDb + 60.0) / 60.0
+  return h.column(
+    &[h.class("w-full")],
+    &[
+      settingsSection(h, "Colormap"),
+      h.row(
+        &[h.class("flex-wrap gap-[8px] pb-[12px] border-b border-[#F0F0F2]")],
+        &[
+          swatchCard(h, 0, cur, "Muted", "new"),
+          swatchCard(h, 1, cur, "VoceVista", ""),
+          swatchCard(h, 2, cur, "Inferno", ""),
+          swatchCard(h, 3, cur, "Magma", ""),
+          swatchCard(h, 4, cur, "Viridis", ""),
+          swatchCard(h, 5, cur, "Ocean", ""),
+          swatchCard(h, 6, cur, "Grayscale", ""),
+          swatchCard(h, 7, cur, "Praat light", ""),
+        ],
+      ),
+      settingsSection(h, "Spectrogram"),
+      h.row(
+        &[h.class("items-center gap-[16px] py-[9px] border-b border-[#F0F0F2]")],
+        &[
+          h.column(
+            &[h.class("w-[180px] shrink-0 gap-[1px]")],
+            &[
+              txt(h, "Opacity", "text-[13px] leading-[16px] text-[#0B0B0C]"),
+              txt(h, "H hides it", "text-[11px] leading-[14px] text-[#8A8A90]"),
+            ],
+          ),
+          h.row(
+            &[h.class("border border-[#DCDCDF] rounded-[5px] overflow-hidden")],
+            &[
+              segOption(h, "Off", "", isOff, false, true, Message.ToggleSpectrogram),
+              segOption(h, "Dim 35%", "", isDim, false, true, Message.SetSpecOpacityPreset { opacity: 0.35 }),
+              segOption(h, "Full", "", isFull, false, false, Message.SetSpecOpacityPreset { opacity: 1.0 }),
+            ],
+          ),
+        ],
+      ),
+      settingsSliderRow(m, h, SLIDER_SPEC_OPACITY, "Fine opacity", "", m.specOpacity, if isFull { "100%" } else if isDim { "35%" } else { "Custom" }, false),
+      settingsSliderRow(m, h, SLIDER_BRIGHTNESS, "Brightness", "", brNorm, if m.brightness >= 0.05 { "Bright" } else if m.brightness <= -0.05 { "Dark" } else { "0.0" }, false),
+      settingsSliderRow(m, h, SLIDER_CONTRAST, "Contrast", "", ctNorm, if m.contrast > 1.15 { "High" } else { "1.0×" }, false),
+      settingsSliderRow(m, h, SLIDER_FLOOR_DB, "Floor dB", "", flNorm, "-129 dB", false),
+      settingsSliderRow(m, h, SLIDER_CEILING_DB, "Ceiling dB", "", clNorm, "-25 dB", true),
+    ],
+  )
+}
+
+fn renderSettingsGuides(m: &Overtone, h: &Document<Message>) -> Node {
+  let isLog = m.vp.isLog()
+  let f1 = m.vp.f1
+  return h.column(
+    &[h.class("w-full")],
+    &[
+      settingsSection(h, "Frequency axis"),
+      h.row(
+        &[h.class("items-center gap-[16px] py-[9px] border-b border-[#F0F0F2]")],
+        &[
+          txt(h, "Scale", "w-[180px] shrink-0 text-[13px] leading-[16px] text-[#0B0B0C]"),
+          h.row(
+            &[h.class("border border-[#DCDCDF] rounded-[5px] overflow-hidden")],
+            &[
+              segOption(h, "Log · musical", "", isLog, false, true, Message.ToggleScale),
+              segOption(h, "Linear · Hz", "", !isLog, false, false, Message.ToggleScale),
+            ],
+          ),
+        ],
+      ),
+      h.row(
+        &[h.class("items-center gap-[16px] py-[9px] border-b border-[#F0F0F2]")],
+        &[
+          h.column(
+            &[h.class("w-[180px] shrink-0 gap-[1px]")],
+            &[
+              txt(h, "Range", "text-[13px] leading-[16px] text-[#0B0B0C]"),
+              txt(h, "0 resets zoom", "text-[11px] leading-[14px] text-[#8A8A90]"),
+            ],
+          ),
+          h.row(
+            &[h.class("border border-[#DCDCDF] rounded-[5px] overflow-hidden")],
+            &[
+              segOption(h, "55–4k", "", f64.abs(f1 - 4000.0) < 250.0, true, true, Message.SetFreqRangePreset { f0: 55.0, f1: 4000.0 }),
+              segOption(h, "55–6k", "", f64.abs(f1 - 6000.0) < 250.0, true, true, Message.SetFreqRangePreset { f0: 55.0, f1: 6000.0 }),
+              segOption(h, "55–8k", "", f64.abs(f1 - 8000.0) < 400.0, true, true, Message.SetFreqRangePreset { f0: 55.0, f1: 8000.0 }),
+              segOption(h, "55–12k", "", f1 > 10000.0, true, false, Message.SetFreqRangePreset { f0: 55.0, f1: 12000.0 }),
+            ],
+          ),
+        ],
+      ),
+      settingsSection(h, "Guide lines"),
+      h.row(
+        &[h.class("items-center gap-[16px] py-[9px] border-b border-[#F0F0F2]")],
+        &[
+          h.column(
+            &[h.class("w-[180px] shrink-0 gap-[1px]")],
+            &[
+              txt(h, "When dragging", "text-[13px] leading-[16px] text-[#0B0B0C]"),
+              txt(h, "Hold ⌥ to invert", "text-[11px] leading-[14px] text-[#8A8A90]"),
+            ],
+          ),
+          h.row(
+            &[h.class("border border-[#DCDCDF] rounded-[5px] overflow-hidden")],
+            &[
+              segOption(h, "Free", "", !m.snapGuidesToNote, false, true, Message.ToggleGuideSnap),
+              segOption(h, "Snap to note", "", m.snapGuidesToNote, false, false, Message.ToggleGuideSnap),
+            ],
+          ),
+        ],
+      ),
+      h.row(
+        &[h.class("items-start gap-[16px] py-[9px]")],
+        &[
+          txt(h, "Quick add", "w-[180px] shrink-0 pt-[4px] text-[13px] leading-[16px] text-[#0B0B0C]"),
+          h.row(
+            &[h.class("flex-wrap gap-[6px] items-center")],
+            &[
+              guideQuickChip(h, "+ G3 196", Message.AddGuideHz { hz: 196.0 }),
+              guideQuickChip(h, "+ A3 220", Message.AddGuideHz { hz: 220.0 }),
+              guideQuickChip(h, "+ C4 262", Message.AddGuideHz { hz: 261.63 }),
+              guideQuickChip(h, "+ 500 Hz", Message.AddGuideHz { hz: 500.0 }),
+              guideQuickChip(h, "+ 1.8k Hz", Message.AddGuideHz { hz: 1800.0 }),
+              txtA(
+                h,
+                "Clear all",
+                &[
+                  h.class("px-[8px] py-[3px] text-[12px] text-[#D9381E]"),
+                  h.cursor(Cursor.Pointer),
+                  h.onClick(Message.ClearGuides),
+                ],
+              ),
+            ],
+          ),
+        ],
+      ),
+    ],
+  )
+}
+
+fn weightProfileCard(
+  h: &Document<Message>,
+  title: string,
+  spec: string,
+  active: bool,
+  p: f64,
+  s: f64,
+  w: f64,
+  v: f64,
+) -> Node {
+  return h.column(
+    &[
+      h.class("flex-1 gap-[2px] rounded-[6px]"),
+      h.classSelect(active, "px-[10px] py-[7px] border-2 border-[#0E0E10]", "px-[11px] py-[8px] border border-[#E6E6E8] glint-btn-hover"),
+      h.cursor(Cursor.Pointer),
+      h.onClick(Message.SetMatchWeightsPreset { pitch: p, size: s, weight: w, vowel: v }),
+    ],
+    &[
+      txtA(h, title, &[h.class("text-[12px] leading-[16px] text-[#0B0B0C]"), h.classWhen(active, "font-semibold")]),
+      txt(h, spec, "glint-mono text-[10px] leading-[12px] text-[#8A8A90]"),
+    ],
+  )
+}
+
+fn renderSettingsCompare(m: &Overtone, h: &Document<Message>) -> Node {
+  let mw = m.matchWeights
+  let isBalanced = f64.abs(mw.pitch - 0.25) < 0.04 && f64.abs(mw.size - 0.35) < 0.04
+  let isRes = f64.abs(mw.size - 0.50) < 0.05
+  let isPitch = f64.abs(mw.pitch - 0.50) < 0.05
+  let isWeight = f64.abs(mw.weight - 0.50) < 0.05
+  return h.column(
+    &[h.class("w-full")],
+    &[
+      settingsSection(h, "Profile"),
+      h.row(
+        &[h.class("gap-[6px] pb-[12px] border-b border-[#F0F0F2]")],
+        &[
+          weightProfileCard(h, "Balanced", "25·35·25·15", isBalanced, 0.25, 0.35, 0.25, 0.15),
+          weightProfileCard(h, "Resonance", "10·50·20·20", isRes, 0.10, 0.50, 0.20, 0.20),
+          weightProfileCard(h, "Pitch focus", "50·20·20·10", isPitch, 0.50, 0.20, 0.20, 0.10),
+          weightProfileCard(h, "Weight focus", "15·25·50·10", isWeight, 0.15, 0.25, 0.50, 0.10),
+        ],
+      ),
+      settingsSliderRow(m, h, SLIDER_W_PITCH, "Pitch contour", "", f64.toF32(mw.pitch), String.view(&m.readoutWPitchPct), false),
+      settingsSliderRow(m, h, SLIDER_W_SIZE, "Size · resonance", "", f64.toF32(mw.size), String.view(&m.readoutWSizePct), false),
+      settingsSliderRow(m, h, SLIDER_W_WEIGHT, "Vocal weight", "", f64.toF32(mw.weight), String.view(&m.readoutWWeightPct), false),
+      settingsSliderRow(m, h, SLIDER_W_VOWEL, "Vowels · LTAS", "", f64.toF32(mw.vowel), String.view(&m.readoutWVowelPct), false),
+      settingsSection(h, "Alignment"),
+      h.row(
+        &[h.class("items-center gap-[16px] py-[9px] border-b border-[#F0F0F2]")],
+        &[
+          h.column(
+            &[h.class("w-[180px] shrink-0 gap-[1px]")],
+            &[
+              txt(h, "DTW time-warp", "text-[13px] leading-[16px] text-[#0B0B0C]"),
+              txt(h, "Lines up words before scoring", "text-[11px] leading-[14px] text-[#8A8A90]"),
+            ],
+          ),
+          toggleSwitch(h, m.useDtwAlign, true, Message.ToggleDtwAlign),
+        ],
+      ),
+      h.row(
+        &[h.class("items-center gap-[16px] py-[9px]")],
+        &[
+          h.column(
+            &[h.class("w-[180px] shrink-0 gap-[1px]")],
+            &[
+              txt(h, "Plot mine on ref", "text-[13px] leading-[16px] text-[#0B0B0C]"),
+              txt(h, "B toggles reference as base", "text-[11px] leading-[14px] text-[#8A8A90]"),
+            ],
+          ),
+          toggleSwitch(h, m.plotOnRef, true, Message.TogglePlotOnRef),
+        ],
+      ),
+    ],
+  )
+}
+
+fn renderSettingsShortcuts(h: &Document<Message>) -> Node {
+  return h.row(
+    &[h.class("gap-[28px] pt-[8px]")],
+    &[
+      h.column(
+        &[h.class("flex-1 min-w-0")],
+        &[
+          settingsSection(h, "Transport"),
+          shortcutRow(h, "Record / stop, append", "R", ""),
+          shortcutRow(h, "Record new take", "⌘", "R"),
+          shortcutRow(h, "Play / pause", "Space", ""),
+          shortcutRow(h, "Loop selection", "L", ""),
+          shortcutRow(h, "Repeat drill", "D", ""),
+          shortcutRow(h, "Echo mirror", "E", ""),
+          settingsSection(h, "View & overlays"),
+          shortcutRow(h, "Pin take as reference", "P", ""),
+          shortcutRow(h, "Plot mine on ref", "B", ""),
+          shortcutRow(h, "Add guide at cursor", "G", ""),
+          shortcutRow(h, "Hide spectrogram", "H", ""),
+          shortcutRow(h, "Toggle script strip", "N", ""),
+          shortcutRow(h, "Reset zoom", "0", ""),
+        ],
+      ),
+      h.column(
+        &[h.class("flex-1 min-w-0")],
+        &[
+          settingsSection(h, "Edit"),
+          shortcutRow(h, "Select region", "⇧", "Drag"),
+          shortcutRow(h, "Average pitch of selection", "F5", ""),
+          shortcutRow(h, "Select all", "⌘", "A"),
+          shortcutRow(h, "Copy selection", "⌘", "C"),
+          shortcutRow(h, "Cut selection", "⌘", "X"),
+          shortcutRow(h, "Paste at cursor", "⌘", "V"),
+          shortcutRow(h, "Delete selection", "⌫", ""),
+          shortcutRow(h, "Undo edit", "⌘", "Z"),
+          settingsSection(h, "File & library"),
+          shortcutRow(h, "New blank take", "⌘", "N"),
+          shortcutRow(h, "Open audio file", "⌘", "O"),
+          shortcutRow(h, "Save take to library", "⌘", "S"),
+          shortcutRow(h, "Rename selected item", "F2", ""),
+          shortcutRow(h, "Settings", "⌘", ","),
+        ],
+      ),
+    ],
+  )
+}
+
+/// Floating drag ghost pill when moving a take/folder in the Library rail.
+pub fn renderDragGhost(m: &Overtone, h: &Document<Message>) -> Node {
+  if !m.explorerDragActive {
+    return h.empty()
+  }
+  let targetRaw = String.view(&m.explorerDropTargetRel)
+  let targetEmpty = String.byteLength(targetRaw) == 0
+  let cls = if m.explorerDropValid {
+    "fixed z-50 pointer-events-none flex items-center gap-[6px] px-[10px] py-[5px] glint-drag-ghost text-[12px] leading-[16px]"
+  } else {
+    "fixed z-50 pointer-events-none flex items-center gap-[6px] px-[10px] py-[5px] rounded-[6px] bg-white border border-dashed border-[#9A9AA2] text-[12px] leading-[16px] text-[#8A8A90]"
+  }
+  return h.row(
+    &[
+      h.class(cls),
+      h.style(&[css.left(px(m.explorerDragX + 12.0)), css.top(px(m.explorerDragY - 12.0))]),
+    ],
+    &[
+      h.text("Move "),
+      txtA(h, String.view(&m.explorerDragLabel), &[h.classWhen(m.explorerDropValid, "font-semibold")]),
+      if m.explorerDropValid {
+        h.row(
+          &[h.class("items-center gap-[5px]")],
+          &[
+            txt(h, "→", "text-[#9A9AA2]"),
+            if targetEmpty {
+              txt(h, "/", "glint-mono text-[11px] text-[#C8C8CC]")
+            } else {
+              txt(h, targetRaw, "glint-mono text-[11px] text-[#C8C8CC]")
+            },
+          ],
+        )
+      } else {
+        h.text(" — can’t drop here")
+      },
+    ],
+  )
+}

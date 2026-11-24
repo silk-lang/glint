@@ -1,0 +1,109 @@
+//! Glint entry point: launches the macOS event loop and opens the voice analysis studio.
+import host
+import font_collection.lib { FontCollection }
+import font_collection.system as fontFiles
+import font_collection.system { Options as FontOptions }
+import ui_tree_window.console { StderrWriter }
+import ui_tree_window.platform_thread { Launched, launch }
+import atlas.atlas { AtlasError }
+import ui_tree.legacy { TreeError }
+import vector.geometry_error { GeometryError }
+import webgpu.runtime { GpuError }
+import window.types { WindowError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.platform.native.host_input { NativeHostInput }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.host_input_native { OsHostInput }
+
+effect fn noFonts(error: HostInputError) -> () {
+  drop error
+}
+
+effect fn loadFonts(collection: &mut FontCollection) -> ()
+  ! HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let snapshot = run unsafe NativeHostInput.environmentSnapshot()
+  let mut inputs = OsHostInput.make(move snapshot)
+  drop run fontFiles.load(&mut collection, FontOptions.defaults())
+    |> Effect.provideMut<HostInput>(&mut inputs)
+}
+
+effect fn systemFonts() -> FontCollection
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut collection = FontCollection.make()
+  run Effect.catch<HostInputError>(loadFonts(&mut collection), noFonts)
+  return move collection
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  StderrWriter.print("glint: studio failed to start\n", &())
+  return 2
+}
+
+effect fn failWindow(e: WindowError) -> i32 {
+  drop e
+  StderrWriter.print("glint: WindowError\n", &())
+  return 2
+}
+
+effect fn failGpu(e: GpuError) -> i32 {
+  drop e
+  StderrWriter.print("glint: GpuError\n", &())
+  return 2
+}
+
+effect fn failTree(e: TreeError) -> i32 {
+  drop e
+  StderrWriter.print("glint: TreeError\n", &())
+  return 2
+}
+
+effect fn failAtlas(e: AtlasError) -> i32 {
+  drop e
+  StderrWriter.print("glint: AtlasError\n", &())
+  return 2
+}
+
+effect fn failGeom(e: GeometryError) -> i32 {
+  drop e
+  StderrWriter.print("glint: GeometryError\n", &())
+  return 2
+}
+
+effect fn failOom(e: OutOfMemoryError) -> i32 {
+  drop e
+  StderrWriter.print("glint: OutOfMemoryError\n", &())
+  return 2
+}
+
+effect fn openStudio(platform: Option<Launched>) -> i32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run systemFonts()
+  return run host.runOvertone(&fonts, move platform)
+    |> Effect.catch<WindowError>(failWindow)
+    |> Effect.catch<GpuError>(failGpu)
+    |> Effect.catch<TreeError>(failTree)
+    |> Effect.catch<AtlasError>(failAtlas)
+    |> Effect.catch<GeometryError>(failGeom)
+    |> Effect.catch<OutOfMemoryError>(failOom)
+}
+
+fn app(platform: Option<Launched>) -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(openStudio(move platform), failed)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+pub fn main() -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(
+    launch(|platform: Option<Launched>| -> i32 { return app(move platform) }),
+    failed,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}

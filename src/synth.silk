@@ -1,0 +1,157 @@
+//! Demo synthetic singing voice with ground-truth pitch glide, vibrato, and moving vowel formants
+//! (`/ɑ/ -> /e/ -> /i/ -> /o/ -> /u/`), adapted from `voiceapp/apps/harness/src/synth.ts`.
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import silk.num.usize
+
+pub const SYNTH_SAMPLE_RATE: f64 = 48000.0
+
+struct VowelTarget {
+  f1: f64,
+  b1: f64,
+  f2: f64,
+  b2: f64,
+  f3: f64,
+  b3: f64,
+  f4: f64,
+  b4: f64,
+}
+
+impl Copy for VowelTarget {}
+
+const PHRASE_VOWELS: [VowelTarget; 5] = [
+  // /ɑ/ (ah)
+  VowelTarget { f1: 750.0, b1: 90.0, f2: 1180.0, b2: 120.0, f3: 2650.0, b3: 180.0, f4: 3750.0, b4: 240.0 },
+  // /e/ (eh)
+  VowelTarget { f1: 480.0, b1: 75.0, f2: 2150.0, b2: 140.0, f3: 2850.0, b3: 190.0, f4: 3900.0, b4: 240.0 },
+  // /i/ (ee)
+  VowelTarget { f1: 310.0, b1: 65.0, f2: 2550.0, b2: 150.0, f3: 3150.0, b3: 200.0, f4: 4100.0, b4: 250.0 },
+  // /o/ (oh)
+  VowelTarget { f1: 470.0, b1: 80.0, f2: 960.0, b2: 110.0, f3: 2650.0, b3: 190.0, f4: 3700.0, b4: 240.0 },
+  // /u/ (oo)
+  VowelTarget { f1: 340.0, b1: 70.0, f2: 900.0, b2: 110.0, f3: 2500.0, b3: 180.0, f4: 3650.0, b4: 240.0 },
+]
+
+fn lerp(a: f64, b: f64, t: f64) -> f64 {
+  return a + (b - a) * t
+}
+
+fn smoothstep(t: f64) -> f64 {
+  let c = f64.max(0.0, f64.min(1.0, t))
+  return c * c * (3.0 - 2.0 * c)
+}
+
+fn formantGain(hz: f64, f: f64, bw: f64, g: f64) -> f64 {
+  let d = (hz - f) / bw
+  return g / (1.0 + d * d)
+}
+
+/// Generates a 6.5 s vocal phrase gliding smoothly across 5 vowels with musical vibrato.
+pub effect fn synthDemoVoice() -> List<f32>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let seconds: f64 = 6.5
+  let sr = SYNTH_SAMPLE_RATE
+  let n = f64.toUsize(f64.round(seconds * sr))
+  let mut samples = List<f32>.make()
+  run samples.appendRepeated(0.0, n)
+  let out = samples.asMutSlice()
+
+  let noiseAmp = f64.pow(10.0, -68.0 / 20.0)
+  let mut seed: u32 = 987654321
+  let mut phase: f64 = 0.0
+  let twoPi = 2.0 * f64.PI
+
+  let mut i: usize = 0
+  while i < n {
+    let t = usize.toF64(i) / sr
+    let u = t / seconds
+
+    // Musical vocal pitch glide (F3 174 Hz -> D4 294 Hz -> A3 220 Hz) with 5.4 Hz vibrato.
+    let baseF0 = if u < 0.65 {
+      lerp(174.6, 293.7, smoothstep(u / 0.65))
+    } else {
+      lerp(293.7, 220.0, smoothstep((u - 0.65) / 0.35))
+    }
+    let f0 = baseF0 * (1.0 + 0.016 * f64.sin(twoPi * 5.4 * t))
+    phase = phase + twoPi * f0 / sr
+
+    // Five distinct vowel syllables with brief breath gaps so voiced/unvoiced breaks show clearly.
+    let segPos = u * 5.0
+    let segIdxRaw = f64.toUsize(f64.floor(segPos))
+    let segIdx = if segIdxRaw >= 5 { 4 } else { segIdxRaw }
+    let segFrac = segPos - usize.toF64(segIdx)
+    let nextIdx = if segIdx + 1 < 5 { segIdx + 1 } else { 4 }
+    let morph = smoothstep((segFrac - 0.62) / 0.30)
+
+    let vA = PHRASE_VOWELS[segIdx]
+    let vB = PHRASE_VOWELS[nextIdx]
+    let f1 = lerp(vA.f1, vB.f1, morph)
+    let b1 = lerp(vA.b1, vB.b1, morph)
+    let f2 = lerp(vA.f2, vB.f2, morph)
+    let b2 = lerp(vA.b2, vB.b2, morph)
+    let f3 = lerp(vA.f3, vB.f3, morph)
+    let b3 = lerp(vA.b3, vB.b3, morph)
+    let f4 = lerp(vA.f4, vB.f4, morph)
+    let b4 = lerp(vA.b4, vB.b4, morph)
+
+    // Smooth syllable envelope with a tiny pause at the end of each syllable.
+    let gate = if segFrac < 0.05 {
+      smoothstep(segFrac / 0.05)
+    } else if segFrac > 0.88 {
+      smoothstep((0.95 - segFrac) / 0.07)
+    } else {
+      1.0
+    }
+
+    let mut sample: f64 = 0.0
+    let mut h: usize = 1
+    while h <= 34 {
+      let hf = usize.toF64(h)
+      let hz = f0 * hf
+      if hz > sr * 0.45 {
+        break
+      }
+      let rolloff = 1.0 / (hf * f64.sqrt(hf))
+      let shaped = 0.12
+        + formantGain(hz, f1, b1, 1.15)
+        + formantGain(hz, f2, b2, 0.72)
+        + formantGain(hz, f3, b3, 0.38)
+        + formantGain(hz, f4, b4, 0.22)
+      sample = sample + rolloff * shaped * f64.sin(phase * hf)
+      h = h + 1
+    }
+
+    // LCG noise floor
+    seed = u32.wrappingAdd(u32.wrappingMultiply(seed, 1103515245), 12345) & 0x7fffffff
+    let noise = (u32.toF64(seed) / 1073741823.5 - 1.0) * noiseAmp
+
+    out[i] = f64.toF32(gate * 0.45 * sample + noise)
+    i = i + 1
+  }
+
+  // Normalize peak to 0.88 full scale.
+  let mut peak: f32 = 0.0
+  i = 0
+  while i < n {
+    let a = f32.abs(out[i])
+    if a > peak {
+      peak = a
+    }
+    i = i + 1
+  }
+  if peak > 0.0 {
+    let scale = 0.88 / peak
+    i = 0
+    while i < n {
+      out[i] = out[i] * scale
+      i = i + 1
+    }
+  }
+
+  return move samples
+}

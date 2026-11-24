@@ -1,0 +1,2116 @@
+//! Vector canvas drawings & formatting helpers for Overtone's VoceVista-style workspace:
+//!   - Spectrogram overlays (note grid, frequency guides, Boersma F0 pitch + harmonics,
+//!     Praat Burg F1-F4 formant tracks, selection band, playhead & scrub cursor, crosshair)
+//!   - Vertical piano keyboard aligned 1:1 with the spectrogram's frequency scale
+//!   - Power spectrum slice + smooth LPC vocal-tract envelope + F1-F4 / F0 markers
+//!   - 2D Vowel Space (F1 vs F2 phonetic trapezoid with IPA landmarks & live voice position)
+//!   - Waveform overview strip with visible viewport window & playhead
+import compare { AlignedRefPoint }
+import dsp { ColumnData }
+import formants {
+  DEFAULT_LPC_ORDER,
+  FormantFrame,
+  VOWELS_FEM,
+  VOWELS_MASC,
+  VOWEL_MODE_BOTH,
+  VOWEL_MODE_FEM,
+  VOWEL_MODE_MASC,
+  lpcEnvelopeDb
+}
+import pitch { MAX_CONNECTED_SEMITONES, PitchFrame, frequencyToNote, midiToFrequency, noteClassName, semitonesBetween }
+import viewport { Viewport }
+import voice_metrics { LTAS_BINS, VoiceFrame, VoiceSummary }
+import loom.drawing { Drawing }
+import loom.lib { CanvasCommand }
+import silk.collections.list { List }
+import silk.color.rgba { Rgba }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String }
+
+// Glint Muted color palette for darkroom spectrogram well & light-chrome side canvases
+pub const COL_PITCH: Rgba<f32> = Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: 0.96 }
+pub const COL_PITCH_GLOW: Rgba<f32> = Rgba<f32> { r: 0.04, g: 0.04, b: 0.05, a: 0.58 }
+pub const COL_HARMONIC: Rgba<f32> = Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: 0.28 }
+pub const COL_F1: Rgba<f32> = Rgba<f32> { r: 0.96, g: 0.42, b: 0.36, a: 0.90 }
+pub const COL_F2: Rgba<f32> = Rgba<f32> { r: 0.95, g: 0.80, b: 0.32, a: 0.90 }
+pub const COL_F3: Rgba<f32> = Rgba<f32> { r: 0.38, g: 0.82, b: 0.90, a: 0.86 }
+pub const COL_F4: Rgba<f32> = Rgba<f32> { r: 0.72, g: 0.58, b: 0.96, a: 0.82 }
+pub const COL_GUIDE: Rgba<f32> = Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: 0.85 }
+pub const COL_SELECTION: Rgba<f32> = Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: 0.10 }
+pub const COL_SEL_EDGE: Rgba<f32> = Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: 0.90 }
+pub const COL_CURSOR: Rgba<f32> = Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: 0.96 }
+pub const COL_CROSSHAIR: Rgba<f32> = Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: 0.24 }
+pub const COL_REF: Rgba<f32> = Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: 0.62 }
+pub const COL_REF_SOFT: Rgba<f32> = Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: 0.24 }
+pub const COL_INK: Rgba<f32> = Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 1.0 }
+pub const COL_INK_SOFT: Rgba<f32> = Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 0.45 }
+pub const COL_MUTED: Rgba<f32> = Rgba<f32> { r: 0.541, g: 0.541, b: 0.565, a: 1.0 }
+pub const COL_VERMILION: Rgba<f32> = Rgba<f32> { r: 0.851, g: 0.220, b: 0.118, a: 1.0 }
+pub const COL_SIZE: Rgba<f32> = Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 1.0 }
+pub const COL_WEIGHT: Rgba<f32> = Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 0.45 }
+pub const COL_BREATHY: Rgba<f32> = Rgba<f32> { r: 0.851, g: 0.220, b: 0.118, a: 0.08 }
+
+pub struct AxisTick {
+  pub pos: f32,
+  pub label: String,
+  pub major: bool,
+}
+
+pub struct GuideBadge {
+  pub idx: usize,
+  pub hz: f64,
+  pub y: f32,
+  pub visible: bool,
+  pub label: String,
+}
+
+pub struct OverlayOptions {
+  pub showPitch: bool,
+  pub showHarmonics: bool,
+  pub showFormants: bool,
+  pub showNoteGrid: bool,
+  pub showRefOverlay: bool,
+  pub showRefWave: bool,
+  pub useDtwAlign: bool,
+  pub plotOnRef: bool,
+  pub displayClarity: f64,
+  pub cursorSec: f64,
+  pub hasSelection: bool,
+  pub selStart: f64,
+  pub selEnd: f64,
+  pub hasRefSel: bool,
+  pub refSelStart: f64,
+  pub refSelEnd: f64,
+  pub hoverValid: bool,
+  pub hoverX: f32,
+  pub hoverY: f32,
+}
+
+impl Copy for OverlayOptions {}
+
+// ============================================================================
+// Formatting helpers
+// ============================================================================
+
+const DIGITS: string = "0123456789"
+
+effect fn appendUint(out: &mut String, v: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if v >= 10 {
+    run appendUint(&mut out, v / 10)
+  }
+  run out.append(String.slice(DIGITS, u32.toUsize(v % 10), 1))
+}
+
+pub effect fn appendInt(out: &mut String, v: i32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if v < 0 {
+    run out.append("-")
+    run appendUint(&mut out, i32.toU32(-v))
+  } else {
+    run appendUint(&mut out, i32.toU32(v))
+  }
+}
+
+pub effect fn appendFixed(out: &mut String, value: f64, decimals: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut v = value
+  if v < 0.0 {
+    run out.append("-")
+    v = -v
+  }
+  if decimals == 0 {
+    run appendUint(&mut out, f64.toU32(f64.round(v)))
+    return ()
+  }
+  let mut scale: f64 = 1.0
+  let mut d: u32 = 0
+  while d < decimals {
+    scale = scale * 10.0
+    d = d + 1
+  }
+  let scaled = f64.toU32(f64.round(v * scale))
+  let scaleU = f64.toU32(scale)
+  let whole = scaled / scaleU
+  let frac = scaled % scaleU
+  run appendUint(&mut out, whole)
+  run out.append(".")
+  let mut div = scaleU / 10
+  while div >= 1 {
+    run out.append(String.slice(DIGITS, u32.toUsize((frac / div) % 10), 1))
+    if div == 1 {
+      break
+    }
+    div = div / 10
+  }
+}
+
+pub effect fn formatHz(hz: f64) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut s = String.make()
+  if hz <= 0.0 {
+    run s.append("—")
+    return move s
+  }
+  if hz >= 1000.0 {
+    run appendFixed(&mut s, hz / 1000.0, 2)
+    run s.append("k")
+  } else if hz >= 100.0 {
+    run appendFixed(&mut s, hz, 0)
+  } else {
+    run appendFixed(&mut s, hz, 1)
+  }
+  return move s
+}
+
+pub effect fn formatHzFull(hz: f64) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut s = String.make()
+  if hz <= 0.0 {
+    run s.append("—")
+    return move s
+  }
+  run appendFixed(&mut s, hz, 1)
+  run s.append(" Hz")
+  return move s
+}
+
+pub effect fn formatNoteFull(hz: f64) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut s = String.make()
+  if hz <= 1.0 {
+    run s.append("—")
+    return move s
+  }
+  let r = frequencyToNote(hz)
+  run s.append(noteClassName(r.pitchClass))
+  run appendInt(&mut s, r.octave)
+  return move s
+}
+
+pub effect fn formatCents(cents: i32) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut s = String.make()
+  if cents > 0 {
+    run s.append("+")
+  }
+  run appendInt(&mut s, cents)
+  run s.append("¢")
+  return move s
+}
+
+pub effect fn formatTime(sec: f64) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut s = String.make()
+  let clamped = f64.max(0.0, sec)
+  if clamped >= 60.0 {
+    let mins = f64.toU32(f64.floor(clamped / 60.0))
+    let rem = clamped - u32.toF64(mins) * 60.0
+    run appendUint(&mut s, mins)
+    run s.append(":")
+    if rem < 10.0 {
+      run s.append("0")
+    }
+    run appendFixed(&mut s, rem, 1)
+  } else {
+    run appendFixed(&mut s, clamped, 2)
+    run s.append("s")
+  }
+  return move s
+}
+
+pub effect fn formatDb(db: f64) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut s = String.make()
+  if db <= -119.0 {
+    run s.append("-∞ dB")
+    return move s
+  }
+  run appendFixed(&mut s, db, 1)
+  run s.append(" dB")
+  return move s
+}
+
+// ============================================================================
+// Coordinate mapping
+// ============================================================================
+
+fn xOfTime(vp: &Viewport, t: f64, width: f32) -> f32 {
+  return f64.toF32(vp.timeToNormAt(t)) * width
+}
+
+fn yOfFreq(vp: &Viewport, hz: f64, height: f32) -> f32 {
+  return f64.toF32(1.0 - vp.freqToNormAt(hz)) * height
+}
+
+fn isBlackKey(midi: i32) -> bool {
+  let mut pc = midi % 12
+  if pc < 0 { pc = pc + 12 }
+  return pc == 1 || pc == 3 || pc == 6 || pc == 8 || pc == 10
+}
+
+// ============================================================================
+// Axis tick generators
+// ============================================================================
+
+pub effect fn computeFreqTicks(vp: &Viewport, height: f32) -> List<AxisTick>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut ticks = List<AxisTick>.make()
+  if height <= 10.0 {
+    return move ticks
+  }
+  if vp.isLog() {
+    // Pass 1: VoceVista-style primary round Hz landmarks (never crowded out by minor ticks!)
+    let majors: [f64; 22] = [
+      50.0, 60.0, 80.0, 100.0, 150.0, 200.0, 300.0, 400.0, 500.0, 600.0, 800.0,
+      1000.0, 1500.0, 2000.0, 3000.0, 4000.0, 5000.0, 6000.0, 8000.0, 10000.0, 12000.0, 16000.0,
+    ]
+    let mut lastY: f32 = height + 100.0
+    let mut i: usize = 0
+    while i < majors.length {
+      let hz = majors[i]
+      if hz >= vp.f0 * 1.01 && hz <= vp.f1 * 0.99 {
+        let y = yOfFreq(vp, hz, height)
+        if lastY - y >= 18.0 && y >= 8.0 && y <= height - 8.0 {
+          let label = run formatHz(hz)
+          run ticks.append(AxisTick { pos: y, label: move label, major: true })
+          lastY = y
+        }
+      }
+      i = i + 1
+    }
+    // Pass 2: Minor intermediate Hz ticks when zoomed in (inserted only where >= 20 px clear)
+    let minors: [f64; 14] = [
+      30.0, 40.0, 70.0, 90.0, 120.0, 175.0, 250.0, 350.0, 450.0, 700.0, 900.0, 1200.0, 2500.0, 3500.0,
+    ]
+    i = 0
+    while i < minors.length {
+      let hz = minors[i]
+      if hz >= vp.f0 * 1.01 && hz <= vp.f1 * 0.99 {
+        let y = yOfFreq(vp, hz, height)
+        if y >= 8.0 && y <= height - 8.0 {
+          let mut clear = true
+          let existing = ticks.asSlice()
+          let mut j: usize = 0
+          while j < existing.length {
+            if f32.abs(existing[j].pos - y) < 20.0 {
+              clear = false
+              break
+            }
+            j = j + 1
+          }
+          if clear {
+            let label = run formatHz(hz)
+            run ticks.append(AxisTick { pos: y, label: move label, major: false })
+          }
+        }
+      }
+      i = i + 1
+    }
+  } else {
+    let span = vp.f1 - vp.f0
+    let targetTicks = f32.toF64(height) / 36.0
+    let rawStep = span / f64.max(2.0, targetTicks)
+    let steps: [f64; 10] = [20.0, 50.0, 100.0, 200.0, 250.0, 500.0, 1000.0, 2000.0, 2500.0, 5000.0]
+    let mut step = 5000.0
+    let mut i: usize = 0
+    while i < steps.length {
+      if steps[i] >= rawStep {
+        step = steps[i]
+        break
+      }
+      i = i + 1
+    }
+    let mut hz = f64.ceil(vp.f0 / step) * step
+    while hz <= vp.f1 {
+      let y = yOfFreq(vp, hz, height)
+      if y >= 10.0 && y <= height - 10.0 {
+        let label = run formatHz(hz)
+        run ticks.append(AxisTick { pos: y, label: move label, major: true })
+      }
+      hz = hz + step
+    }
+  }
+  return move ticks
+}
+
+pub effect fn computeTimeTicks(vp: &Viewport, width: f32) -> List<AxisTick>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut ticks = List<AxisTick>.make()
+  if width <= 20.0 {
+    return move ticks
+  }
+  let span = vp.t1 - vp.t0
+  let rawStep = span / f64.max(2.0, f32.toF64(width) / 90.0)
+  let steps: [f64; 12] = [0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0]
+  let mut step = 60.0
+  let mut i: usize = 0
+  while i < steps.length {
+    if steps[i] >= rawStep {
+      step = steps[i]
+      break
+    }
+    i = i + 1
+  }
+  let mut t = f64.ceil(vp.t0 / step) * step
+  while t <= vp.t1 {
+    let x = xOfTime(vp, t, width)
+    if x >= 12.0 && x <= width - 28.0 {
+      let label = run formatTime(t)
+      run ticks.append(AxisTick { pos: x, label: move label, major: true })
+    }
+    t = t + step
+  }
+  return move ticks
+}
+
+pub effect fn computeGuideBadges(guides: &[f64], vp: &Viewport, height: f32) -> List<GuideBadge>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<GuideBadge>.make()
+  let mut i: usize = 0
+  while i < guides.length {
+    let hz = guides[i]
+    let visible = height > 10.0 && hz >= vp.f0 && hz <= vp.f1
+    let y: f32 = if visible { yOfFreq(vp, hz, height) } else { -20.0 }
+    let mut lbl = String.make()
+    if hz >= 1000.0 {
+      let hs = run formatHz(hz)
+      run lbl.append(String.view(&hs))
+      run lbl.append(" Hz")
+    } else {
+      run appendFixed(&mut lbl, hz, 0)
+      run lbl.append(" Hz · ")
+      let ns = run formatNoteFull(hz)
+      run lbl.append(String.view(&ns))
+    }
+    run out.append(GuideBadge { idx: i, hz: hz, y: y, visible: visible, label: move lbl })
+    i = i + 1
+  }
+  return move out
+}
+
+// ============================================================================
+// Spectrogram Overlay Drawing
+// ============================================================================
+
+effect fn drawPitchRuns(
+  cmds: &mut List<CanvasCommand>,
+  frames: &[PitchFrame],
+  vp: &Viewport,
+  width: f32,
+  height: f32,
+  minClarity: f64,
+  mult: f64,
+  color: Rgba<f32>,
+  strokeWidth: f32,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let span = vp.t1 - vp.t0
+  let margin = span * 0.03
+  let mut drawing = false
+  let mut segPoints: usize = 0
+  let mut prevFreq: f64 = 0.0
+  let mut any = false
+
+  let mut i: usize = 0
+  while i < frames.length {
+    let fr = frames[i]
+    let ok = fr.voiced && fr.clarity >= minClarity && fr.time >= vp.t0 - margin && fr.time <= vp.t1 + margin
+    if !ok {
+      drawing = false
+      segPoints = 0
+      i = i + 1
+      continue
+    }
+    let hz = fr.frequency * mult
+    if hz < vp.f0 * 0.5 || hz > vp.f1 * 1.5 {
+      drawing = false
+      segPoints = 0
+      i = i + 1
+      continue
+    }
+    if drawing && semitonesBetween(prevFreq, fr.frequency) > MAX_CONNECTED_SEMITONES {
+      drawing = false
+      segPoints = 0
+    }
+    let x = xOfTime(vp, fr.time, width)
+    let y = yOfFreq(vp, hz, height)
+    if drawing {
+      run cmds.append(CanvasCommand.LineTo { x: x, y: y })
+      segPoints = segPoints + 1
+      any = true
+    } else {
+      run cmds.append(CanvasCommand.MoveTo { x: x, y: y })
+      drawing = true
+      segPoints = 1
+    }
+    prevFreq = fr.frequency
+    i = i + 1
+  }
+  if any {
+    run cmds.append(CanvasCommand.Stroke { color: color, width: strokeWidth })
+  }
+}
+
+effect fn drawFormantBand(
+  cmds: &mut List<CanvasCommand>,
+  frames: &[FormantFrame],
+  which: usize,
+  vp: &Viewport,
+  width: f32,
+  height: f32,
+  color: Rgba<f32>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut i: usize = 0
+  while i < frames.length {
+    let fr = frames[i]
+    if fr.time >= vp.t0 && fr.time <= vp.t1 && fr.count > which {
+      let hz = if which == 0 { fr.f1 } else if which == 1 { fr.f2 } else if which == 2 { fr.f3 } else { fr.f4 }
+      if hz >= vp.f0 && hz <= vp.f1 {
+        let x = xOfTime(vp, fr.time, width)
+        let y = yOfFreq(vp, hz, height)
+        run cmds.append(
+          CanvasCommand.FillRect {
+            x: x - 2.2,
+            y: y - 2.2,
+            width: 4.4,
+            height: 4.4,
+            radius: 2.2,
+            color: color,
+          },
+        )
+      }
+    }
+    i = i + 1
+  }
+}
+
+effect fn drawAlignedRefPitch(
+  cmds: &mut List<CanvasCommand>,
+  alignedRef: &[AlignedRefPoint],
+  vp: &Viewport,
+  width: f32,
+  height: f32,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  // Batch all dash segments into ONE VectorPath + ONE Stroke (200x fewer path tessellations!).
+  let mut i: usize = 0
+  let mut hasPrev = false
+  let mut prevX: f32 = 0.0
+  let mut prevY: f32 = 0.0
+  let mut prevF0: f64 = 0.0
+  let mut prevT: f64 = 0.0
+  let mut segIdx: usize = 0
+  let mut drewAny = false
+  while i < alignedRef.length {
+    let pt = alignedRef[i]
+    let valid = pt.voiced && pt.f0 >= vp.f0 && pt.f0 <= vp.f1 && pt.time >= vp.t0 - 0.1 && pt.time <= vp.t1 + 0.1
+    if !valid {
+      hasPrev = false
+    } else {
+      let x = xOfTime(vp, pt.time, width)
+      let y = yOfFreq(vp, pt.f0, height)
+      if hasPrev && (pt.time - prevT) < 0.15 && semitonesBetween(prevF0, pt.f0) <= MAX_CONNECTED_SEMITONES {
+        if (segIdx % 3) != 2 {
+          run cmds.append(CanvasCommand.MoveTo { x: prevX, y: prevY })
+          run cmds.append(CanvasCommand.LineTo { x: x, y: y })
+          drewAny = true
+        }
+        segIdx = segIdx + 1
+      } else {
+        segIdx = 0
+      }
+      prevX = x
+      prevY = y
+      prevF0 = pt.f0
+      prevT = pt.time
+      hasPrev = true
+    }
+    i = i + 1
+  }
+  if drewAny {
+    run cmds.append(CanvasCommand.Stroke { color: COL_REF, width: 2.0 })
+  }
+}
+
+effect fn drawAlignedSolidPitch(
+  cmds: &mut List<CanvasCommand>,
+  aligned: &[AlignedRefPoint],
+  vp: &Viewport,
+  width: f32,
+  height: f32,
+  color: Rgba<f32>,
+  strokeW: f32,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut inRun = false
+  let mut runPts: usize = 0
+  let mut prevF0: f64 = 0.0
+  let mut prevT: f64 = 0.0
+  let mut i: usize = 0
+  while i < aligned.length {
+    let pt = aligned[i]
+    let ok = pt.voiced && pt.f0 >= vp.f0 && pt.f0 <= vp.f1 && pt.time >= vp.t0 - 0.1 && pt.time <= vp.t1 + 0.1
+    if !ok || (inRun && ((pt.time - prevT) > 0.16 || semitonesBetween(prevF0, pt.f0) > MAX_CONNECTED_SEMITONES)) {
+      if inRun && runPts >= 2 {
+        run cmds.append(CanvasCommand.Stroke { color: color, width: strokeW })
+      }
+      inRun = false
+      runPts = 0
+    }
+    if ok {
+      let x = xOfTime(vp, pt.time, width)
+      let y = yOfFreq(vp, pt.f0, height)
+      if !inRun {
+        run cmds.append(CanvasCommand.MoveTo { x: x, y: y })
+        inRun = true
+        runPts = 1
+      } else {
+        run cmds.append(CanvasCommand.LineTo { x: x, y: y })
+        runPts = runPts + 1
+      }
+      prevF0 = pt.f0
+      prevT = pt.time
+    }
+    i = i + 1
+  }
+  if inRun && runPts >= 2 {
+    run cmds.append(CanvasCommand.Stroke { color: color, width: strokeW })
+  }
+}
+
+effect fn drawAlignedFormants(
+  cmds: &mut List<CanvasCommand>,
+  aligned: &[AlignedRefPoint],
+  vp: &Viewport,
+  width: f32,
+  height: f32,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut i: usize = 0
+  while i < aligned.length {
+    let pt = aligned[i]
+    if pt.voiced && pt.hasFormants && pt.time >= vp.t0 && pt.time <= vp.t1 {
+      let x = xOfTime(vp, pt.time, width)
+      if pt.f1 >= vp.f0 && pt.f1 <= vp.f1 {
+        let y1 = yOfFreq(vp, pt.f1, height)
+        run cmds.append(CanvasCommand.FillRect { x: x - 2.6, y: y1 - 2.6, width: 5.2, height: 5.2, radius: 1.0, color: COL_F1 })
+      }
+      if pt.f2 >= vp.f0 && pt.f2 <= vp.f1 {
+        let y2 = yOfFreq(vp, pt.f2, height)
+        run cmds.append(CanvasCommand.FillRect { x: x - 2.6, y: y2 - 2.6, width: 5.2, height: 5.2, radius: 1.0, color: COL_F2 })
+      }
+    }
+    i = i + 1
+  }
+}
+
+fn warpTimeToRef(alignedRef: &[AlignedRefPoint], t: f64) -> f64 {
+  let n = alignedRef.length
+  if n == 0 {
+    return t
+  }
+  if t <= alignedRef[0].time {
+    let dt = alignedRef[0].time - t
+    return f64.max(0.0, alignedRef[0].refTime - dt)
+  }
+  if t >= alignedRef[n - 1].time {
+    let dt = t - alignedRef[n - 1].time
+    return alignedRef[n - 1].refTime + dt
+  }
+  let mut lo: usize = 0
+  let mut hi: usize = n - 1
+  while lo + 1 < hi {
+    let mid = (lo + hi) / 2
+    if alignedRef[mid].time <= t {
+      lo = mid
+    } else {
+      hi = mid
+    }
+  }
+  let t0 = alignedRef[lo].time
+  let t1 = alignedRef[hi].time
+  let span = t1 - t0
+  if span <= 1.0e-6 {
+    return alignedRef[lo].refTime
+  }
+  let alpha = (t - t0) / span
+  return alignedRef[lo].refTime + alpha * (alignedRef[hi].refTime - alignedRef[lo].refTime)
+}
+
+/// Draws a semi-transparent Reference amplitude waveform ribbon along the top of the spectrogram
+/// (DTW-aligned to your Take when DTW is ON, and highlighting the bisected Ref slice when selecting!).
+effect fn drawRefWaveformRibbon(
+  cmds: &mut List<CanvasCommand>,
+  refSamples: &[f32],
+  refSampleRate: f64,
+  alignedRef: &[AlignedRefPoint],
+  vp: &Viewport,
+  width: f32,
+  opts: OverlayOptions,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if refSamples.length < 32 || refSampleRate <= 0.0 || width <= 8.0 {
+    return ()
+  }
+  let stripH: f32 = 34.0
+  let midY: f32 = stripH * 0.5
+  let halfAmp: f32 = stripH * 0.42
+
+  // Subtle darkroom backing ribbon for the Reference waveform (Glint Muted spec)
+  run cmds.append(
+    CanvasCommand.FillRect {
+      x: 0.0,
+      y: 0.0,
+      width: width,
+      height: stripH,
+      radius: 0.0,
+      color: Rgba<f32> { r: 0.039, g: 0.039, b: 0.047, a: 0.72 },
+    },
+  )
+  run cmds.append(
+    CanvasCommand.FillRect {
+      x: 0.0,
+      y: stripH - 1.0,
+      width: width,
+      height: 1.0,
+      radius: 0.0,
+      color: Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: 0.18 },
+    },
+  )
+  run cmds.append(
+    CanvasCommand.FillRect {
+      x: 0.0,
+      y: midY - 0.5,
+      width: width,
+      height: 1.0,
+      radius: 0.0,
+      color: Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: 0.12 },
+    },
+  )
+
+  // Peak normalize reference amplitude (strided scan for O(1) microsecond speed)
+  let stepScan = if refSamples.length > 4096 { refSamples.length / 4096 } else { 1 }
+  let mut peak: f32 = 0.001
+  let mut si: usize = 0
+  while si < refSamples.length {
+    let a = f32.abs(refSamples[si])
+    if a > peak { peak = a }
+    si = si + stepScan
+  }
+  let invPeak: f32 = 1.0 / peak
+
+  let refDur = usize.toF64(refSamples.length) / refSampleRate
+  let warp = !opts.plotOnRef && opts.useDtwAlign && alignedRef.length >= 2
+  let span = f64.max(0.001, vp.t1 - vp.t0)
+  let cols = f32.toUsize(f32.max(24.0, f32.min(480.0, width * 0.5)))
+  let colW = width / usize.toF32(cols)
+  let halfBinSec = f64.max(0.004, (span / usize.toF64(cols)) * 0.55)
+
+  let mut c: usize = 0
+  while c < cols {
+    let frac = (usize.toF64(c) + 0.5) / usize.toF64(cols)
+    let t = vp.t0 + frac * span
+    let refT = if warp { warpTimeToRef(alignedRef, t) } else { t }
+    if refT >= 0.0 && refT <= refDur {
+      let i0 = f64.toUsize(f64.max(0.0, f64.floor((refT - halfBinSec) * refSampleRate)))
+      let mut i1 = f64.toUsize(f64.ceil((refT + halfBinSec) * refSampleRate))
+      if i1 > refSamples.length { i1 = refSamples.length }
+      if i1 > i0 {
+        let binSpan = i1 - i0
+        let stride = if binSpan > 24 { binSpan / 24 } else { 1 }
+        let mut mag: f32 = 0.0
+        let mut k = i0
+        while k < i1 {
+          let a = f32.abs(refSamples[k])
+          if a > mag { mag = a }
+          k = k + stride
+        }
+        let norm = f32.min(1.0, mag * invPeak)
+        let h = f32.max(1.2, norm * halfAmp * 2.0)
+        let inRefSel = opts.hasRefSel && refT >= opts.refSelStart && refT <= opts.refSelEnd
+        let barCol = if inRefSel {
+          Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
+        } else if opts.hasRefSel {
+          Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: 0.42 }
+        } else {
+          Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: 0.55 }
+        }
+        let bx = usize.toF32(c) * colW
+        run cmds.append(
+          CanvasCommand.FillRect {
+            x: bx,
+            y: midY - h * 0.5,
+            width: f32.max(1.2, colW - 0.3),
+            height: h,
+            radius: 0.6,
+            color: barCol,
+          },
+        )
+      }
+    }
+    c = c + 1
+  }
+}
+
+pub effect fn buildSpectrogramOverlay(
+  vp: &Viewport,
+  width: f32,
+  height: f32,
+  pitchFrames: &[PitchFrame],
+  formantFrames: &[FormantFrame],
+  alignedRef: &[AlignedRefPoint],
+  refSamples: &[f32],
+  refSampleRate: f64,
+  guides: &[f64],
+  opts: OverlayOptions,
+) -> Drawing
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut cmds = List<CanvasCommand>.make()
+  if width <= 2.0 || height <= 2.0 {
+    return run Drawing.make(move cmds)
+  }
+
+  // 1. Optional musical note grid lines (C notes stronger, other natural notes faint)
+  if opts.showNoteGrid {
+    let mut midi: i32 = 24
+    while midi <= 108 {
+      let hz = midiToFrequency(midi)
+      if hz >= vp.f0 && hz <= vp.f1 {
+        let y = yOfFreq(vp, hz, height)
+        let isC = (midi % 12) == 0
+        let isA = (midi % 12) == 9
+        if isC || isA || !isBlackKey(midi) {
+          let alpha: f32 = if isC { 0.22 } else if isA { 0.14 } else { 0.06 }
+          run cmds.append(
+            CanvasCommand.FillRect {
+              x: 0.0,
+              y: y,
+              width: width,
+              height: if isC { 1.0 } else { 0.75 },
+              radius: 0.0,
+              color: Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: alpha },
+            },
+          )
+        }
+      }
+      midi = midi + 1
+    }
+  }
+
+  // 2. Horizontal frequency guides (dashed crisp white lines; interactive white pills rendered in view.silk)
+  let mut g: usize = 0
+  while g < guides.length {
+    let hz = guides[g]
+    if hz >= vp.f0 && hz <= vp.f1 {
+      let y = yOfFreq(vp, hz, height)
+      let mut dx: f32 = 0.0
+      while dx < width {
+        let segW = f32.min(5.0, width - dx)
+        run cmds.append(
+          CanvasCommand.FillRect { x: dx, y: y - 0.5, width: segW, height: 1.0, radius: 0.0, color: COL_GUIDE },
+        )
+        dx = dx + 8.0
+      }
+    }
+    g = g + 1
+  }
+
+  // 4. Praat Burg Formant tracks (F1 coral, F2 gold, F3 emerald, F4 sky)
+  if opts.showFormants && formantFrames.length > 0 {
+    run drawFormantBand(&mut cmds, formantFrames, 0, vp, width, height, COL_F1)
+    run drawFormantBand(&mut cmds, formantFrames, 1, vp, width, height, COL_F2)
+    run drawFormantBand(&mut cmds, formantFrames, 2, vp, width, height, COL_F3)
+    run drawFormantBand(&mut cmds, formantFrames, 3, vp, width, height, COL_F4)
+  }
+
+  // 5. Optional harmonic overtone guide tracks (2x, 3x, 4x F0)
+  if opts.showHarmonics && pitchFrames.length > 1 {
+    run drawPitchRuns(&mut cmds, pitchFrames, vp, width, height, opts.displayClarity, 2.0, COL_HARMONIC, 1.0)
+    run drawPitchRuns(&mut cmds, pitchFrames, vp, width, height, opts.displayClarity, 3.0, COL_HARMONIC, 0.9)
+    run drawPitchRuns(&mut cmds, pitchFrames, vp, width, height, opts.displayClarity, 4.0, COL_HARMONIC, 0.8)
+  }
+
+  // 5b & 6: Pitch contours (either Take base + Ref dashed ghost, OR Ref base + YOUR voice plotted on top!)
+  if opts.plotOnRef {
+    if opts.showFormants && alignedRef.length > 0 {
+      run drawAlignedFormants(&mut cmds, alignedRef, vp, width, height)
+    }
+    if opts.showPitch && pitchFrames.length > 1 {
+      run drawPitchRuns(&mut cmds, pitchFrames, vp, width, height, opts.displayClarity, 1.0, COL_REF, 1.8)
+    }
+    if opts.showPitch && alignedRef.length > 1 {
+      run drawAlignedSolidPitch(&mut cmds, alignedRef, vp, width, height, COL_PITCH_GLOW, 4.2)
+      run drawAlignedSolidPitch(&mut cmds, alignedRef, vp, width, height, COL_PITCH, 2.2)
+    }
+  } else {
+    if opts.showPitch && opts.showRefOverlay && alignedRef.length > 1 {
+      run drawAlignedRefPitch(&mut cmds, alignedRef, vp, width, height)
+    }
+    if opts.showPitch && pitchFrames.length > 1 {
+      run drawPitchRuns(&mut cmds, pitchFrames, vp, width, height, opts.displayClarity, 1.0, COL_PITCH_GLOW, 3.8)
+      run drawPitchRuns(&mut cmds, pitchFrames, vp, width, height, opts.displayClarity, 1.0, COL_PITCH, 1.8)
+    }
+  }
+
+  // 7. Optional Reference amplitude waveform ribbon across top of spectrogram
+  if opts.showRefWave && refSamples.length >= 32 && refSampleRate > 0.0 {
+    run drawRefWaveformRibbon(&mut cmds, refSamples, refSampleRate, alignedRef, vp, width, opts)
+  }
+
+  return run Drawing.make(move cmds)
+}
+
+// ============================================================================
+// Vertical Piano Keyboard (aligned 1:1 with frequency axis)
+// ============================================================================
+
+pub effect fn buildPianoDrawing(
+  vp: &Viewport,
+  width: f32,
+  height: f32,
+  activeMidi: i32,
+  hasActivePitch: bool,
+) -> Drawing
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut cmds = List<CanvasCommand>.make()
+  if width <= 2.0 || height <= 2.0 {
+    return run Drawing.make(move cmds)
+  }
+
+  // Glint slim darkroom piano strip (12px): #3E3E44 white keys, #5C5C63 C/F dividers, #18181B black keys, #FFFFFF active
+  run cmds.append(
+    CanvasCommand.FillRect {
+      x: 0.0,
+      y: 0.0,
+      width: width,
+      height: height,
+      radius: 0.0,
+      color: Rgba<f32> { r: 0.243, g: 0.243, b: 0.267, a: 1.0 },
+    },
+  )
+
+  // Draw white key C/F dividers and active white key highlight first, then black keys on top.
+  let mut midi: i32 = 21
+  while midi <= 108 {
+    if !isBlackKey(midi) {
+      let loHz = midiToFrequency(midi) * f64.pow(2.0, -0.5 / 12.0)
+      let hiHz = midiToFrequency(midi) * f64.pow(2.0, 0.5 / 12.0)
+      if hiHz >= vp.f0 && loHz <= vp.f1 {
+        let yTop = f32.max(0.0, yOfFreq(vp, hiHz, height))
+        let yBot = f32.min(height, yOfFreq(vp, loHz, height))
+        let h = yBot - yTop
+        if h >= 0.6 {
+          let active = hasActivePitch && midi == activeMidi
+          let pc = midi % 12
+          let isDiv = pc == 0 || pc == 5
+          if active {
+            run cmds.append(
+              CanvasCommand.FillRect {
+                x: 0.0,
+                y: yTop,
+                width: width,
+                height: f32.max(1.5, h),
+                radius: 0.0,
+                color: Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: 0.95 },
+              },
+            )
+          }
+          if isDiv {
+            run cmds.append(
+              CanvasCommand.FillRect {
+                x: 0.0,
+                y: yBot - 0.6,
+                width: width,
+                height: 0.6,
+                radius: 0.0,
+                color: Rgba<f32> { r: 0.361, g: 0.361, b: 0.388, a: 1.0 },
+              },
+            )
+          }
+        }
+      }
+    }
+    midi = midi + 1
+  }
+
+  midi = 21
+  while midi <= 108 {
+    if isBlackKey(midi) {
+      let loHz = midiToFrequency(midi) * f64.pow(2.0, -0.45 / 12.0)
+      let hiHz = midiToFrequency(midi) * f64.pow(2.0, 0.45 / 12.0)
+      if hiHz >= vp.f0 && loHz <= vp.f1 {
+        let yTop = f32.max(0.0, yOfFreq(vp, hiHz, height))
+        let yBot = f32.min(height, yOfFreq(vp, loHz, height))
+        let h = yBot - yTop
+        if h >= 0.6 {
+          let active = hasActivePitch && midi == activeMidi
+          let col = if active {
+            Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
+          } else {
+            Rgba<f32> { r: 0.094, g: 0.094, b: 0.106, a: 1.0 }
+          }
+          run cmds.append(
+            CanvasCommand.FillRect {
+              x: 0.0,
+              y: yTop,
+              width: width * 0.62,
+              height: h,
+              radius: 0.0,
+              color: col,
+            },
+          )
+        }
+      }
+    }
+    midi = midi + 1
+  }
+
+  return run Drawing.make(move cmds)
+}
+
+// ============================================================================
+// VoceVista Power Spectrum Slice + LPC Envelope
+// ============================================================================
+
+pub effect fn buildSpectrumSliceDrawing(
+  vp: &Viewport,
+  width: f32,
+  height: f32,
+  slice: &ColumnData,
+  lpcCoeffs: &[f64],
+  lpcValid: bool,
+  lpcRate: f64,
+  formant: Option<FormantFrame>,
+  pitchFrame: Option<PitchFrame>,
+  floorDb: f32,
+  ceilingDb: f32,
+) -> Drawing
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut cmds = List<CanvasCommand>.make()
+  if width <= 4.0 || height <= 4.0 {
+    return run Drawing.make(move cmds)
+  }
+
+  // Glint light card background (#F7F7F8) — horizontal frequency axis (left -> right), dB bottom -> top
+  run cmds.append(
+    CanvasCommand.FillRect {
+      x: 0.0,
+      y: 0.0,
+      width: width,
+      height: height,
+      radius: 4.0,
+      color: Rgba<f32> { r: 0.969, g: 0.969, b: 0.973, a: 1.0 },
+    },
+  )
+
+  let padX: f32 = 4.0
+  let padY: f32 = 8.0
+  let iw = f32.max(4.0, width - padX * 2.0)
+  let ih = f32.max(4.0, height - padY * 2.0)
+
+  // Subtle horizontal grid lines
+  let mut g: usize = 1
+  while g < 4 {
+    let gy = padY + ih * usize.toF32(g) * 0.25
+    run cmds.append(
+      CanvasCommand.FillRect {
+        x: padX,
+        y: gy,
+        width: iw,
+        height: 1.0,
+        radius: 0.0,
+        color: Rgba<f32> { r: 0.902, g: 0.902, b: 0.910, a: 1.0 },
+      },
+    )
+    g = g + 1
+  }
+
+  let dbSpan = f32.max(10.0, ceilingDb - floorDb)
+
+  // FFT spectrum curve (#8A8A90, 1px)
+  if slice.bins > 2 && slice.data.length() >= slice.bins {
+    let raw = slice.data.asSlice()
+    let cols: usize = 140
+    let mut started = false
+    let mut c: usize = 0
+    while c <= cols {
+      let norm = usize.toF64(c) / usize.toF64(cols)
+      let hz = vp.normToFreqAt(norm)
+      let binF = hz / slice.hzPerBin
+      let b0 = if binF < 0.0 { 0 } else { f64.toUsize(f64.floor(binF)) }
+      let db = if b0 < slice.bins {
+        let mut peak = raw[b0]
+        if b0 + 1 < slice.bins && raw[b0 + 1] > peak {
+          peak = raw[b0 + 1]
+        }
+        peak
+      } else {
+        floorDb
+      }
+      let mut t = (db - floorDb) / dbSpan
+      if t < 0.0 { t = 0.0 }
+      if t > 1.0 { t = 1.0 }
+      let x = padX + usize.toF32(c) / usize.toF32(cols) * iw
+      let y = padY + (1.0 - t) * ih
+      if !started {
+        run cmds.append(CanvasCommand.MoveTo { x: x, y: y })
+        started = true
+      } else {
+        run cmds.append(CanvasCommand.LineTo { x: x, y: y })
+      }
+      c = c + 1
+    }
+    if started {
+      run cmds.append(
+        CanvasCommand.Stroke {
+          color: COL_MUTED,
+          width: 1.0,
+        },
+      )
+    }
+  }
+
+  // Smooth Praat LPC vocal-tract envelope curve (#0B0B0C, 1.8px)
+  if lpcValid && lpcCoeffs.length >= DEFAULT_LPC_ORDER && lpcRate > 0.0 {
+    let cols: usize = 110
+    let mut maxEnv: f32 = -120.0
+    let mut vals: [f32; 111] = [-120.0; 111]
+    let mut c: usize = 0
+    while c <= cols {
+      let norm = usize.toF64(c) / usize.toF64(cols)
+      let hz = vp.normToFreqAt(norm)
+      let e = lpcEnvelopeDb(lpcCoeffs, DEFAULT_LPC_ORDER, hz, lpcRate)
+      vals[c] = e
+      if e > maxEnv && hz <= lpcRate * 0.48 {
+        maxEnv = e
+      }
+      c = c + 1
+    }
+    let mut started = false
+    c = 0
+    while c <= cols {
+      let norm = usize.toF64(c) / usize.toF64(cols)
+      let hz = vp.normToFreqAt(norm)
+      if hz <= lpcRate * 0.48 {
+        let mut t = (vals[c] - (maxEnv - 48.0)) / 52.0
+        if t < 0.0 { t = 0.0 }
+        if t > 1.0 { t = 1.0 }
+        let x = padX + usize.toF32(c) / usize.toF32(cols) * iw
+        let y = padY + (1.0 - t) * ih
+        if !started {
+          run cmds.append(CanvasCommand.MoveTo { x: x, y: y })
+          started = true
+        } else {
+          run cmds.append(CanvasCommand.LineTo { x: x, y: y })
+        }
+      }
+      c = c + 1
+    }
+    if started {
+      run cmds.append(
+        CanvasCommand.Stroke {
+          color: COL_INK,
+          width: 1.8,
+        },
+      )
+    }
+  }
+
+  // Formant vertical marker ticks (vermilion for F1/F2, ink for F3)
+  if let Option<FormantFrame>.Some { value: ff } = formant {
+    if ff.count >= 1 && ff.f1 >= vp.f0 && ff.f1 <= vp.f1 {
+      let x = padX + f64.toF32(vp.freqToNormAt(ff.f1)) * iw
+      run cmds.append(CanvasCommand.FillRect { x: x - 0.5, y: 0.0, width: 1.0, height: height, radius: 0.0, color: COL_VERMILION })
+    }
+    if ff.count >= 2 && ff.f2 >= vp.f0 && ff.f2 <= vp.f1 {
+      let x = padX + f64.toF32(vp.freqToNormAt(ff.f2)) * iw
+      let mut dy: f32 = 0.0
+      while dy < height {
+        run cmds.append(CanvasCommand.FillRect { x: x - 0.5, y: dy, width: 1.0, height: f32.min(3.0, height - dy), radius: 0.0, color: COL_VERMILION })
+        dy = dy + 5.0
+      }
+    }
+    if ff.count >= 3 && ff.f3 >= vp.f0 && ff.f3 <= vp.f1 {
+      let x = padX + f64.toF32(vp.freqToNormAt(ff.f3)) * iw
+      run cmds.append(CanvasCommand.FillRect { x: x - 0.5, y: 0.0, width: 1.0, height: height, radius: 0.0, color: Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 0.25 } })
+    }
+  }
+
+  // Fundamental F0 marker line
+  if let Option<PitchFrame>.Some { value: pf } = pitchFrame {
+    if pf.voiced && pf.frequency >= vp.f0 && pf.frequency <= vp.f1 {
+      let x = padX + f64.toF32(vp.freqToNormAt(pf.frequency)) * iw
+      run cmds.append(
+        CanvasCommand.FillRect {
+          x: x - 0.5,
+          y: 0.0,
+          width: 1.0,
+          height: height,
+          radius: 0.0,
+          color: Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 0.40 },
+        },
+      )
+    }
+  }
+
+  return run Drawing.make(move cmds)
+}
+
+// ============================================================================
+// 2D Vowel Space Plot (F1 vs F2 phonetic chart: F2 right-to-left, F1 top-to-bottom)
+// ============================================================================
+
+pub fn vowelX(f2: f64, width: f32) -> f32 {
+  // F2 runs 3100 Hz (left/front) -> 650 Hz (right/back)
+  let t = (3100.0 - f2) / 2450.0
+  let c = f64.max(0.04, f64.min(0.96, t))
+  return f64.toF32(c) * width
+}
+
+pub fn vowelY(f1: f64, height: f32) -> f32 {
+  // F1 runs 220 Hz (top/close) -> 1020 Hz (bottom/open)
+  let t = (f1 - 220.0) / 800.0
+  let c = f64.max(0.06, f64.min(0.92, t))
+  return f64.toF32(c) * height
+}
+
+pub effect fn buildVowelChartDrawing(
+  width: f32,
+  height: f32,
+  formant: Option<FormantFrame>,
+  takeFrames: &[VoiceFrame],
+  takeSummary: VoiceSummary,
+  refFrames: &[VoiceFrame],
+  refSummary: VoiceSummary,
+  hasRef: bool,
+  vowelMode: u32,
+) -> Drawing
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut cmds = List<CanvasCommand>.make()
+  if width <= 4.0 || height <= 4.0 {
+    return run Drawing.make(move cmds)
+  }
+
+  // Glint light card background (#F7F7F8)
+  run cmds.append(
+    CanvasCommand.FillRect {
+      x: 0.0,
+      y: 0.0,
+      width: width,
+      height: height,
+      radius: 4.0,
+      color: Rgba<f32> { r: 0.969, g: 0.969, b: 0.973, a: 1.0 },
+    },
+  )
+
+  let showFem = vowelMode == VOWEL_MODE_FEM || vowelMode == VOWEL_MODE_BOTH
+  let showMasc = vowelMode == VOWEL_MODE_MASC || vowelMode == VOWEL_MODE_BOTH
+  let colFemPoly = COL_INK
+  let colMascPoly = COL_MUTED
+
+  // Hillenbrand (1995) Men's vowel polygon (muted #8A8A90)
+  if showMasc {
+    run cmds.append(CanvasCommand.MoveTo { x: vowelX(VOWELS_MASC[0].f2, width), y: vowelY(VOWELS_MASC[0].f1, height) })
+    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_MASC[1].f2, width), y: vowelY(VOWELS_MASC[1].f1, height) })
+    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_MASC[3].f2, width), y: vowelY(VOWELS_MASC[3].f1, height) })
+    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_MASC[4].f2, width), y: vowelY(VOWELS_MASC[4].f1, height) })
+    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_MASC[5].f2, width), y: vowelY(VOWELS_MASC[5].f1, height) })
+    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_MASC[6].f2, width), y: vowelY(VOWELS_MASC[6].f1, height) })
+    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_MASC[9].f2, width), y: vowelY(VOWELS_MASC[9].f1, height) })
+    run cmds.append(CanvasCommand.Close)
+    run cmds.append(CanvasCommand.Stroke { color: colMascPoly, width: 1.1 })
+  }
+
+  // Hillenbrand (1995) Women's vowel polygon (#0B0B0C with 4% fill)
+  if showFem {
+    run cmds.append(CanvasCommand.MoveTo { x: vowelX(VOWELS_FEM[0].f2, width), y: vowelY(VOWELS_FEM[0].f1, height) })
+    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[1].f2, width), y: vowelY(VOWELS_FEM[1].f1, height) })
+    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[3].f2, width), y: vowelY(VOWELS_FEM[3].f1, height) })
+    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[4].f2, width), y: vowelY(VOWELS_FEM[4].f1, height) })
+    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[5].f2, width), y: vowelY(VOWELS_FEM[5].f1, height) })
+    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[6].f2, width), y: vowelY(VOWELS_FEM[6].f1, height) })
+    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[9].f2, width), y: vowelY(VOWELS_FEM[9].f1, height) })
+    run cmds.append(CanvasCommand.Close)
+    run cmds.append(CanvasCommand.Fill { color: Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 0.04 } })
+    run cmds.append(CanvasCommand.MoveTo { x: vowelX(VOWELS_FEM[0].f2, width), y: vowelY(VOWELS_FEM[0].f1, height) })
+    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[1].f2, width), y: vowelY(VOWELS_FEM[1].f1, height) })
+    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[3].f2, width), y: vowelY(VOWELS_FEM[3].f1, height) })
+    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[4].f2, width), y: vowelY(VOWELS_FEM[4].f1, height) })
+    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[5].f2, width), y: vowelY(VOWELS_FEM[5].f1, height) })
+    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[6].f2, width), y: vowelY(VOWELS_FEM[6].f1, height) })
+    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[9].f2, width), y: vowelY(VOWELS_FEM[9].f1, height) })
+    run cmds.append(CanvasCommand.Close)
+    run cmds.append(CanvasCommand.Stroke { color: colFemPoly, width: 1.3 })
+  }
+
+  // Subtle shift vectors from Men -> Women on cardinal vowels in Both mode
+  if showFem && showMasc {
+    let shiftIdx: [usize; 6] = [0, 3, 4, 5, 6, 9]
+    let mut s: usize = 0
+    while s < shiftIdx.length {
+      let vi = shiftIdx[s]
+      run cmds.append(CanvasCommand.MoveTo { x: vowelX(VOWELS_MASC[vi].f2, width), y: vowelY(VOWELS_MASC[vi].f1, height) })
+      run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[vi].f2, width), y: vowelY(VOWELS_FEM[vi].f1, height) })
+      s = s + 1
+    }
+    run cmds.append(CanvasCommand.Stroke { color: Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 0.14 }, width: 0.8 })
+  }
+
+  // Whole-sentence Reference vowel cloud (subtle muted) + hollow ring centroid
+  if hasRef && refFrames.length > 0 {
+    let step = if refFrames.length > 160 { refFrames.length / 160 } else { 1 }
+    let mut k: usize = 0
+    while k < refFrames.length {
+      let rf = refFrames[k]
+      if rf.voiced && rf.hasFormants {
+        let rx = vowelX(rf.f2, width)
+        let ry = vowelY(rf.f1, height)
+        run cmds.append(
+          CanvasCommand.FillRect {
+            x: rx - 1.6,
+            y: ry - 1.6,
+            width: 3.2,
+            height: 3.2,
+            radius: 1.6,
+            color: Rgba<f32> { r: 0.541, g: 0.541, b: 0.565, a: 0.24 },
+          },
+        )
+      }
+      k = k + step
+    }
+    if refSummary.formantCount > 0 {
+      let rcx = vowelX(refSummary.meanF2, width)
+      let rcy = vowelY(refSummary.meanF1, height)
+      run cmds.append(
+        CanvasCommand.FillRect {
+          x: rcx - 4.5,
+          y: rcy - 4.5,
+          width: 9.0,
+          height: 9.0,
+          radius: 4.5,
+          color: COL_INK,
+        },
+      )
+      run cmds.append(
+        CanvasCommand.FillRect {
+          x: rcx - 3.0,
+          y: rcy - 3.0,
+          width: 6.0,
+          height: 6.0,
+          radius: 3.0,
+          color: Rgba<f32> { r: 0.969, g: 0.969, b: 0.973, a: 1.0 },
+        },
+      )
+    }
+  }
+
+  // Whole-sentence Your Take vowel cloud (ink 16%) + solid #0B0B0C centroid
+  if takeFrames.length > 0 {
+    let step = if takeFrames.length > 160 { takeFrames.length / 160 } else { 1 }
+    let mut k: usize = 0
+    while k < takeFrames.length {
+      let tf = takeFrames[k]
+      if tf.voiced && tf.hasFormants {
+        let tx = vowelX(tf.f2, width)
+        let ty = vowelY(tf.f1, height)
+        run cmds.append(
+          CanvasCommand.FillRect {
+            x: tx - 1.6,
+            y: ty - 1.6,
+            width: 3.2,
+            height: 3.2,
+            radius: 1.6,
+            color: Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 0.16 },
+          },
+        )
+      }
+      k = k + step
+    }
+    if takeSummary.formantCount > 0 {
+      let tcx = vowelX(takeSummary.meanF2, width)
+      let tcy = vowelY(takeSummary.meanF1, height)
+      // Vermilion shift vector from Take -> Ref when both exist
+      if hasRef && refSummary.formantCount > 0 {
+        let rcx = vowelX(refSummary.meanF2, width)
+        let rcy = vowelY(refSummary.meanF1, height)
+        run cmds.append(CanvasCommand.MoveTo { x: tcx, y: tcy })
+        run cmds.append(CanvasCommand.LineTo { x: rcx, y: rcy })
+        run cmds.append(CanvasCommand.Stroke { color: COL_VERMILION, width: 1.3 })
+      }
+      run cmds.append(
+        CanvasCommand.FillRect {
+          x: tcx - 4.0,
+          y: tcy - 4.0,
+          width: 8.0,
+          height: 8.0,
+          radius: 4.0,
+          color: COL_INK,
+        },
+      )
+    }
+  }
+
+  // Reference vowel dots (subtle ink / muted)
+  if showMasc {
+    let mut i: usize = 0
+    while i < VOWELS_MASC.length {
+      let vx = vowelX(VOWELS_MASC[i].f2, width)
+      let vy = vowelY(VOWELS_MASC[i].f1, height)
+      run cmds.append(
+        CanvasCommand.FillRect {
+          x: vx - 1.8,
+          y: vy - 1.8,
+          width: 3.6,
+          height: 3.6,
+          radius: 1.8,
+          color: Rgba<f32> { r: 0.541, g: 0.541, b: 0.565, a: 0.65 },
+        },
+      )
+      i = i + 1
+    }
+  }
+  if showFem {
+    let mut i: usize = 0
+    while i < VOWELS_FEM.length {
+      let vx = vowelX(VOWELS_FEM[i].f2, width)
+      let vy = vowelY(VOWELS_FEM[i].f1, height)
+      run cmds.append(
+        CanvasCommand.FillRect {
+          x: vx - 1.8,
+          y: vy - 1.8,
+          width: 3.6,
+          height: 3.6,
+          radius: 1.8,
+          color: Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 0.55 },
+        },
+      )
+      i = i + 1
+    }
+  }
+
+  // Current voice formant position (vermilion cursor dot)
+  if let Option<FormantFrame>.Some { value: ff } = formant {
+    if ff.count >= 2 && ff.f1 > 150.0 && ff.f2 > ff.f1 {
+      let cx = vowelX(ff.f2, width)
+      let cy = vowelY(ff.f1, height)
+      run cmds.append(
+        CanvasCommand.FillRect {
+          x: cx - 6.0,
+          y: cy - 6.0,
+          width: 12.0,
+          height: 12.0,
+          radius: 6.0,
+          color: Rgba<f32> { r: 0.851, g: 0.220, b: 0.118, a: 0.22 },
+        },
+      )
+      run cmds.append(
+        CanvasCommand.FillRect {
+          x: cx - 3.0,
+          y: cy - 3.0,
+          width: 6.0,
+          height: 6.0,
+          radius: 3.0,
+          color: COL_VERMILION,
+        },
+      )
+    }
+  }
+
+  return run Drawing.make(move cmds)
+}
+
+// ============================================================================
+// Waveform Overview Strip
+// ============================================================================
+
+pub effect fn buildWaveformOverview(
+  samples: &[f32],
+  sampleRate: f64,
+  vp: &Viewport,
+  width: f32,
+  height: f32,
+  cursorSec: f64,
+  hasSelection: bool,
+  selStart: f64,
+  selEnd: f64,
+) -> Drawing
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut cmds = List<CanvasCommand>.make()
+  if width <= 4.0 || height <= 4.0 {
+    return run Drawing.make(move cmds)
+  }
+
+  // Glint overview bar inside darkroom well (#1C1C1F bg, #6E6E76 waveform bars)
+  run cmds.append(
+    CanvasCommand.FillRect {
+      x: 0.0,
+      y: 0.0,
+      width: width,
+      height: height,
+      radius: 3.0,
+      color: Rgba<f32> { r: 0.110, g: 0.110, b: 0.122, a: 1.0 },
+    },
+  )
+
+  let midY = height * 0.5
+  let dur = f64.max(vp.duration, 0.05)
+
+  if samples.length > 0 {
+    let cols = f32.toUsize(f32.max(1.0, f32.min(width * 0.5, 440.0)))
+    let colW = width / usize.toF32(cols)
+    let totalSamples = f64.toUsize(f64.max(1.0, dur * sampleRate))
+    let mut c: usize = 0
+    while c < cols {
+      let s0 = (c * totalSamples) / cols
+      let s1Raw = ((c + 1) * totalSamples) / cols
+      let s1 = if s1Raw <= s0 { s0 + 1 } else { s1Raw }
+      let mut peak: f32 = 0.0
+      let step = if s1 - s0 > 64 { (s1 - s0) / 64 } else { 1 }
+      let mut s = s0
+      while s < s1 && s < samples.length {
+        let a = f32.abs(samples[s])
+        if a > peak {
+          peak = a
+        }
+        s = s + step
+      }
+      let h = f32.max(1.2, peak * (height - 4.0))
+      run cmds.append(
+        CanvasCommand.FillRect {
+          x: usize.toF32(c) * colW,
+          y: midY - h * 0.5,
+          width: f32.max(1.0, colW - 0.6),
+          height: h,
+          radius: 0.5,
+          color: Rgba<f32> { r: 0.431, g: 0.431, b: 0.463, a: 0.90 },
+        },
+      )
+      c = c + 1
+    }
+  }
+
+  // Selection, viewport window, and playhead are lightweight GPU h.box overlays in view.silk!
+  drop cursorSec
+  drop hasSelection
+  drop selStart
+  drop selEnd
+  return run Drawing.make(move cmds)
+}
+
+// ============================================================================
+// Voice Training Metrics Formatting Helpers
+// ============================================================================
+
+pub effect fn formatVtlCm(vtlCm: f64) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut s = String.make()
+  if vtlCm <= 1.0 {
+    run s.append("—")
+    return move s
+  }
+  run appendFixed(&mut s, vtlCm, 1)
+  run s.append(" cm")
+  return move s
+}
+
+pub effect fn formatSignedFixed(val: f64, decimals: u32, suffix: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut s = String.make()
+  if val >= 0.0 {
+    run s.append("+")
+  }
+  run appendFixed(&mut s, val, decimals)
+  run s.append(suffix)
+  return move s
+}
+
+pub effect fn formatSecShort(sec: f64) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut s = String.make()
+  run appendFixed(&mut s, sec, 2)
+  run s.append("s")
+  return move s
+}
+
+pub effect fn formatScorePct(score: i32) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut s = String.make()
+  if score < 0 {
+    run s.append("—")
+    return move s
+  }
+  run appendInt(&mut s, score)
+  run s.append("%")
+  return move s
+}
+
+// ============================================================================
+// Time-Synced Size (Resonance) & Weight (H1-H2) Metrics Lane
+// ============================================================================
+
+pub effect fn buildMetricsLaneDrawing(
+  vp: &Viewport,
+  width: f32,
+  height: f32,
+  takeFrames: &[VoiceFrame],
+  alignedRef: &[AlignedRefPoint],
+  showRef: bool,
+  plotOnRef: bool,
+  cursorSec: f64,
+) -> Drawing
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut cmds = List<CanvasCommand>.make()
+  if width <= 4.0 || height <= 4.0 {
+    return run Drawing.make(move cmds)
+  }
+
+  // Glint light lane background (#F7F7F8)
+  run cmds.append(
+    CanvasCommand.FillRect {
+      x: 0.0,
+      y: 0.0,
+      width: width,
+      height: height,
+      radius: 4.0,
+      color: Rgba<f32> { r: 0.969, g: 0.969, b: 0.973, a: 1.0 },
+    },
+  )
+
+  // Horizontal guide lines (25%, 50%, 75%)
+  let padY: f32 = 6.0
+  let usableH = f32.max(4.0, height - padY * 2.0)
+  let mut g: usize = 1
+  while g < 4 {
+    let gy = padY + usableH * usize.toF32(g) * 0.25
+    run cmds.append(
+      CanvasCommand.FillRect {
+        x: 0.0,
+        y: gy,
+        width: width,
+        height: 1.0,
+        radius: 0.0,
+        color: Rgba<f32> { r: 0.902, g: 0.902, b: 0.910, a: if g == 2 { 1.0 } else { 0.55 } },
+      },
+    )
+    g = g + 1
+  }
+
+  // Breathiness shading (soft tint where HNR < 10 dB on voiced frames)
+  let mut i: usize = 0
+  while i < takeFrames.length {
+    let fr = takeFrames[i]
+    if fr.voiced && fr.hnrDb < 10.0 && fr.time >= vp.t0 && fr.time <= vp.t1 {
+      let x = xOfTime(vp, fr.time, width)
+      let barW: f32 = if i + 1 < takeFrames.length {
+        f32.max(2.0, xOfTime(vp, takeFrames[i + 1].time, width) - x)
+      } else {
+        4.0
+      }
+      run cmds.append(
+        CanvasCommand.FillRect {
+          x: x,
+          y: padY,
+          width: barW,
+          height: usableH,
+          radius: 0.0,
+          color: COL_BREATHY,
+        },
+      )
+    }
+    i = i + 1
+  }
+
+  let baseWeightCol = if plotOnRef { Rgba<f32> { r: 0.541, g: 0.541, b: 0.565, a: 0.55 } } else { COL_INK_SOFT }
+  let baseSizeCol = if plotOnRef { COL_MUTED } else { COL_INK }
+  let alignedSizeCol = if plotOnRef { COL_INK } else { COL_MUTED }
+  let alignedWeightCol = if plotOnRef { COL_INK_SOFT } else { Rgba<f32> { r: 0.541, g: 0.541, b: 0.565, a: 0.65 } }
+
+  // Base timeline Size & Weight curves (solid when Take base, faint ghost when Reference base)
+  if takeFrames.length > 1 {
+    let mut inRun = false
+    let mut runPts: usize = 0
+    let mut prevT: f64 = 0.0
+    i = 0
+    while i < takeFrames.length {
+      let fr = takeFrames[i]
+      let ok = fr.voiced && fr.time >= vp.t0 - 0.1 && fr.time <= vp.t1 + 0.1
+      if !ok || (inRun && (fr.time - prevT) > 0.14) {
+        if inRun && runPts >= 2 {
+          run cmds.append(CanvasCommand.Stroke { color: baseWeightCol, width: if plotOnRef { 1.4 } else { 1.8 } })
+        }
+        inRun = false
+        runPts = 0
+      }
+      if ok {
+        let x = xOfTime(vp, fr.time, width)
+        let y = padY + (1.0 - f64.toF32(fr.weightLightNorm)) * usableH
+        if !inRun {
+          run cmds.append(CanvasCommand.MoveTo { x: x, y: y })
+          inRun = true
+          runPts = 1
+        } else {
+          run cmds.append(CanvasCommand.LineTo { x: x, y: y })
+          runPts = runPts + 1
+        }
+        prevT = fr.time
+      }
+      i = i + 1
+    }
+    if inRun && runPts >= 2 {
+      run cmds.append(CanvasCommand.Stroke { color: baseWeightCol, width: if plotOnRef { 1.4 } else { 1.8 } })
+    }
+
+    inRun = false
+    runPts = 0
+    i = 0
+    while i < takeFrames.length {
+      let fr = takeFrames[i]
+      let ok = fr.voiced && fr.vtlCm > 1.0 && fr.time >= vp.t0 - 0.1 && fr.time <= vp.t1 + 0.1
+      if !ok || (inRun && (fr.time - prevT) > 0.14) {
+        if inRun && runPts >= 2 {
+          run cmds.append(CanvasCommand.Stroke { color: baseSizeCol, width: if plotOnRef { 1.4 } else { 2.0 } })
+        }
+        inRun = false
+        runPts = 0
+      }
+      if ok {
+        let x = xOfTime(vp, fr.time, width)
+        let y = padY + (1.0 - f64.toF32(fr.sizeNorm)) * usableH
+        if !inRun {
+          run cmds.append(CanvasCommand.MoveTo { x: x, y: y })
+          inRun = true
+          runPts = 1
+        } else {
+          run cmds.append(CanvasCommand.LineTo { x: x, y: y })
+          runPts = runPts + 1
+        }
+        prevT = fr.time
+      }
+      i = i + 1
+    }
+    if inRun && runPts >= 2 {
+      run cmds.append(CanvasCommand.Stroke { color: baseSizeCol, width: if plotOnRef { 1.4 } else { 2.0 } })
+    }
+  }
+
+  // Overlaid DTW-aligned curves batched into ONE Stroke per curve (200x faster!)
+  if (showRef || plotOnRef) && alignedRef.length > 1 {
+    let mut hasPrev = false
+    let mut prevX: f32 = 0.0
+    let mut prevY: f32 = 0.0
+    let mut prevT: f64 = 0.0
+    let mut seg: usize = 0
+    let mut drewWeight = false
+    i = 0
+    while i < alignedRef.length {
+      let pt = alignedRef[i]
+      if !pt.voiced || pt.time < vp.t0 - 0.1 || pt.time > vp.t1 + 0.1 {
+        hasPrev = false
+      } else {
+        let x = xOfTime(vp, pt.time, width)
+        let y = padY + (1.0 - f64.toF32(pt.weightLightNorm)) * usableH
+        if hasPrev && (pt.time - prevT) < 0.16 {
+          if plotOnRef || (seg % 3) != 2 {
+            run cmds.append(CanvasCommand.MoveTo { x: prevX, y: prevY })
+            run cmds.append(CanvasCommand.LineTo { x: x, y: y })
+            drewWeight = true
+          }
+          seg = seg + 1
+        } else {
+          seg = 0
+        }
+        prevX = x
+        prevY = y
+        prevT = pt.time
+        hasPrev = true
+      }
+      i = i + 1
+    }
+    if drewWeight {
+      run cmds.append(CanvasCommand.Stroke { color: alignedWeightCol, width: if plotOnRef { 1.9 } else { 1.5 } })
+    }
+
+    hasPrev = false
+    seg = 0
+    let mut drewSize = false
+    i = 0
+    while i < alignedRef.length {
+      let pt = alignedRef[i]
+      if !pt.voiced || pt.time < vp.t0 - 0.1 || pt.time > vp.t1 + 0.1 {
+        hasPrev = false
+      } else {
+        let x = xOfTime(vp, pt.time, width)
+        let y = padY + (1.0 - f64.toF32(pt.sizeNorm)) * usableH
+        if hasPrev && (pt.time - prevT) < 0.16 {
+          if plotOnRef || (seg % 3) != 2 {
+            run cmds.append(CanvasCommand.MoveTo { x: prevX, y: prevY })
+            run cmds.append(CanvasCommand.LineTo { x: x, y: y })
+            drewSize = true
+          }
+          seg = seg + 1
+        } else {
+          seg = 0
+        }
+        prevX = x
+        prevY = y
+        prevT = pt.time
+        hasPrev = true
+      }
+      i = i + 1
+    }
+    if drewSize {
+      run cmds.append(CanvasCommand.Stroke { color: alignedSizeCol, width: if plotOnRef { 2.1 } else { 1.5 } })
+    }
+  }
+
+  // Playhead cursor is a lightweight GPU h.box overlay in view.silk!
+  drop cursorSec
+  return run Drawing.make(move cmds)
+}
+
+// ============================================================================
+// Size x Weight ("Fullness") 2D Pad
+// ============================================================================
+
+pub effect fn buildSizeWeightPadDrawing(
+  width: f32,
+  height: f32,
+  takeFrames: &[VoiceFrame],
+  takeSummary: VoiceSummary,
+  currentFrame: Option<VoiceFrame>,
+  refFrames: &[VoiceFrame],
+  refSummary: VoiceSummary,
+  hasRef: bool,
+) -> Drawing
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut cmds = List<CanvasCommand>.make()
+  if width <= 4.0 || height <= 4.0 {
+    return run Drawing.make(move cmds)
+  }
+
+  // Glint light card background (#F7F7F8)
+  run cmds.append(
+    CanvasCommand.FillRect {
+      x: 0.0,
+      y: 0.0,
+      width: width,
+      height: height,
+      radius: 4.0,
+      color: Rgba<f32> { r: 0.969, g: 0.969, b: 0.973, a: 1.0 },
+    },
+  )
+
+  let pad: f32 = 8.0
+  let iw = f32.max(4.0, width - pad * 2.0)
+  let ih = f32.max(4.0, height - pad * 2.0)
+
+  // Center quadrant crosshairs (#E6E6E8)
+  run cmds.append(
+    CanvasCommand.FillRect {
+      x: width * 0.5,
+      y: 0.0,
+      width: 1.0,
+      height: height,
+      radius: 0.0,
+      color: Rgba<f32> { r: 0.902, g: 0.902, b: 0.910, a: 1.0 },
+    },
+  )
+  run cmds.append(
+    CanvasCommand.FillRect {
+      x: 0.0,
+      y: height * 0.5,
+      width: width,
+      height: 1.0,
+      radius: 0.0,
+      color: Rgba<f32> { r: 0.902, g: 0.902, b: 0.910, a: 1.0 },
+    },
+  )
+
+  // Balanced "Fullness" diagonal (bottom-left big+heavy -> top-right small+light)
+  run cmds.append(CanvasCommand.MoveTo { x: pad, y: pad + ih })
+  run cmds.append(CanvasCommand.LineTo { x: pad + iw, y: pad })
+  run cmds.append(
+    CanvasCommand.Stroke {
+      color: Rgba<f32> { r: 0.86, g: 0.86, b: 0.88, a: 1.0 },
+      width: 1.0,
+    },
+  )
+
+  // Reference cloud & hollow ring (#0B0B0C)
+  if hasRef && refFrames.length > 0 {
+    let step = if refFrames.length > 140 { refFrames.length / 140 } else { 1 }
+    let mut k: usize = 0
+    while k < refFrames.length {
+      let rf = refFrames[k]
+      if rf.voiced && rf.vtlCm > 1.0 {
+        let rx = pad + f64.toF32(rf.sizeNorm) * iw
+        let ry = pad + (1.0 - f64.toF32(rf.weightLightNorm)) * ih
+        run cmds.append(
+          CanvasCommand.FillRect {
+            x: rx - 1.6,
+            y: ry - 1.6,
+            width: 3.2,
+            height: 3.2,
+            radius: 1.6,
+            color: Rgba<f32> { r: 0.541, g: 0.541, b: 0.565, a: 0.24 },
+          },
+        )
+      }
+      k = k + step
+    }
+    if refSummary.voicedFrames > 0 {
+      let cx = pad + f64.toF32(refSummary.medianSizeNorm) * iw
+      let cy = pad + (1.0 - f64.toF32(refSummary.medianWeightLight)) * ih
+      run cmds.append(
+        CanvasCommand.FillRect {
+          x: cx - 5.0,
+          y: cy - 5.0,
+          width: 10.0,
+          height: 10.0,
+          radius: 5.0,
+          color: COL_INK,
+        },
+      )
+      run cmds.append(
+        CanvasCommand.FillRect {
+          x: cx - 3.4,
+          y: cy - 3.4,
+          width: 6.8,
+          height: 6.8,
+          radius: 3.4,
+          color: Rgba<f32> { r: 0.969, g: 0.969, b: 0.973, a: 1.0 },
+        },
+      )
+    }
+  }
+
+  // Your Take cloud (#0B0B0C 18%) & solid dot (#0B0B0C) + vermilion delta line to Ref
+  if takeFrames.length > 0 {
+    let step = if takeFrames.length > 140 { takeFrames.length / 140 } else { 1 }
+    let mut k: usize = 0
+    while k < takeFrames.length {
+      let tf = takeFrames[k]
+      if tf.voiced && tf.vtlCm > 1.0 {
+        let tx = pad + f64.toF32(tf.sizeNorm) * iw
+        let ty = pad + (1.0 - f64.toF32(tf.weightLightNorm)) * ih
+        run cmds.append(
+          CanvasCommand.FillRect {
+            x: tx - 2.0,
+            y: ty - 2.0,
+            width: 4.0,
+            height: 4.0,
+            radius: 2.0,
+            color: Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 0.18 },
+          },
+        )
+      }
+      k = k + step
+    }
+    if takeSummary.voicedFrames > 0 {
+      let tx = pad + f64.toF32(takeSummary.medianSizeNorm) * iw
+      let ty = pad + (1.0 - f64.toF32(takeSummary.medianWeightLight)) * ih
+      if hasRef && refSummary.voicedFrames > 0 {
+        let rx = pad + f64.toF32(refSummary.medianSizeNorm) * iw
+        let ry = pad + (1.0 - f64.toF32(refSummary.medianWeightLight)) * ih
+        run cmds.append(CanvasCommand.MoveTo { x: tx, y: ty })
+        run cmds.append(CanvasCommand.LineTo { x: rx, y: ry })
+        run cmds.append(CanvasCommand.Stroke { color: COL_VERMILION, width: 1.5 })
+      }
+      run cmds.append(
+        CanvasCommand.FillRect {
+          x: tx - 4.8,
+          y: ty - 4.8,
+          width: 9.6,
+          height: 9.6,
+          radius: 4.8,
+          color: COL_INK,
+        },
+      )
+    }
+  }
+
+  // Live cursor dot (vermilion)
+  if let Option<VoiceFrame>.Some { value: cf } = currentFrame {
+    if cf.voiced {
+      let lx = pad + f64.toF32(cf.sizeNorm) * iw
+      let ly = pad + (1.0 - f64.toF32(cf.weightLightNorm)) * ih
+      run cmds.append(
+        CanvasCommand.FillRect {
+          x: lx - 5.5,
+          y: ly - 5.5,
+          width: 11.0,
+          height: 11.0,
+          radius: 5.5,
+          color: Rgba<f32> { r: 0.851, g: 0.220, b: 0.118, a: 0.22 },
+        },
+      )
+      run cmds.append(
+        CanvasCommand.FillRect {
+          x: lx - 2.8,
+          y: ly - 2.8,
+          width: 5.6,
+          height: 5.6,
+          radius: 2.8,
+          color: COL_VERMILION,
+        },
+      )
+    }
+  }
+
+  return run Drawing.make(move cmds)
+}
+
+// ============================================================================
+// Long-Term Average Spectrum (LTAS) Overlay: Reference vs Your Take
+// ============================================================================
+
+pub effect fn buildLtasDrawing(
+  width: f32,
+  height: f32,
+  takeLtas: &[f32],
+  hasTakeLtas: bool,
+  refLtas: &[f32],
+  hasRefLtas: bool,
+) -> Drawing
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut cmds = List<CanvasCommand>.make()
+  if width <= 4.0 || height <= 4.0 {
+    return run Drawing.make(move cmds)
+  }
+
+  // Glint light card background (#F7F7F8)
+  run cmds.append(
+    CanvasCommand.FillRect {
+      x: 0.0,
+      y: 0.0,
+      width: width,
+      height: height,
+      radius: 4.0,
+      color: Rgba<f32> { r: 0.969, g: 0.969, b: 0.973, a: 1.0 },
+    },
+  )
+
+  let padX: f32 = 8.0
+  let padY: f32 = 10.0
+  let iw = f32.max(4.0, width - padX * 2.0)
+  let ih = f32.max(4.0, height - padY * 2.0)
+
+  // Horizontal 0 dB center line + +/- 15 dB guides
+  let mut g: usize = 1
+  while g < 4 {
+    let gy = padY + ih * usize.toF32(g) * 0.25
+    run cmds.append(
+      CanvasCommand.FillRect {
+        x: padX,
+        y: gy,
+        width: iw,
+        height: 1.0,
+        radius: 0.0,
+        color: Rgba<f32> { r: 0.902, g: 0.902, b: 0.910, a: if g == 2 { 1.0 } else { 0.55 } },
+      },
+    )
+    g = g + 1
+  }
+
+  // Vertical log-freq landmarks: 250 Hz, 1 kHz, 3 kHz inside [60..6000 Hz]
+  let logMin = f64.log(60.0)
+  let logSpan = f64.log(6000.0) - logMin
+  let marks: [f64; 3] = [250.0, 1000.0, 3000.0]
+  let mut m: usize = 0
+  while m < 3 {
+    let t = (f64.log(marks[m]) - logMin) / logSpan
+    let gx = padX + f64.toF32(t) * iw
+    run cmds.append(
+      CanvasCommand.FillRect {
+        x: gx,
+        y: padY,
+        width: 1.0,
+        height: ih,
+        radius: 0.0,
+        color: Rgba<f32> { r: 0.902, g: 0.902, b: 0.910, a: 0.80 },
+      },
+    )
+    m = m + 1
+  }
+
+  // Reference LTAS curve (dashed muted #8A8A90)
+  if hasRefLtas && refLtas.length >= LTAS_BINS {
+    let mut drewRef = false
+    let mut i: usize = 1
+    while i < LTAS_BINS {
+      if (i % 3) != 0 {
+        let x0 = padX + usize.toF32(i - 1) / usize.toF32(LTAS_BINS - 1) * iw
+        let x1 = padX + usize.toF32(i) / usize.toF32(LTAS_BINS - 1) * iw
+        let v0 = f32.max(-28.0, f32.min(28.0, refLtas[i - 1]))
+        let v1 = f32.max(-28.0, f32.min(28.0, refLtas[i]))
+        let y0 = padY + (1.0 - (v0 + 28.0) / 56.0) * ih
+        let y1 = padY + (1.0 - (v1 + 28.0) / 56.0) * ih
+        run cmds.append(CanvasCommand.MoveTo { x: x0, y: y0 })
+        run cmds.append(CanvasCommand.LineTo { x: x1, y: y1 })
+        drewRef = true
+      }
+      i = i + 1
+    }
+    if drewRef {
+      run cmds.append(CanvasCommand.Stroke { color: COL_MUTED, width: 1.5 })
+    }
+  }
+
+  // Your Take LTAS curve (solid #0B0B0C)
+  if hasTakeLtas && takeLtas.length >= LTAS_BINS {
+    let mut i: usize = 0
+    while i < LTAS_BINS {
+      let x = padX + usize.toF32(i) / usize.toF32(LTAS_BINS - 1) * iw
+      let v = f32.max(-28.0, f32.min(28.0, takeLtas[i]))
+      let y = padY + (1.0 - (v + 28.0) / 56.0) * ih
+      if i == 0 {
+        run cmds.append(CanvasCommand.MoveTo { x: x, y: y })
+      } else {
+        run cmds.append(CanvasCommand.LineTo { x: x, y: y })
+      }
+      i = i + 1
+    }
+    run cmds.append(CanvasCommand.Stroke { color: COL_INK, width: 1.8 })
+  }
+
+  return run Drawing.make(move cmds)
+}

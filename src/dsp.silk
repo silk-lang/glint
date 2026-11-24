@@ -1,0 +1,285 @@
+//! Spectral analysis, periodic windows, and multi-tier column production.
+//!
+//! Ported from `voiceapp/packages/audio/src/dsp/Window.ts`,
+//! `voiceapp/packages/components/src/spectrogram/columns.ts`, and
+//! `voiceapp/packages/components/src/spectrogram/coarse-tracker.ts`,
+//! accelerated with Apple Accelerate vDSP via `audio_native`.
+import audio_native
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.i32
+import silk.num.usize
+
+pub const DEFAULT_WINDOW_SIZE: usize = 8192
+pub const COARSE_WINDOW_SIZE: usize = 2048
+pub const COARSE_HOP: usize = 2048
+pub const LIVE_WINDOW_SIZE: usize = 8192
+pub const LIVE_HOP: usize = 384
+pub const DB_FLOOR: f32 = -140.0
+
+pub struct ColumnData {
+  /// Column-major dB values, `columns * bins` long.
+  pub data: List<f32>,
+  pub columns: usize,
+  pub bins: usize,
+  pub startTime: f64,
+  pub endTime: f64,
+  pub hzPerBin: f64,
+  pub dbFloor: f32,
+}
+
+impl ColumnData {
+  pub fn empty() -> ColumnData {
+    return ColumnData {
+      data: List<f32>.make(),
+      columns: 0,
+      bins: 0,
+      startTime: 0.0,
+      endTime: 0.0,
+      hzPerBin: 1.0,
+      dbFloor: DB_FLOOR,
+    }
+  }
+}
+
+/// Periodic 4-term Blackman-Nuttall window (~-98 dB sidelobes, VoceVista default).
+pub effect fn makeBlackmanNuttallWindow(size: usize) -> List<f32>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut w = List<f32>.make()
+  run w.appendRepeated(0.0, size)
+  let out = w.asMutSlice()
+  let n = usize.toF64(size)
+  let twoPi = 2.0 * f64.PI
+  let mut i: usize = 0
+  while i < size {
+    let a = twoPi * usize.toF64(i) / n
+    let v = 0.3635819 - 0.4891775 * f64.cos(a) + 0.1365995 * f64.cos(2.0 * a)
+      - 0.0106411 * f64.cos(3.0 * a)
+    out[i] = f64.toF32(v)
+    i = i + 1
+  }
+  return move w
+}
+
+/// Periodic Hann window (used for Boersma pitch autocorrelation).
+pub effect fn makeHannWindow(size: usize) -> List<f32>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut w = List<f32>.make()
+  run w.appendRepeated(0.0, size)
+  let out = w.asMutSlice()
+  let n = usize.toF64(size)
+  let twoPi = 2.0 * f64.PI
+  let mut i: usize = 0
+  while i < size {
+    let v = 0.5 - 0.5 * f64.cos(twoPi * usize.toF64(i) / n)
+    out[i] = f64.toF32(v)
+    i = i + 1
+  }
+  return move w
+}
+
+/// Coherent gain (window mean) so a full-scale sinusoid reads 0 dBFS.
+pub fn coherentGain(window: &[f32]) -> f32 {
+  if window.length == 0 {
+    return 1.0
+  }
+  let mut sum: f64 = 0.0
+  let mut i: usize = 0
+  while i < window.length {
+    sum = sum + f32.toF64(window[i])
+    i = i + 1
+  }
+  return f64.toF32(sum / usize.toF64(window.length))
+}
+
+/// Bins needed to cover `maxHz` with one bin of headroom. Pass `maxHz <= 0.0` to keep all.
+pub fn binsForCeiling(maxHz: f64, fftBins: usize, hzPerBin: f64) -> usize {
+  if maxHz <= 0.0 || hzPerBin <= 0.0 {
+    return fftBins
+  }
+  let needed = f64.toUsize(f64.ceil(maxHz / hzPerBin)) + 1
+  if needed < 1 {
+    return 1
+  }
+  if needed > fftBins {
+    return fftBins
+  }
+  return needed
+}
+
+/// Reusable cached window + coherent gain for fast repeated spectrogram column runs.
+pub struct WindowCache {
+  pub size: usize,
+  pub window: List<f32>,
+  pub gain: f32,
+}
+
+impl WindowCache {
+  pub effect fn blackmanNuttall(size: usize) -> WindowCache
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let win = run makeBlackmanNuttallWindow(size)
+    let gain = coherentGain(win.asSlice())
+    return WindowCache { size: size, window: move win, gain: gain }
+  }
+}
+
+/// Computes spectrogram dB columns for `[startTime, endTime]`.
+/// Pass `hopOverride > 0` for a fixed hop, or `0` to space `targetColumns` across the range.
+pub effect fn computeColumns(
+  samples: &[f32],
+  sampleRate: f64,
+  startTime: f64,
+  endTime: f64,
+  targetColumns: usize,
+  win: &WindowCache,
+  maxHz: f64,
+  hopOverride: usize,
+) -> ColumnData
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let fftBins = win.size / 2
+  let hzPerBin = sampleRate / usize.toF64(win.size)
+  let bins = binsForCeiling(maxHz, fftBins, hzPerBin)
+
+  let spanSeconds = f64.max(endTime - startTime, 1.0 / sampleRate)
+  let hop = if hopOverride > 0 {
+    hopOverride
+  } else {
+    let tc = if targetColumns < 1 { 1 } else { targetColumns }
+    let raw = f64.floor((spanSeconds * sampleRate) / usize.toF64(tc))
+    if raw < 1.0 { 1 } else { f64.toUsize(raw) }
+  }
+
+  let firstCentre = f64.toI32(f64.floor(startTime * sampleRate))
+  let lastCentre = f64.toI32(f64.ceil(endTime * sampleRate))
+  let hopI = usize.toI32(hop)
+  let diff = lastCentre - firstCentre
+  let columns: usize = if diff <= 0 {
+    1
+  } else {
+    i32.toUsize(diff / hopI) + 1
+  }
+
+  let mut data = List<f32>.make()
+  run data.appendRepeated(DB_FLOOR, columns * bins)
+  audio_native.computeColumnsDbNative(
+    samples,
+    firstCentre,
+    hopI,
+    usize.toI32(columns),
+    win.window.asSlice(),
+    win.gain,
+    DB_FLOOR,
+    usize.toI32(bins),
+    data.asMutSlice(),
+  )
+
+  return ColumnData {
+    data: move data,
+    columns: columns,
+    bins: bins,
+    startTime: i32.toF64(firstCentre) / sampleRate,
+    endTime: i32.toF64(firstCentre + usize.toI32(columns - 1) * hopI) / sampleRate,
+    hzPerBin: hzPerBin,
+    dbFloor: DB_FLOOR,
+  }
+}
+
+/// Computes a single instantaneous dB power spectrum slice centered at `timeSec`.
+pub effect fn computeSpectrumSlice(
+  samples: &[f32],
+  sampleRate: f64,
+  timeSec: f64,
+  win: &WindowCache,
+  maxHz: f64,
+) -> ColumnData
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let fftBins = win.size / 2
+  let hzPerBin = sampleRate / usize.toF64(win.size)
+  let bins = binsForCeiling(maxHz, fftBins, hzPerBin)
+  let centre = f64.toI32(f64.round(timeSec * sampleRate))
+
+  let mut data = List<f32>.make()
+  run data.appendRepeated(DB_FLOOR, bins)
+  if samples.length > 0 {
+    audio_native.computeColumnsDbNative(
+      samples,
+      centre,
+      1,
+      1,
+      win.window.asSlice(),
+      win.gain,
+      DB_FLOOR,
+      usize.toI32(bins),
+      data.asMutSlice(),
+    )
+  }
+
+  return ColumnData {
+    data: move data,
+    columns: 1,
+    bins: bins,
+    startTime: timeSec,
+    endTime: timeSec,
+    hzPerBin: hzPerBin,
+    dbFloor: DB_FLOOR,
+  }
+}
+
+/// Result of an incremental tier update over append-only audio.
+pub struct TierUpdate {
+  pub startColumn: usize,
+  pub data: ColumnData,
+}
+
+/// Incremental append + tail finalization tracker (exact port of `voiceapp/coarse-tracker.ts`).
+pub struct TierTracker {
+  pub hop: usize,
+  pub maxHz: f64,
+  pub finalized: usize,
+}
+
+impl Copy for TierTracker {}
+
+impl TierTracker {
+  pub fn make(hop: usize, maxHz: f64) -> TierTracker {
+    return TierTracker { hop: hop, maxHz: maxHz, finalized: 0 }
+  }
+
+  pub fn reset(self: &mut Self) -> () {
+    self.finalized = 0
+  }
+
+  pub effect fn update(
+    self: &mut Self,
+    samples: &[f32],
+    sampleRate: f64,
+    win: &WindowCache,
+  ) -> Option<TierUpdate>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let len = samples.length
+    if len == 0 {
+      return Option<TierUpdate>.None
+    }
+    let half = win.size / 2
+    let lastComputable = len / self.hop
+    if lastComputable < self.finalized {
+      return Option<TierUpdate>.None
+    }
+    let startColumn = self.finalized
+    let startTime = usize.toF64(startColumn * self.hop) / sampleRate
+    let endTime = usize.toF64(len) / sampleRate
+    let data = run computeColumns(samples, sampleRate, startTime, endTime, 0, win, self.maxHz, self.hop)
+    self.finalized = if len >= half { (len - half) / self.hop + 1 } else { 0 }
+    return Option<TierUpdate>.some(TierUpdate { startColumn: startColumn, data: move data })
+  }
+}

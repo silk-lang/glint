@@ -1,0 +1,11 @@
+// Glint web app on Cloudflare: a Worker with no code, only the static files
+// scripts/build-web.sh writes into dist/web.
+{
+  "name": "glint",
+  "compatibility_date": "2026-11-01",
+  "assets": {
+    "directory": "./dist/web",
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "single-page-application"
+  }
+}

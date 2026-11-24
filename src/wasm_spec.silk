@@ -1,0 +1,398 @@
+//! WASM WebGL2 spectrogram bridge — mirrors `GpuSpectrogram` tier logic on wasm32.
+import audio_native
+import colormap {
+  DEFAULT_DISPLAY_CEILING_DB,
+  DEFAULT_DISPLAY_FLOOR_DB,
+  Palette,
+  buildLut
+}
+import dsp { ColumnData }
+import viewport { MIN_LOG_FREQ_HZ, Viewport }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import silk.num.usize
+
+pub const LIVE_TEXTURE_COLUMNS: usize = 8192
+
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  unsafe extern "C" fn js_spec_set_lut(rgba: ?[*]const u8, len: usize) -> () as "glint#spec_set_lut"
+  unsafe extern "C" fn js_spec_alloc_tier(tier: u32, w: u32, h: u32) -> () as "glint#spec_alloc_tier"
+  unsafe extern "C" fn js_spec_write_tier(
+    tier: u32,
+    x: u32,
+    w: u32,
+    h: u32,
+    rgba: ?[*]const u8,
+    len: usize,
+  ) -> () as "glint#spec_write_tier"
+  unsafe extern "C" fn js_spec_clear_tier(tier: u32) -> () as "glint#spec_clear_tier"
+  unsafe extern "C" fn js_spec_draw(uniforms: ?[*]const f32, count: usize) -> () as "glint#spec_draw"
+}
+
+const TIER_COARSE: u32 = 0
+const TIER_LIVE: u32 = 1
+const TIER_SHARP: u32 = 2
+
+struct TierMeta {
+  t0: f64,
+  t1: f64,
+  maxHz: f64,
+  valid: bool,
+  uScale: f32,
+  uOffset: f32,
+  width: usize,
+  height: usize,
+}
+
+fn emptyTierMeta() -> TierMeta {
+  return TierMeta { t0: 0.0, t1: 0.0, maxHz: 1.0, valid: false, uScale: 0.0, uOffset: 0.5, width: 1, height: 1 }
+}
+
+fn uScaleOf(written: usize, width: usize) -> f32 {
+  if written <= 1 || width == 0 {
+    return 0.0
+  }
+  return usize.toF32(written - 1) / usize.toF32(width)
+}
+
+fn uOffsetOf(width: usize) -> f32 {
+  if width == 0 {
+    return 0.5
+  }
+  return 0.5 / usize.toF32(width)
+}
+
+pub struct WasmSpectrogram {
+  coarse: TierMeta,
+  live: TierMeta,
+  sharp: TierMeta,
+  coarseStepSec: f64,
+  coarseHzPerBin: f64,
+  sharpStepSec: f64,
+  recordingWidth: usize,
+  recordingWritten: usize,
+  liveWidth: usize,
+  liveWritten: usize,
+  liveFirstColumn: usize,
+  liveHop: usize,
+  liveSampleRate: f64,
+  pub brightness: f32,
+  pub contrast: f32,
+  pub displayFloorDb: f32,
+  pub displayCeilingDb: f32,
+  pub palette: Palette,
+  uploadScratch: List<u8>,
+}
+
+impl WasmSpectrogram {
+  pub effect fn open() -> WasmSpectrogram
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut s = WasmSpectrogram {
+      coarse: emptyTierMeta(),
+      live: emptyTierMeta(),
+      sharp: emptyTierMeta(),
+      coarseStepSec: 0.0,
+      coarseHzPerBin: 0.0,
+      sharpStepSec: 0.0,
+      recordingWidth: 0,
+      recordingWritten: 0,
+      liveWidth: 0,
+      liveWritten: 0,
+      liveFirstColumn: 0,
+      liveHop: 0,
+      liveSampleRate: 0.0,
+      brightness: 0.0,
+      contrast: 1.0,
+      displayFloorDb: DEFAULT_DISPLAY_FLOOR_DB,
+      displayCeilingDb: DEFAULT_DISPLAY_CEILING_DB,
+      palette: Palette.Muted,
+      uploadScratch: List<u8>.make(),
+    }
+    run s.setPalette(Palette.Muted)
+    return move s
+  }
+
+  pub effect fn setPalette(self: &mut Self, palette: Palette) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.palette = palette
+    let lut = run buildLut(palette)
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      unsafe js_spec_set_lut(Pointer.fromSlice(lut.asSlice()), lut.length())
+    }
+  }
+
+  pub fn clearLiveTier(self: &mut Self) -> () {
+    self.live = emptyTierMeta()
+    self.liveWidth = 0
+    self.liveWritten = 0
+    self.liveFirstColumn = 0
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      unsafe js_spec_clear_tier(TIER_LIVE)
+    }
+  }
+
+  pub fn clearSharpTier(self: &mut Self) -> () {
+    self.sharp = emptyTierMeta()
+    self.sharpStepSec = 0.0
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      unsafe js_spec_clear_tier(TIER_SHARP)
+    }
+  }
+
+  pub fn beginRecordingSession(self: &mut Self, sampleRate: f64, maxDurationSec: f64, hop: usize, windowSize: usize) -> () {
+    let bins = windowSize / 2
+    let cols = f64.toUsize(f64.ceil((maxDurationSec * sampleRate) / usize.toF64(hop))) + 4
+    let w = if cols > 4096 { 4096 } else if cols < 64 { 64 } else { cols }
+    self.recordingWidth = w
+    self.recordingWritten = 0
+    self.coarseStepSec = usize.toF64(hop) / sampleRate
+    self.coarseHzPerBin = sampleRate / usize.toF64(windowSize)
+    self.coarse = TierMeta {
+      t0: 0.0,
+      t1: 0.0,
+      maxHz: usize.toF64(bins) * self.coarseHzPerBin,
+      valid: false,
+      uScale: 0.0,
+      uOffset: uOffsetOf(w),
+      width: w,
+      height: bins,
+    }
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      unsafe js_spec_alloc_tier(TIER_COARSE, usize.toU32(w), usize.toU32(bins))
+    }
+  }
+
+  pub fn beginLiveTier(self: &mut Self, sampleRate: f64, hop: usize, bins: usize, hzPerBin: f64) -> () {
+    let w: usize = 2048
+    self.liveWidth = w
+    self.liveWritten = 0
+    self.liveFirstColumn = 0
+    self.liveHop = hop
+    self.liveSampleRate = sampleRate
+    self.live = TierMeta {
+      t0: 0.0,
+      t1: 0.0,
+      maxHz: usize.toF64(bins) * hzPerBin,
+      valid: false,
+      uScale: 0.0,
+      uOffset: uOffsetOf(w),
+      width: w,
+      height: bins,
+    }
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      unsafe js_spec_alloc_tier(TIER_LIVE, usize.toU32(w), usize.toU32(bins))
+    }
+  }
+
+  effect fn ensureScratch(self: &mut Self, cols: usize, bins: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let needed = cols * bins * 4
+    if self.uploadScratch.length() < needed {
+      self.uploadScratch.clear()
+      run self.uploadScratch.appendRepeated(0, needed)
+    }
+  }
+
+  pub effect fn appendCoarseColumns(self: &mut Self, startCol: usize, col: &ColumnData) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if col.columns == 0 || col.bins == 0 || self.recordingWidth == 0 {
+      return ()
+    }
+    if startCol >= self.recordingWidth {
+      return ()
+    }
+    let avail = self.recordingWidth - startCol
+    let count = if col.columns < avail { col.columns } else { avail }
+    run self.ensureScratch(count, col.bins)
+    audio_native.columnsToRgbaNative(col.data.asSlice(), 0, count, col.bins, self.displayFloorDb, self.displayCeilingDb, self.uploadScratch.asMutSlice())
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      unsafe js_spec_write_tier(
+        TIER_COARSE,
+        usize.toU32(startCol),
+        usize.toU32(count),
+        usize.toU32(col.bins),
+        Pointer.fromSlice(self.uploadScratch.asSlice()),
+        count * col.bins * 4,
+      )
+    }
+    let endCol = startCol + count
+    if endCol > self.recordingWritten {
+      self.recordingWritten = endCol
+    }
+    self.coarse.t0 = 0.0
+    self.coarse.t1 = usize.toF64(if self.recordingWritten > 0 { self.recordingWritten - 1 } else { 0 }) * self.coarseStepSec
+    self.coarse.valid = self.recordingWritten > 0
+    self.coarse.uScale = uScaleOf(self.recordingWritten, self.recordingWidth)
+    self.coarse.uOffset = uOffsetOf(self.recordingWidth)
+  }
+
+  pub effect fn appendLiveColumns(self: &mut Self, startCol: usize, col: &ColumnData) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if col.columns == 0 || col.bins == 0 || self.liveWidth == 0 {
+      return ()
+    }
+    let mut localStart: usize = 0
+    if startCol >= self.liveFirstColumn {
+      localStart = startCol - self.liveFirstColumn
+    }
+    if localStart >= self.liveWidth {
+      return ()
+    }
+    let avail = self.liveWidth - localStart
+    let count = if col.columns < avail { col.columns } else { avail }
+    run self.ensureScratch(count, col.bins)
+    audio_native.columnsToRgbaNative(col.data.asSlice(), 0, count, col.bins, self.displayFloorDb, self.displayCeilingDb, self.uploadScratch.asMutSlice())
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      unsafe js_spec_write_tier(
+        TIER_LIVE,
+        usize.toU32(localStart),
+        usize.toU32(count),
+        usize.toU32(col.bins),
+        Pointer.fromSlice(self.uploadScratch.asSlice()),
+        count * col.bins * 4,
+      )
+    }
+    let endCol = localStart + count
+    if endCol > self.liveWritten {
+      self.liveWritten = endCol
+    }
+    let step = usize.toF64(self.liveHop) / f64.max(1.0, self.liveSampleRate)
+    self.live.t0 = usize.toF64(self.liveFirstColumn) * step
+    self.live.t1 = usize.toF64(self.liveFirstColumn + (if self.liveWritten > 0 { self.liveWritten - 1 } else { 0 })) * step
+    self.live.valid = self.liveWritten > 0
+    self.live.uScale = uScaleOf(self.liveWritten, self.liveWidth)
+    self.live.uOffset = uOffsetOf(self.liveWidth)
+  }
+
+  pub effect fn setCoarseTier(self: &mut Self, col: &ColumnData) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if col.columns == 0 || col.bins == 0 {
+      return ()
+    }
+    let w = if col.columns > 4096 { 4096 } else { col.columns }
+    run self.ensureScratch(w, col.bins)
+    audio_native.columnsToRgbaNative(col.data.asSlice(), 0, w, col.bins, self.displayFloorDb, self.displayCeilingDb, self.uploadScratch.asMutSlice())
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      unsafe js_spec_alloc_tier(TIER_COARSE, usize.toU32(w), usize.toU32(col.bins))
+      unsafe js_spec_write_tier(
+        TIER_COARSE,
+        0,
+        usize.toU32(w),
+        usize.toU32(col.bins),
+        Pointer.fromSlice(self.uploadScratch.asSlice()),
+        w * col.bins * 4,
+      )
+    }
+    self.coarseStepSec = if w > 1 { (col.endTime - col.startTime) / usize.toF64(w - 1) } else { 0.01 }
+    self.coarseHzPerBin = col.hzPerBin
+    self.coarse = TierMeta {
+      t0: col.startTime,
+      t1: col.endTime,
+      maxHz: usize.toF64(col.bins) * col.hzPerBin,
+      valid: true,
+      uScale: uScaleOf(w, w),
+      uOffset: uOffsetOf(w),
+      width: w,
+      height: col.bins,
+    }
+  }
+
+  pub effect fn setSharpTier(self: &mut Self, col: &ColumnData) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if col.columns == 0 || col.bins == 0 {
+      return ()
+    }
+    let w = if col.columns > 4096 { 4096 } else { col.columns }
+    run self.ensureScratch(w, col.bins)
+    audio_native.columnsToRgbaNative(col.data.asSlice(), 0, w, col.bins, self.displayFloorDb, self.displayCeilingDb, self.uploadScratch.asMutSlice())
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      unsafe js_spec_alloc_tier(TIER_SHARP, usize.toU32(w), usize.toU32(col.bins))
+      unsafe js_spec_write_tier(
+        TIER_SHARP,
+        0,
+        usize.toU32(w),
+        usize.toU32(col.bins),
+        Pointer.fromSlice(self.uploadScratch.asSlice()),
+        w * col.bins * 4,
+      )
+    }
+    self.sharpStepSec = if w > 1 { (col.endTime - col.startTime) / usize.toF64(w - 1) } else { 0.005 }
+    self.sharp = TierMeta {
+      t0: col.startTime,
+      t1: col.endTime,
+      maxHz: usize.toF64(col.bins) * col.hzPerBin,
+      valid: true,
+      uScale: uScaleOf(w, w),
+      uOffset: uOffsetOf(w),
+      width: w,
+      height: col.bins,
+    }
+  }
+
+  pub fn coarseCovers(self: &Self, vp: &Viewport, desiredStepSec: f64, desiredHzPerBin: f64) -> bool {
+    if !self.coarse.valid {
+      return false
+    }
+    return self.coarse.t0 <= vp.t0 + 0.001
+      && self.coarse.t1 >= vp.t1 - 0.001
+      && self.coarse.maxHz >= vp.f1 * 0.99
+      && self.coarseStepSec <= desiredStepSec * 1.35
+      && self.coarseHzPerBin <= desiredHzPerBin * 1.15
+  }
+
+  pub fn sharpCovers(self: &Self, vp: &Viewport, desiredStepSec: f64) -> bool {
+    if !self.sharp.valid {
+      return false
+    }
+    return self.sharp.t0 <= vp.t0 + 0.001
+      && self.sharp.t1 >= vp.t1 - 0.001
+      && self.sharp.maxHz >= vp.f1 * 0.99
+      && self.sharpStepSec <= desiredStepSec * 1.35
+  }
+
+  pub fn draw(self: &Self, vp: &Viewport) -> () {
+    let uniforms: [f32; 25] = [
+      f64.toF32(vp.t0),
+      f64.toF32(vp.t1),
+      f64.toF32(vp.f0),
+      f64.toF32(vp.f1),
+      f64.toF32(self.coarse.t0),
+      f64.toF32(self.coarse.t1),
+      f64.toF32(self.live.t0),
+      f64.toF32(self.live.t1),
+      f64.toF32(self.sharp.t0),
+      f64.toF32(self.sharp.t1),
+      f64.toF32(self.coarse.maxHz),
+      f64.toF32(self.live.maxHz),
+      f64.toF32(self.sharp.maxHz),
+      if vp.isLog() { 1.0 } else { 0.0 },
+      if self.live.valid { 1.0 } else { 0.0 },
+      if self.sharp.valid { 1.0 } else { 0.0 },
+      self.brightness,
+      self.contrast,
+      f64.toF32(MIN_LOG_FREQ_HZ),
+      self.coarse.uScale,
+      self.coarse.uOffset,
+      self.live.uScale,
+      self.live.uOffset,
+      self.sharp.uScale,
+      self.sharp.uOffset,
+    ]
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      unsafe js_spec_draw(Pointer.fromSlice(&uniforms), 25)
+    } else {
+      drop uniforms
+    }
+  }
+}

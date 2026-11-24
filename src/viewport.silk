@@ -1,0 +1,243 @@
+//! Visible time/frequency window, ported directly from `voiceapp/packages/components/src/viewport.ts`.
+//!
+//! `normToFreq` MUST stay in lockstep with `SPECTROGRAM_WGSL` in `gpu_spectrogram.silk`, so the
+//! frequency rulers, piano keyboard, pitch contour, formant tracks, and spectrum slice align
+//! pixel-for-pixel with the WebGPU spectrogram image.
+import silk.core.ownership { Copy }
+import silk.num.f64
+
+/// Frequencies at or below this are meaningless on a log axis (log(0) is -Inf).
+pub const MIN_LOG_FREQ_HZ: f64 = 10.0
+
+pub const DEFAULT_MIN_TIME_SPAN: f64 = 0.005
+pub const DEFAULT_MIN_FREQ_SPAN: f64 = 20.0
+pub const DEFAULT_VIEW_F0: f64 = 55.0
+pub const DEFAULT_VIEW_F1: f64 = 6000.0
+pub const RECORD_VIEW_S: f64 = 10.0
+
+pub enum FreqScale {
+  Linear,
+  Log,
+}
+
+pub struct Viewport {
+  pub t0: f64,
+  pub t1: f64,
+  pub f0: f64,
+  pub f1: f64,
+  pub scale: FreqScale,
+  pub duration: f64,
+  pub maxFreq: f64,
+}
+
+impl Copy for Viewport {}
+
+/// Maps a frequency (Hz) to normalized vertical position (0 = bottom f0, 1 = top f1).
+pub fn freqToNorm(freq: f64, f0: f64, f1: f64, scale: FreqScale) -> f64 {
+  return match scale {
+    FreqScale.Log => {
+      let lo = f64.log(f64.max(f0, MIN_LOG_FREQ_HZ))
+      let hi = f64.log(f64.max(f1, MIN_LOG_FREQ_HZ * 2.0))
+      let safeFreq = f64.max(freq, 1.0e-12)
+      let num = f64.log(safeFreq) - lo
+      num / (hi - lo)
+    }
+    FreqScale.Linear => (freq - f0) / (f1 - f0)
+  }
+}
+
+/// Inverse of `freqToNorm`. Exact match with `normToFreq` in `SPECTROGRAM_WGSL`.
+pub fn normToFreq(norm: f64, f0: f64, f1: f64, scale: FreqScale) -> f64 {
+  return match scale {
+    FreqScale.Log => {
+      let lo = f64.log(f64.max(f0, MIN_LOG_FREQ_HZ))
+      let hi = f64.log(f64.max(f1, MIN_LOG_FREQ_HZ * 2.0))
+      f64.exp(lo + norm * (hi - lo))
+    }
+    FreqScale.Linear => f0 + norm * (f1 - f0)
+  }
+}
+
+pub fn timeToNorm(time: f64, t0: f64, t1: f64) -> f64 {
+  let span = t1 - t0
+  if span <= 0.0 {
+    return 0.0
+  }
+  return (time - t0) / span
+}
+
+pub fn normToTime(norm: f64, t0: f64, t1: f64) -> f64 {
+  return t0 + norm * (t1 - t0)
+}
+
+impl Viewport {
+  pub fn make(duration: f64, maxFreq: f64) -> Viewport {
+    let dur = f64.max(duration, RECORD_VIEW_S)
+    let mf = f64.max(maxFreq, 1000.0)
+    let mut vp = Viewport {
+      t0: 0.0,
+      t1: dur,
+      f0: DEFAULT_VIEW_F0,
+      f1: f64.min(DEFAULT_VIEW_F1, mf),
+      scale: FreqScale.Log,
+      duration: dur,
+      maxFreq: mf,
+    }
+    vp.clampAll()
+    return vp
+  }
+
+  pub fn isLog(self: &Self) -> bool {
+    return match self.scale {
+      FreqScale.Log => true
+      FreqScale.Linear => false
+    }
+  }
+
+  pub fn freqToNormAt(self: &Self, freq: f64) -> f64 {
+    return freqToNorm(freq, self.f0, self.f1, self.scale)
+  }
+
+  pub fn normToFreqAt(self: &Self, norm: f64) -> f64 {
+    return normToFreq(norm, self.f0, self.f1, self.scale)
+  }
+
+  pub fn timeToNormAt(self: &Self, time: f64) -> f64 {
+    return timeToNorm(time, self.t0, self.t1)
+  }
+
+  pub fn normToTimeAt(self: &Self, norm: f64) -> f64 {
+    return normToTime(norm, self.t0, self.t1)
+  }
+
+  pub fn setLimits(self: &mut Self, duration: f64, maxFreq: f64) -> () {
+    self.duration = f64.max(duration, 0.05)
+    self.maxFreq = f64.max(maxFreq, 200.0)
+    self.clampAll()
+  }
+
+  pub fn setTimeRange(self: &mut Self, t0: f64, t1: f64) -> () {
+    let maxSpan = self.duration
+    let mut span = f64.min(f64.max(t1 - t0, DEFAULT_MIN_TIME_SPAN), maxSpan)
+    span = f64.min(span, maxSpan)
+    let mut lo = t0
+    if lo + span > self.duration {
+      lo = self.duration - span
+    }
+    if lo < 0.0 {
+      lo = 0.0
+    }
+    self.t0 = lo
+    self.t1 = lo + span
+  }
+
+  pub fn setFreqRange(self: &mut Self, f0: f64, f1: f64) -> () {
+    let floor = if self.isLog() { MIN_LOG_FREQ_HZ } else { 0.0 }
+    let ceil = self.maxFreq
+    let mut lo: f64 = floor
+    let mut hi: f64 = ceil
+    if self.isLog() {
+      let logFloor = f64.log(MIN_LOG_FREQ_HZ)
+      let logCeil = f64.log(f64.max(ceil, MIN_LOG_FREQ_HZ * 2.0))
+      let lf0 = f64.log(f64.max(f0, 1.0e-12))
+      let lf1 = f64.log(f64.max(f1, 1.0e-12))
+      let span = f64.min(f64.max(lf1 - lf0, 0.0), logCeil - logFloor)
+      let mut l = lf0
+      if l + span > logCeil {
+        l = logCeil - span
+      }
+      if l < logFloor {
+        l = logFloor
+      }
+      lo = f64.exp(l)
+      hi = f64.exp(l + span)
+    } else {
+      let span = f64.min(f64.max(f1 - f0, 0.0), ceil - floor)
+      let mut l = f0
+      if l + span > ceil {
+        l = ceil - span
+      }
+      if l < floor {
+        l = floor
+      }
+      lo = l
+      hi = l + span
+    }
+    if hi - lo < DEFAULT_MIN_FREQ_SPAN {
+      let mid = (lo + hi) * 0.5
+      lo = f64.max(floor, mid - DEFAULT_MIN_FREQ_SPAN * 0.5)
+      hi = f64.min(ceil, lo + DEFAULT_MIN_FREQ_SPAN)
+      lo = f64.max(floor, hi - DEFAULT_MIN_FREQ_SPAN)
+    }
+    self.f0 = lo
+    self.f1 = hi
+  }
+
+  pub fn clampAll(self: &mut Self) -> () {
+    let t0 = self.t0
+    let t1 = self.t1
+    let f0 = self.f0
+    let f1 = self.f1
+    self.setTimeRange(t0, t1)
+    self.setFreqRange(f0, f1)
+  }
+
+  pub fn toggleScale(self: &mut Self) -> () {
+    self.scale = if self.isLog() { FreqScale.Linear } else { FreqScale.Log }
+    let f0 = self.f0
+    let f1 = self.f1
+    self.setFreqRange(f0, f1)
+  }
+
+  pub fn zoomTimeAbout(self: &mut Self, anchorNorm: f64, factor: f64) -> () {
+    let pivot = normToTime(anchorNorm, self.t0, self.t1)
+    let span = (self.t1 - self.t0) * factor
+    let lo = pivot - anchorNorm * span
+    self.setTimeRange(lo, lo + span)
+  }
+
+  pub fn zoomFreqAbout(self: &mut Self, anchorNorm: f64, factor: f64) -> () {
+    let pivot = normToFreq(anchorNorm, self.f0, self.f1, self.scale)
+    if self.isLog() {
+      let lo = f64.log(f64.max(self.f0, MIN_LOG_FREQ_HZ))
+      let hi = f64.log(f64.max(self.f1, MIN_LOG_FREQ_HZ * 2.0))
+      let span = (hi - lo) * factor
+      let newLo = f64.log(f64.max(pivot, 1.0e-12)) - anchorNorm * span
+      self.setFreqRange(f64.exp(newLo), f64.exp(newLo + span))
+    } else {
+      let span = (self.f1 - self.f0) * factor
+      let lo = pivot - anchorNorm * span
+      self.setFreqRange(lo, lo + span)
+    }
+  }
+
+  pub fn panTime(self: &mut Self, fractionOfSpan: f64) -> () {
+    let t0 = self.t0
+    let t1 = self.t1
+    let delta = (t1 - t0) * fractionOfSpan
+    self.setTimeRange(t0 + delta, t1 + delta)
+  }
+
+  pub fn panFreq(self: &mut Self, fractionOfSpan: f64) -> () {
+    let f0 = self.f0
+    let f1 = self.f1
+    if self.isLog() {
+      let lo = f64.log(f64.max(f0, MIN_LOG_FREQ_HZ))
+      let hi = f64.log(f64.max(f1, MIN_LOG_FREQ_HZ * 2.0))
+      let delta = (hi - lo) * fractionOfSpan
+      self.setFreqRange(f64.exp(lo + delta), f64.exp(hi + delta))
+    } else {
+      let delta = (f1 - f0) * fractionOfSpan
+      self.setFreqRange(f0 + delta, f1 + delta)
+    }
+  }
+
+  pub fn reset(self: &mut Self, duration: f64, maxFreq: f64) -> () {
+    let dur = f64.max(duration, 0.05)
+    let mf = f64.max(maxFreq, 200.0)
+    self.duration = dur
+    self.maxFreq = mf
+    self.setTimeRange(0.0, dur)
+    self.setFreqRange(DEFAULT_VIEW_F0, f64.min(DEFAULT_VIEW_F1, mf))
+  }
+}

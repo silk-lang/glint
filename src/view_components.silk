@@ -1,0 +1,444 @@
+//! Reusable Tailwind-styled Loom UI primitives for Glint.
+import studio { DRAG_SLIDER, Message, Overtone }
+import loom.css
+import loom.css { percent, px }
+import loom.document { Attr }
+import loom.lib { Cursor, Document, Node, Reply }
+import silk.color.rgba { Rgba }
+import silk.num.f32
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String }
+
+/// Styled text box helper (Loom's `h.text` takes a single string, so classes go on its box).
+pub fn txt(h: &Document<Message>, value: string, cls: string) -> Node {
+  return h.box(&[h.class(cls)], &[h.text(value)])
+}
+
+/// Styled text box helper with arbitrary attributes.
+pub fn txtA(h: &Document<Message>, value: string, attrs: &[Attr]) -> Node {
+  return h.box(attrs, &[h.text(value)])
+}
+
+/// Crisp Glint toggle switch (24x14 compact or 28x16 settings).
+pub fn toggleSwitch(h: &Document<Message>, on: bool, large: bool, msg: Message) -> Node {
+  let trackCls = if large {
+    if on {
+      "w-[28px] h-[16px] rounded-[8px] bg-[#0E0E10] flex items-center justify-end p-[2px] shrink-0"
+    } else {
+      "w-[28px] h-[16px] rounded-[8px] bg-[#DCDCDF] flex items-center justify-start p-[2px] shrink-0"
+    }
+  } else {
+    if on {
+      "w-[24px] h-[14px] rounded-[7px] bg-[#0B0B0C] flex items-center justify-end p-[2px] shrink-0"
+    } else {
+      "w-[24px] h-[14px] rounded-[7px] bg-[#E6E6E8] flex items-center justify-start p-[2px] shrink-0"
+    }
+  }
+  let knobCls = if large {
+    "w-[12px] h-[12px] rounded-[6px] bg-white"
+  } else {
+    "w-[10px] h-[10px] rounded-[5px] bg-white"
+  }
+  return h.box(
+    &[
+      h.class(trackCls),
+      h.cursor(Cursor.Pointer),
+      h.onClick(move msg),
+    ],
+    &[h.box(&[h.class(knobCls)], &[])],
+  )
+}
+
+/// Multi-stop colormap preview bar rendered with crisp zero-gap flex stops (identical on native & web).
+pub fn paletteSwatch(h: &Document<Message>, idx: u32, widthPx: f32, heightPx: f32) -> Node {
+  let c0: Rgba<f32> = match idx {
+    0 => Rgba<f32> { r: 0.118, g: 0.165, b: 0.333, a: 1.0 }
+    1 => Rgba<f32> { r: 0.0, g: 0.0, b: 0.784, a: 1.0 }
+    2 => Rgba<f32> { r: 0.02, g: 0.01, b: 0.08, a: 1.0 }
+    3 => Rgba<f32> { r: 0.02, g: 0.01, b: 0.10, a: 1.0 }
+    4 => Rgba<f32> { r: 0.267, g: 0.004, b: 0.329, a: 1.0 }
+    5 => Rgba<f32> { r: 0.016, g: 0.071, b: 0.122, a: 1.0 }
+    6 => Rgba<f32> { r: 0.04, g: 0.04, b: 0.05, a: 1.0 }
+    _ => Rgba<f32> { r: 0.96, g: 0.96, b: 0.97, a: 1.0 }
+  }
+  let c1: Rgba<f32> = match idx {
+    0 => Rgba<f32> { r: 0.361, g: 0.624, b: 0.690, a: 1.0 }
+    1 => Rgba<f32> { r: 0.0, g: 0.784, b: 0.941, a: 1.0 }
+    2 => Rgba<f32> { r: 0.471, g: 0.110, b: 0.427, a: 1.0 }
+    3 => Rgba<f32> { r: 0.549, g: 0.161, b: 0.506, a: 1.0 }
+    4 => Rgba<f32> { r: 0.129, g: 0.569, b: 0.549, a: 1.0 }
+    5 => Rgba<f32> { r: 0.118, g: 0.478, b: 0.600, a: 1.0 }
+    6 => Rgba<f32> { r: 0.38, g: 0.38, b: 0.40, a: 1.0 }
+    _ => Rgba<f32> { r: 0.65, g: 0.65, b: 0.68, a: 1.0 }
+  }
+  let c2: Rgba<f32> = match idx {
+    0 => Rgba<f32> { r: 0.847, g: 0.812, b: 0.541, a: 1.0 }
+    1 => Rgba<f32> { r: 1.0, g: 1.0, b: 0.404, a: 1.0 }
+    2 => Rgba<f32> { r: 0.867, g: 0.318, b: 0.227, a: 1.0 }
+    3 => Rgba<f32> { r: 0.871, g: 0.286, b: 0.408, a: 1.0 }
+    4 => Rgba<f32> { r: 0.369, g: 0.788, b: 0.384, a: 1.0 }
+    5 => Rgba<f32> { r: 0.424, g: 0.769, b: 0.812, a: 1.0 }
+    6 => Rgba<f32> { r: 0.70, g: 0.70, b: 0.72, a: 1.0 }
+    _ => Rgba<f32> { r: 0.32, g: 0.32, b: 0.35, a: 1.0 }
+  }
+  let c3: Rgba<f32> = match idx {
+    0 => Rgba<f32> { r: 0.608, g: 0.227, b: 0.290, a: 1.0 }
+    1 => Rgba<f32> { r: 0.733, g: 0.310, b: 0.435, a: 1.0 }
+    2 => Rgba<f32> { r: 0.988, g: 1.0, b: 0.643, a: 1.0 }
+    3 => Rgba<f32> { r: 0.988, g: 0.992, b: 0.749, a: 1.0 }
+    4 => Rgba<f32> { r: 0.992, g: 0.906, b: 0.145, a: 1.0 }
+    5 => Rgba<f32> { r: 0.878, g: 0.969, b: 0.961, a: 1.0 }
+    6 => Rgba<f32> { r: 0.98, g: 0.98, b: 0.98, a: 1.0 }
+    _ => Rgba<f32> { r: 0.05, g: 0.05, b: 0.06, a: 1.0 }
+  }
+  return h.row(
+    &[
+      h.class("rounded-[2px] overflow-hidden border border-black/10 shrink-0"),
+      h.style(&[css.width(px(widthPx)), css.height(px(heightPx))]),
+    ],
+    &[
+      h.box(&[h.class("flex-1 h-full"), h.style(&[css.backgroundColor(c0)])], &[]),
+      h.box(&[h.class("flex-1 h-full"), h.style(&[css.backgroundColor(c1)])], &[]),
+      h.box(&[h.class("flex-1 h-full"), h.style(&[css.backgroundColor(c2)])], &[]),
+      h.box(&[h.class("flex-1 h-full"), h.style(&[css.backgroundColor(c3)])], &[]),
+    ],
+  )
+}
+
+/// Compact Glint slider used in the Display strip (fill-bar style, draggable).
+pub fn compactSlider(
+  m: &Overtone,
+  h: &Document<Message>,
+  id: u32,
+  label: string,
+  widthPx: f32,
+  normVal: f32,
+) -> Node {
+  let clamped = f32.max(0.0, f32.min(1.0, normVal))
+  let pct = clamped * 100.0
+  let sLeft = m.sliderLeft[u32.toUsize(id)]
+  let sWidth = m.sliderWidth[u32.toUsize(id)]
+  return h.row(
+    &[h.class("items-center gap-[6px] shrink-0")],
+    &[
+      txt(h, label, "text-[11px] leading-[14px] text-[#6B6B70]"),
+      h.box(
+        &[
+          h.class("h-[16px] flex items-center shrink-0"),
+          h.style(&[css.width(px(widthPx))]),
+          h.cursor(Cursor.ResizeHorizontal),
+          if m.drag == DRAG_SLIDER && m.dragSlider == id { h.capturePointer() } else { h.none() },
+          h.onLayout(|r| Message.SliderLayout { id: id, rect: r }),
+          h.onPointerDown(|e| Reply<Message>.EmitAndStop { message: Message.SliderDown { id: id, x: e.x, left: sLeft, width: sWidth } }),
+          h.onPointerMove(|e| Reply<Message>.EmitAndStop { message: Message.SliderMove { x: e.x } }),
+          h.onPointerUp(|_| Reply<Message>.EmitAndStop { message: Message.SliderUp }),
+        ],
+        &[
+          h.box(
+            &[h.class("w-full h-[3px] rounded-[2px] bg-[#E6E6E8] flex overflow-hidden")],
+            &[
+              h.box(
+                &[
+                  h.class("h-full bg-[#0B0B0C] rounded-[2px]"),
+                  h.style(&[css.width(percent(pct))]),
+                ],
+                &[],
+              ),
+            ],
+          ),
+        ],
+      ),
+    ],
+  )
+}
+
+/// Full Glint settings slider row: 180px label + 260px track with knob + 72px monospace readout box.
+pub fn settingsSliderRow(
+  m: &Overtone,
+  h: &Document<Message>,
+  id: u32,
+  title: string,
+  subtitle: string,
+  normVal: f32,
+  valueText: string,
+  lastRow: bool,
+) -> Node {
+  let clamped = f32.max(0.0, f32.min(1.0, normVal))
+  let fillPct = clamped * 100.0
+  let knobLeftPx = clamped * 248.0
+  let sLeft = m.sliderLeft[u32.toUsize(id)]
+  let sWidth = m.sliderWidth[u32.toUsize(id)]
+  let hasSub = String.byteLength(subtitle) > 0
+  return h.row(
+    &[
+      h.class("items-center gap-[16px] py-[9px]"),
+      h.classWhen(!lastRow, "border-b border-[#F0F0F2]"),
+    ],
+    &[
+      h.column(
+        &[h.class("w-[180px] shrink-0 gap-[1px]")],
+        &[
+          txt(h, title, "text-[13px] leading-[16px] text-[#0B0B0C]"),
+          if hasSub {
+            txt(h, subtitle, "text-[11px] leading-[14px] text-[#8A8A90]")
+          } else {
+            h.empty()
+          },
+        ],
+      ),
+      h.box(
+        &[
+          h.class("relative w-[260px] h-[16px] flex items-center shrink-0"),
+          h.cursor(Cursor.ResizeHorizontal),
+          if m.drag == DRAG_SLIDER && m.dragSlider == id { h.capturePointer() } else { h.none() },
+          h.onLayout(|r| Message.SliderLayout { id: id, rect: r }),
+          h.onPointerDown(|e| Reply<Message>.EmitAndStop { message: Message.SliderDown { id: id, x: e.x, left: sLeft, width: sWidth } }),
+          h.onPointerMove(|e| Reply<Message>.EmitAndStop { message: Message.SliderMove { x: e.x } }),
+          h.onPointerUp(|_| Reply<Message>.EmitAndStop { message: Message.SliderUp }),
+        ],
+        &[
+          h.box(&[h.class("absolute left-0 right-0 top-[7px] h-[2px] rounded-[1px] bg-[#E6E6E8]")], &[]),
+          h.box(
+            &[
+              h.class("absolute left-0 top-[7px] h-[2px] rounded-[1px] bg-[#0E0E10]"),
+              h.style(&[css.width(percent(fillPct))]),
+            ],
+            &[],
+          ),
+          h.box(
+            &[
+              h.class("absolute top-[2px] w-[12px] h-[12px] rounded-[6px] bg-white border-[1.5px] border-[#0E0E10]"),
+              h.style(&[css.left(px(knobLeftPx))]),
+            ],
+            &[],
+          ),
+        ],
+      ),
+      h.box(
+        &[h.class("w-[76px] px-[6px] py-[2px] border border-[#DCDCDF] rounded-[4px] flex justify-end shrink-0")],
+        &[txt(h, valueText, "glint-mono text-[11px] leading-[14px] text-[#0B0B0C]")],
+      ),
+    ],
+  )
+}
+
+/// Settings section heading (uppercase 11px muted).
+pub fn settingsSection(h: &Document<Message>, title: string) -> Node {
+  return txt(
+    h,
+    title,
+    "pt-[14px] pb-[6px] text-[11px] leading-[14px] font-semibold tracking-[0.06em] uppercase text-[#6B6B70]",
+  )
+}
+
+/// Segmented control option button inside a bordered `#DCDCDF` group.
+pub fn segOption(
+  h: &Document<Message>,
+  label: string,
+  sub: string,
+  active: bool,
+  mono: bool,
+  hasRightBorder: bool,
+  msg: Message,
+) -> Node {
+  let hasSub = String.byteLength(sub) > 0
+  return h.row(
+    &[
+      h.class("items-center gap-[5px] px-[10px] py-[4px] leading-[16px] shrink-0"),
+      h.classSelect(mono, "glint-mono text-[11px]", "text-[12px]"),
+      h.classSelect(active, "bg-[#0E0E10] text-white font-medium", "bg-white text-[#3A3A3F] glint-btn-hover"),
+      h.classWhen(hasRightBorder && !active, "border-r border-[#DCDCDF]"),
+      h.cursor(Cursor.Pointer),
+      h.onClick(move msg),
+    ],
+    &[
+      h.text(label),
+      if hasSub {
+        txtA(
+          h,
+          sub,
+          &[
+            h.class("glint-mono text-[10px]"),
+            h.classSelect(active, "text-[#9A9AA2]", "text-[#8A8A90]"),
+          ],
+        )
+      } else {
+        h.empty()
+      },
+    ],
+  )
+}
+
+/// Floating context menu section header.
+pub fn menuHeader(h: &Document<Message>, title: string) -> Node {
+  return txt(
+    h,
+    title,
+    "pt-[6px] pb-[3px] pl-[26px] pr-[10px] text-[10px] leading-[12px] font-semibold tracking-[0.07em] uppercase text-[#8A8A90]",
+  )
+}
+
+/// Floating context menu separator line.
+pub fn menuSep(h: &Document<Message>) -> Node {
+  return h.box(
+    &[h.class("py-[4px] flex")],
+    &[h.box(&[h.class("flex-1 h-[1px] bg-[#ECECEE]")], &[])],
+  )
+}
+
+/// Floating context menu item row.
+pub fn menuItem(
+  h: &Document<Message>,
+  checked: bool,
+  label: string,
+  shortcut: string,
+  danger: bool,
+  highlight: bool,
+  msg: Message,
+) -> Node {
+  let hasShortcut = String.byteLength(shortcut) > 0
+  return h.row(
+    &[
+      h.class("items-center gap-[6px] h-[26px] pl-[6px] pr-[10px] rounded-[5px]"),
+      h.classSelect(highlight, "bg-[#0E0E10] text-white", "glint-menu-item"),
+      h.cursor(Cursor.Pointer),
+      h.onClick(move msg),
+    ],
+    &[
+      txtA(
+        h,
+        if checked { "✓" } else { "" },
+        &[
+          h.class("w-[14px] shrink-0 text-[12px] leading-[16px]"),
+          h.classSelect(highlight, "text-white", if danger { "text-[#D9381E]" } else { "text-[#0B0B0C]" }),
+        ],
+      ),
+      txtA(
+        h,
+        label,
+        &[
+          h.class("flex-1 text-[13px] leading-[16px]"),
+          h.classSelect(highlight, "text-white", if danger { "text-[#D9381E]" } else { "text-[#0B0B0C]" }),
+        ],
+      ),
+      if hasShortcut {
+        txtA(
+          h,
+          shortcut,
+          &[
+            h.class("glint-mono text-[10px] leading-[12px] shrink-0"),
+            h.classSelect(highlight, "text-[#9A9AA2]", "text-[#8A8A90]"),
+          ],
+        )
+      } else {
+        h.empty()
+      },
+    ],
+  )
+}
+
+/// Menu item with a colormap swatch preview.
+pub fn menuPaletteItem(
+  h: &Document<Message>,
+  checked: bool,
+  idx: u32,
+  label: string,
+  badge: string,
+  msg: Message,
+) -> Node {
+  let hasBadge = String.byteLength(badge) > 0
+  return h.row(
+    &[
+      h.class("items-center gap-[6px] h-[26px] pl-[6px] pr-[10px] rounded-[5px] glint-menu-item"),
+      h.cursor(Cursor.Pointer),
+      h.onClick(move msg),
+    ],
+    &[
+      txt(h, if checked { "✓" } else { "" }, "w-[14px] shrink-0 text-[12px] leading-[16px] text-[#0B0B0C]"),
+      paletteSwatch(h, idx, 28.0, 10.0),
+      txt(h, label, "flex-1 text-[13px] leading-[16px] text-[#0B0B0C]"),
+      if hasBadge {
+        txt(h, badge, "glint-mono text-[9px] leading-[12px] text-[#8A8A90]")
+      } else {
+        h.empty()
+      },
+    ],
+  )
+}
+
+/// Menu item with a monospace speed label + muted description.
+pub fn menuSpeedItem(
+  h: &Document<Message>,
+  checked: bool,
+  speedTxt: string,
+  desc: string,
+  msg: Message,
+) -> Node {
+  return h.row(
+    &[
+      h.class("items-center gap-[6px] h-[26px] pl-[6px] pr-[10px] rounded-[5px] glint-menu-item"),
+      h.cursor(Cursor.Pointer),
+      h.onClick(move msg),
+    ],
+    &[
+      txt(h, if checked { "✓" } else { "" }, "w-[14px] shrink-0 text-[12px] leading-[16px] text-[#0B0B0C]"),
+      h.row(
+        &[h.class("flex-1 items-center gap-[6px]")],
+        &[
+          txt(h, speedTxt, "glint-mono text-[12px] leading-[16px] text-[#0B0B0C] w-[38px] shrink-0"),
+          txt(h, desc, "text-[12px] leading-[16px] text-[#8A8A90]"),
+        ],
+      ),
+    ],
+  )
+}
+
+/// Single keyboard shortcut row inside the Settings -> Shortcuts tab.
+pub fn shortcutRow(h: &Document<Message>, label: string, key1: string, key2: string) -> Node {
+  let hasK2 = String.byteLength(key2) > 0
+  return h.row(
+    &[h.class("items-center justify-between gap-[8px] py-[5px] border-b border-[#F4F4F5]")],
+    &[
+      txt(h, label, "text-[12px] leading-[16px] text-[#3A3A3F]"),
+      h.row(
+        &[h.class("gap-[3px] shrink-0")],
+        &[
+          txt(h, key1, "glint-keycap"),
+          if hasK2 { txt(h, key2, "glint-keycap") } else { h.empty() },
+        ],
+      ),
+    ],
+  )
+}
+
+const PCT_TABLE: [string<'static>; 101] = [
+  "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+  "10", "11", "12", "13", "14", "15", "16", "17", "18", "19",
+  "20", "21", "22", "23", "24", "25", "26", "27", "28", "29",
+  "30", "31", "32", "33", "34", "35", "36", "37", "38", "39",
+  "40", "41", "42", "43", "44", "45", "46", "47", "48", "49",
+  "50", "51", "52", "53", "54", "55", "56", "57", "58", "59",
+  "60", "61", "62", "63", "64", "65", "66", "67", "68", "69",
+  "70", "71", "72", "73", "74", "75", "76", "77", "78", "79",
+  "80", "81", "82", "83", "84", "85", "86", "87", "88", "89",
+  "90", "91", "92", "93", "94", "95", "96", "97", "98", "99",
+  "100",
+]
+
+/// Formats integer 0..100 cleanly without `%` suffix (for large score numerals & mini bar readouts).
+pub fn pctDigits(v: i32) -> string<'static> {
+  if v < 0 || v > 100 {
+    return "—"
+  }
+  return PCT_TABLE[i32.toUsize(v)]
+}
+
+/// Formats a small positive count (for folder item counts & guide counts).
+pub fn countStr(n: usize) -> string<'static> {
+  if n <= 100 {
+    return PCT_TABLE[n]
+  }
+  return "99+"
+}

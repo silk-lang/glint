@@ -1,0 +1,421 @@
+//! Pure-Silk WASM DSP kernel (replaces Apple Accelerate vDSP on wasm32-unknown-unknown).
+//! Implements radix-2 Cooley-Tukey FFT, spectrogram dB column computation, dB->RGBA8 packing,
+//! FFT autocorrelation (Boersma pitch), windowed-sinc resampling + pre-emphasis (Praat Burg),
+//! H1-H2 harmonic measurement, and LTAS.
+import silk.num.f32
+import silk.num.f64
+import silk.num.i32
+import silk.num.u8
+import silk.num.usize
+
+/// In-place iterative radix-2 Cooley-Tukey FFT (`inverse = false` for forward, `true` for IFFT).
+fn fftRadix2(re: &mut [f64], im: &mut [f64], n: usize, inverse: bool) -> () {
+  // Bit-reversal permutation
+  let mut j: usize = 0
+  let mut i: usize = 1
+  while i < n {
+    let mut bit = n / 2
+    while (j & bit) != 0 {
+      j = j ^ bit
+      bit = bit / 2
+    }
+    j = j ^ bit
+    if i < j {
+      let tr = re[i]
+      re[i] = re[j]
+      re[j] = tr
+      let ti = im[i]
+      im[i] = im[j]
+      im[j] = ti
+    }
+    i = i + 1
+  }
+
+  let sign: f64 = if inverse { 1.0 } else { -1.0 }
+  let mut len: usize = 2
+  while len <= n {
+    let half = len / 2
+    let ang = sign * 2.0 * f64.PI / usize.toF64(len)
+    let wlenRe = f64.cos(ang)
+    let wlenIm = f64.sin(ang)
+    let mut base: usize = 0
+    while base < n {
+      let mut wRe: f64 = 1.0
+      let mut wIm: f64 = 0.0
+      let mut k: usize = 0
+      while k < half {
+        let uRe = re[base + k]
+        let uIm = im[base + k]
+        let vr = re[base + k + half]
+        let vi = im[base + k + half]
+        let vRe = vr * wRe - vi * wIm
+        let vIm = vr * wIm + vi * wRe
+        re[base + k] = uRe + vRe
+        im[base + k] = uIm + vIm
+        re[base + k + half] = uRe - vRe
+        im[base + k + half] = uIm - vIm
+        let nextRe = wRe * wlenRe - wIm * wlenIm
+        let nextIm = wRe * wlenIm + wIm * wlenRe
+        wRe = nextRe
+        wIm = nextIm
+        k = k + 1
+      }
+      base = base + len
+    }
+    len = len * 2
+  }
+
+  if inverse {
+    let invN = 1.0 / usize.toF64(n)
+    let mut k: usize = 0
+    while k < n {
+      re[k] = re[k] * invN
+      im[k] = im[k] * invN
+      k = k + 1
+    }
+  }
+}
+
+pub fn computeColumnsDb(
+  samples: &[f32],
+  firstCentre: i32,
+  hop: i32,
+  numColumns: i32,
+  window: &[f32],
+  coherentGain: f32,
+  dbFloor: f32,
+  outBins: i32,
+  outDb: &mut [f32],
+) -> () {
+  let n = window.length
+  if n < 8 || numColumns <= 0 || outBins <= 0 {
+    return ()
+  }
+  let cols = i32.toUsize(numColumns)
+  let bins = i32.toUsize(outBins)
+  let maxBins = n / 2
+  let usedBins = if bins < maxBins { bins } else { maxBins }
+  let halfI = usize.toI32(n / 2)
+  let sampleCountI = usize.toI32(samples.length)
+  let scale = 2.0 / (usize.toF64(n) * f64.max(1.0e-9, f32.toF64(coherentGain)))
+  let scaleSq = scale * scale
+  let floorF = f32.toF64(dbFloor)
+  let invLn10 = 10.0 / f64.log(10.0)
+
+  let mut re: [f64; 8192] = [0.0; 8192]
+  let mut im: [f64; 8192] = [0.0; 8192]
+  if n > 8192 {
+    return ()
+  }
+
+  let mut c: usize = 0
+  while c < cols {
+    let centre = firstCentre + usize.toI32(c) * hop
+    let start = centre - halfI
+    let mut k: usize = 0
+    while k < n {
+      let si = start + usize.toI32(k)
+      let s: f64 = if si >= 0 && si < sampleCountI {
+        f32.toF64(samples[i32.toUsize(si)])
+      } else {
+        0.0
+      }
+      re[k] = s * f32.toF64(window[k])
+      im[k] = 0.0
+      k = k + 1
+    }
+    fftRadix2(&mut re, &mut im, n, false)
+    let colBase = c * bins
+    let mut b: usize = 0
+    while b < usedBins {
+      let mut p = (re[b] * re[b] + im[b] * im[b]) * scaleSq
+      if b == 0 {
+        p = p * 0.25
+      }
+      let db = if p > 1.0e-18 { f64.log(p) * invLn10 } else { floorF }
+      let clamped = if db < floorF { floorF } else { db }
+      outDb[colBase + b] = f64.toF32(clamped)
+      b = b + 1
+    }
+    while b < bins {
+      outDb[colBase + b] = dbFloor
+      b = b + 1
+    }
+    c = c + 1
+  }
+}
+
+pub fn columnsToRgba(
+  data: &[f32],
+  colOffset: usize,
+  cols: usize,
+  bins: usize,
+  floorDb: f32,
+  ceilingDb: f32,
+  rgba: &mut [u8],
+) -> () {
+  if cols == 0 || bins == 0 {
+    return ()
+  }
+  let invSpan: f32 = 1.0 / f32.max(1.0e-5, ceilingDb - floorDb)
+  let mut r: usize = 0
+  while r < bins {
+    let bin = bins - 1 - r
+    let rowBase = r * cols * 4
+    let mut c: usize = 0
+    while c < cols {
+      let db = data[(colOffset + c) * bins + bin]
+      let mut t = (db - floorDb) * invSpan
+      if t < 0.0 { t = 0.0 }
+      if t > 1.0 { t = 1.0 }
+      let byte = f32.toU8(t * 255.0 + 0.5)
+      let p = rowBase + c * 4
+      rgba[p + 0] = byte
+      rgba[p + 1] = byte
+      rgba[p + 2] = byte
+      rgba[p + 3] = 255
+      c = c + 1
+    }
+    r = r + 1
+  }
+}
+
+pub fn autocorrFft(input: &[f32], fftSize: i32, outAcf: &mut [f64]) -> () {
+  let n = i32.toUsize(fftSize)
+  if n < 16 || n > 16384 || input.length == 0 || outAcf.length == 0 {
+    return ()
+  }
+  let mut re: [f64; 16384] = [0.0; 16384]
+  let mut im: [f64; 16384] = [0.0; 16384]
+  let copyN = if input.length < n { input.length } else { n }
+  let mut i: usize = 0
+  while i < copyN {
+    re[i] = f32.toF64(input[i])
+    i = i + 1
+  }
+  fftRadix2(&mut re, &mut im, n, false)
+  i = 0
+  while i < n {
+    let p = re[i] * re[i] + im[i] * im[i]
+    re[i] = p
+    im[i] = 0.0
+    i = i + 1
+  }
+  fftRadix2(&mut re, &mut im, n, true)
+  let outN = if outAcf.length < n { outAcf.length } else { n }
+  i = 0
+  while i < outN {
+    outAcf[i] = re[i]
+    i = i + 1
+  }
+}
+
+pub fn resamplePreEmph(
+  src: &[f32],
+  srcRate: f64,
+  centreSec: f64,
+  dstRate: f64,
+  preemphHz: f64,
+  dst: &mut [f64],
+) -> f64 {
+  let n = dst.length
+  if src.length == 0 || n == 0 || srcRate <= 0.0 || dstRate <= 0.0 {
+    return -120.0
+  }
+  let halfDur = usize.toF64(n) * 0.5 / dstRate
+  let startSec = centreSec - halfDur
+  let ratio = srcRate / dstRate
+  let cutoff = if ratio > 1.0 { 0.45 / ratio } else { 0.45 }
+  let halfLobe: i32 = 8
+  let srcLenI = usize.toI32(src.length)
+
+  let mut sumSq: f64 = 0.0
+  let mut i: usize = 0
+  while i < n {
+    let t = startSec + (usize.toF64(i) + 0.5) / dstRate
+    let pos = t * srcRate
+    let centerI = f64.toI32(f64.floor(pos))
+    let mut acc: f64 = 0.0
+    let mut wsum: f64 = 0.0
+    let mut k: i32 = -halfLobe
+    while k <= halfLobe {
+      let idx = centerI + k
+      if idx >= 0 && idx < srcLenI {
+        let d = pos - i32.toF64(idx)
+        let x = 2.0 * f64.PI * cutoff * d
+        let sinc = if f64.abs(x) < 1.0e-7 { 2.0 * cutoff } else { f64.sin(x) / (f64.PI * d) }
+        let win = 0.5 + 0.5 * f64.cos(f64.PI * d / i32.toF64(halfLobe + 1))
+        let w = sinc * win
+        acc = acc + f32.toF64(src[i32.toUsize(idx)]) * w
+        wsum = wsum + w
+      }
+      k = k + 1
+    }
+    let val = if f64.abs(wsum) > 1.0e-9 { acc / wsum } else { 0.0 }
+    dst[i] = val
+    sumSq = sumSq + val * val
+    i = i + 1
+  }
+
+  // First-order pre-emphasis filter (Praat standard)
+  if preemphHz > 0.0 && n > 1 {
+    let alpha = f64.exp(-2.0 * f64.PI * preemphHz / dstRate)
+    let mut j: usize = n - 1
+    while j >= 1 {
+      dst[j] = dst[j] - alpha * dst[j - 1]
+      j = j - 1
+    }
+  }
+
+  let rms = f64.sqrt(sumSq / usize.toF64(n))
+  if rms <= 1.0e-9 {
+    return -120.0
+  }
+  return 20.0 * f64.log(rms) / f64.log(10.0)
+}
+
+pub fn harmonicH1H2(samples: &[f32], sampleRate: f64, centreSec: f64, f0: f64) -> f64 {
+  if samples.length < 256 || sampleRate <= 0.0 || f0 < 40.0 || f0 * 2.5 >= sampleRate * 0.5 {
+    return 0.0
+  }
+  let n: usize = 2048
+  let halfI = usize.toI32(n / 2)
+  let centre = f64.toI32(f64.round(centreSec * sampleRate))
+  let start = centre - halfI
+  let srcLenI = usize.toI32(samples.length)
+  let twoPi = 2.0 * f64.PI
+  let nF = usize.toF64(n)
+
+  // Direct Goertzel/DFT power around H1 (f0) and H2 (2*f0) — fast O(N) with +-6% peak search!
+  let mut bestH1: f64 = 1.0e-18
+  let mut bestH2: f64 = 1.0e-18
+  let offsets: [f64; 5] = [-0.04, -0.02, 0.0, 0.02, 0.04]
+  let mut oi: usize = 0
+  while oi < 5 {
+    let f1 = f0 * (1.0 + offsets[oi])
+    let f2 = 2.0 * f0 * (1.0 + offsets[oi])
+    let w1 = twoPi * f1 / sampleRate
+    let w2 = twoPi * f2 / sampleRate
+    let mut r1: f64 = 0.0
+    let mut i1: f64 = 0.0
+    let mut r2: f64 = 0.0
+    let mut i2: f64 = 0.0
+    let mut k: usize = 0
+    while k < n {
+      let si = start + usize.toI32(k)
+      if si >= 0 && si < srcLenI {
+        let win = 0.5 - 0.5 * f64.cos(twoPi * usize.toF64(k) / nF)
+        let s = f32.toF64(samples[i32.toUsize(si)]) * win
+        let kf = usize.toF64(k)
+        r1 = r1 + s * f64.cos(w1 * kf)
+        i1 = i1 - s * f64.sin(w1 * kf)
+        r2 = r2 + s * f64.cos(w2 * kf)
+        i2 = i2 - s * f64.sin(w2 * kf)
+      }
+      k = k + 2
+    }
+    let p1 = r1 * r1 + i1 * i1
+    let p2 = r2 * r2 + i2 * i2
+    if p1 > bestH1 { bestH1 = p1 }
+    if p2 > bestH2 { bestH2 = p2 }
+    oi = oi + 1
+  }
+  let db = 10.0 * f64.log(bestH1 / bestH2) / f64.log(10.0)
+  return f64.max(-20.0, f64.min(30.0, db))
+}
+
+pub fn computeLtas(
+  samples: &[f32],
+  sampleRate: f64,
+  voicedTimes: &[f64],
+  outBins: &mut [f32],
+  fMin: f64,
+  fMax: f64,
+) -> bool {
+  let numBins = outBins.length
+  if samples.length < 512 || voicedTimes.length == 0 || numBins < 2 || sampleRate <= 0.0 {
+    return false
+  }
+  let n: usize = 2048
+  let halfI = usize.toI32(n / 2)
+  let srcLenI = usize.toI32(samples.length)
+  let twoPi = 2.0 * f64.PI
+  let nF = usize.toF64(n)
+  let hzPerBin = sampleRate / nF
+
+  let mut win: [f64; 2048] = [0.0; 2048]
+  let mut k: usize = 0
+  while k < n {
+    win[k] = 0.5 - 0.5 * f64.cos(twoPi * usize.toF64(k) / nF)
+    k = k + 1
+  }
+
+  let mut avgPow: [f64; 1024] = [0.0; 1024]
+  let mut re: [f64; 2048] = [0.0; 2048]
+  let mut im: [f64; 2048] = [0.0; 2048]
+
+  let stride = if voicedTimes.length > 64 { voicedTimes.length / 64 } else { 1 }
+  let mut count: usize = 0
+  let mut vi: usize = 0
+  while vi < voicedTimes.length {
+    let centre = f64.toI32(f64.round(voicedTimes[vi] * sampleRate))
+    let start = centre - halfI
+    k = 0
+    while k < n {
+      let si = start + usize.toI32(k)
+      let s: f64 = if si >= 0 && si < srcLenI { f32.toF64(samples[i32.toUsize(si)]) } else { 0.0 }
+      re[k] = s * win[k]
+      im[k] = 0.0
+      k = k + 1
+    }
+    fftRadix2(&mut re, &mut im, n, false)
+    let mut b: usize = 0
+    while b < 1024 {
+      avgPow[b] = avgPow[b] + re[b] * re[b] + im[b] * im[b]
+      b = b + 1
+    }
+    count = count + 1
+    vi = vi + stride
+  }
+
+  if count == 0 {
+    return false
+  }
+  let invCount = 1.0 / usize.toF64(count)
+  let logMin = f64.log(f64.max(20.0, fMin))
+  let logMax = f64.log(f64.min(sampleRate * 0.49, fMax))
+  let invLn10 = 10.0 / f64.log(10.0)
+  let mut dbMean: f64 = 0.0
+
+  let mut ob: usize = 0
+  while ob < numBins {
+    let frac0 = usize.toF64(ob) / usize.toF64(numBins)
+    let frac1 = usize.toF64(ob + 1) / usize.toF64(numBins)
+    let hz0 = f64.exp(logMin + frac0 * (logMax - logMin))
+    let hz1 = f64.exp(logMin + frac1 * (logMax - logMin))
+    let mut b0 = f64.toUsize(f64.floor(hz0 / hzPerBin))
+    let mut b1 = f64.toUsize(f64.ceil(hz1 / hzPerBin))
+    if b0 >= 1024 { b0 = 1023 }
+    if b1 > 1024 { b1 = 1024 }
+    if b1 <= b0 { b1 = b0 + 1 }
+    let mut pSum: f64 = 0.0
+    let mut bb = b0
+    while bb < b1 && bb < 1024 {
+      pSum = pSum + avgPow[bb] * invCount
+      bb = bb + 1
+    }
+    let avg = pSum / usize.toF64(if b1 > b0 { b1 - b0 } else { 1 })
+    let db = if avg > 1.0e-18 { f64.log(avg) * invLn10 } else { -120.0 }
+    outBins[ob] = f64.toF32(db)
+    dbMean = dbMean + db
+    ob = ob + 1
+  }
+
+  dbMean = dbMean / usize.toF64(numBins)
+  ob = 0
+  while ob < numBins {
+    outBins[ob] = f64.toF32(f32.toF64(outBins[ob]) - dbMean)
+    ob = ob + 1
+  }
+  return true
+}

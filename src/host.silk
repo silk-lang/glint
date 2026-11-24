@@ -1,0 +1,570 @@
+//! Native macOS window host for Glint.
+//!
+//! Connects SilkUI's `ui_tree_window.host` directly to Loom's `Runtime<Overtone, Message, Command>`
+//! with compiled Tailwind CSS 4 `StyleAssets`, zero-copy Metal IOSurface WebGPU spectrogram,
+//! native macOS Open/Save file dialogs, drag-and-drop audio, and transparent title bar.
+import app_css { APP_CSS }
+import dsp { COARSE_HOP, COARSE_WINDOW_SIZE, LIVE_HOP, TierUpdate, computeColumns }
+import gpu_spectrogram { GpuSpectrogram }
+import studio { Command, INIT_SPEC_H, INIT_SPEC_W, Message, Overtone }
+import loom.runtime { Runtime, drain, pump, resize, tick }
+import loom.ui { Surface }
+import loom_tree.lib { frame, frameRoot }
+import font_collection.lib { FontCollection }
+import ui_inspect_server.lib { InspectorOptions }
+import ui_tree.legacy { FrameInput, Mutation, TreeError, UiTree }
+import ui_tree.style_assets { StyleAssets }
+import ui_tree.style_runtime { runtime as cssCompiler }
+import ui_tree_window.canvas_frames { CanvasPresenter }
+import ui_tree_window.console { StderrWriter }
+import ui_tree_window.host { RunOptions, StartedGpu, WindowClient, runWindow, startInspector }
+import ui_tree_window.keys { keyName }
+import ui_tree_window.platform_thread { HostPlatform, Launched }
+import atlas.atlas { AtlasError }
+import vector.geometry_error { GeometryError }
+import webgpu.runtime { GpuError }
+import window.event { Event, Key, MouseButton }
+import window.menu { OpenDialog, SaveDialog }
+import window.platform { Platform }
+import window.types { TitleBar, WindowError, WindowId, WindowOptions }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String }
+
+const TITLE_BAR_H: f64 = 44.0
+const DIALOG_OPEN: u32 = 1
+const DIALOG_SAVE: u32 = 2
+
+struct PendingDialog {
+  id: u32,
+  kind: u32,
+}
+
+struct OvertoneClient {
+  presenter: Option<CanvasPresenter>,
+  gpu: Option<GpuSpectrogram>,
+  stylesheets: StyleAssets,
+  dialogs: List<PendingDialog>,
+  windowDrag: bool,
+  lastTime: f64,
+}
+
+effect fn openSpectrogramGpu(presenter: &CanvasPresenter, w: u32, h: u32) -> Option<GpuSpectrogram>
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  return Option<GpuSpectrogram>.some(run GpuSpectrogram.open(presenter, w, h))
+}
+
+effect fn noSpectrogramGpu(err: GpuError | OutOfMemoryError) -> Option<GpuSpectrogram> {
+  drop err
+  StderrWriter.print("glint: could not open WebGPU device for spectrogram\n", &())
+  return Option<GpuSpectrogram>.None
+}
+
+effect fn gpuSyncFailed(err: GpuError | OutOfMemoryError) -> bool {
+  drop err
+  StderrWriter.print("glint: WebGPU sync error\n", &())
+  return false
+}
+
+impl OvertoneClient {
+  effect fn syncGpuInner(self: &mut Self, model: &mut Overtone) -> bool
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut surfaceChanged = false
+
+    // 1. Lazily open the zero-copy WebGPU Spectrogram once we have the presenter.
+    if self.gpu.isNone() {
+      if let Option<CanvasPresenter>.Some { value: pres } = &self.presenter {
+        let w = if model.gpuTargetW >= 16 { model.gpuTargetW } else { f32.toU32(INIT_SPEC_W * 2.0) }
+        let h = if model.gpuTargetH >= 16 { model.gpuTargetH } else { f32.toU32(INIT_SPEC_H * 2.0) }
+        self.gpu = run Effect.catchAll(openSpectrogramGpu(&pres, w, h), noSpectrogramGpu)
+        if let Option<GpuSpectrogram>.Some { value: g } = &self.gpu {
+          model.surface = Surface { id: g.surfaceId(), width: g.width(), height: g.height(), opaque: true }
+          surfaceChanged = true
+        }
+      }
+    }
+
+    if let Option<GpuSpectrogram>.Some { value: g } = &mut self.gpu {
+      // 2. Resize swap chain if spectrogram container resized.
+      if model.gpuNeedResize {
+        model.gpuNeedResize = false
+        if run g.resize(model.gpuTargetW, model.gpuTargetH) {
+          model.surface = Surface { id: g.surfaceId(), width: g.width(), height: g.height(), opaque: true }
+          surfaceChanged = true
+          model.gpuNeedRedraw = true
+        }
+      }
+
+      // 3. Palette LUT swap.
+      if model.gpuNeedPalette {
+        model.gpuNeedPalette = false
+        run g.setPalette(model.palette)
+        model.gpuNeedRedraw = true
+      }
+
+      // 4. Sync brightness / contrast / display range.
+      g.brightness = model.brightness
+      g.contrast = model.contrast
+      g.displayFloorDb = model.displayFloorDb
+      g.displayCeilingDb = model.displayCeilingDb
+
+      // 4b. Clear spectrogram cleanly for a blank "+ New" document.
+      if model.gpuNeedClear {
+        model.gpuNeedClear = false
+        run g.clearLiveTier()
+        run g.clearSharpTier()
+        run g.beginRecordingSession(model.sampleRate, 60.0, COARSE_HOP, COARSE_WINDOW_SIZE)
+        model.gpuNeedRedraw = true
+      }
+
+      // 5. Enter recording session (preallocated coarse + live tiers).
+      if model.gpuNeedBeginRec {
+        model.gpuNeedBeginRec = false
+        run g.beginRecordingSession(model.sampleRate, 600.0, COARSE_HOP, COARSE_WINDOW_SIZE)
+        let probe = run computeColumns(
+          &[0.0; 16],
+          model.sampleRate,
+          0.0,
+          0.0,
+          1,
+          &model.sharpWin,
+          model.liveTracker.maxHz,
+          LIVE_HOP,
+        )
+        run g.beginLiveTier(model.sampleRate, LIVE_HOP, probe.bins, probe.hzPerBin)
+        if model.samples.length() > 0 {
+          model.gpuNeedRecAppend = true
+        }
+        model.gpuNeedRedraw = true
+      }
+
+      // 6. Incremental recording append (coarse + live partial texture writes).
+      if model.gpuNeedRecAppend {
+        model.gpuNeedRecAppend = false
+        let samples = model.samples.asSlice()
+        if let Option<TierUpdate>.Some { value: cu } = run model.coarseTracker.update(samples, model.sampleRate, &model.coarseWin) {
+          run g.appendCoarseColumns(cu.startColumn, &cu.data)
+          model.gpuNeedRedraw = true
+        }
+        if let Option<TierUpdate>.Some { value: lu } = run model.liveTracker.update(samples, model.sampleRate, &model.sharpWin) {
+          run g.appendLiveColumns(lu.startColumn, &lu.data)
+          model.gpuNeedRedraw = true
+        }
+      }
+
+      // 7. Wholesale reload (new clip loaded, Base Take/Ref switched, or display floor/ceiling changed).
+      // For clips <= 45s (almost every voice-training clip), pre-render the whole clip at full 8192-pt
+      // sharp resolution up to 12 kHz so normal panning/zooming is instantaneous with zero resolution pop.
+      if model.gpuNeedFullReload {
+        model.gpuNeedFullReload = false
+        run g.clearLiveTier()
+        run g.clearSharpTier()
+        let dur = model.gpuDuration()
+        let sr = model.gpuSampleRate()
+        if dur > 0.0 {
+          if dur <= 45.0 {
+            let baseHopF = f64.max(256.0, f64.ceil((dur * sr) / 2400.0))
+            let baseHop = f64.toUsize(baseHopF)
+            let baseMaxHz = f64.min(sr * 0.5, f64.max(12000.0, model.vp.f1 * 1.4))
+            let coarseCols = run computeColumns(
+              model.gpuSamples(),
+              sr,
+              0.0,
+              dur,
+              0,
+              &model.sharpWin,
+              baseMaxHz,
+              baseHop,
+            )
+            run g.setCoarseTier(&coarseCols)
+          } else {
+            let longHopF = f64.max(usize.toF64(COARSE_HOP), f64.ceil((dur * sr) / 2400.0))
+            let coarseCols = run computeColumns(
+              model.gpuSamples(),
+              sr,
+              0.0,
+              dur,
+              0,
+              &model.coarseWin,
+              0.0,
+              f64.toUsize(longHopF),
+            )
+            run g.setCoarseTier(&coarseCols)
+          }
+          model.gpuNeedRedraw = true
+        }
+      }
+
+      // 8. On-demand deep-zoom sharp tier (8192-pt Blackman-Nuttall FFT + generous 40% overdraw margin).
+      // Skipped completely when the base tier or existing sharp tier already covers the viewport at full clarity.
+      if model.gpuNeedSharp && !model.recording && self.lastTime >= model.sharpDueTime {
+        model.gpuNeedSharp = false
+        let dur = model.gpuDuration()
+        let sr = model.gpuSampleRate()
+        let src = model.gpuSamples()
+        if dur > 0.0 && src.length > 0 {
+          let span = f64.max(model.vp.t1 - model.vp.t0, 0.005)
+          let cssW = f32.toUsize(f32.max(240.0, f32.min(1200.0, model.specRect.width())))
+          let desiredStepSec = span / usize.toF64(cssW)
+          let desiredHzPerBin = sr / usize.toF64(model.sharpWin.size)
+          if g.coarseCovers(&model.vp, desiredStepSec, desiredHzPerBin) {
+            run g.clearSharpTier()
+            model.gpuNeedRedraw = true
+          } else if !g.sharpCovers(&model.vp, desiredStepSec) {
+            let margin = span * 0.40
+            let t0 = f64.max(0.0, model.vp.t0 - margin)
+            let t1 = f64.min(dur, model.vp.t1 + margin)
+            let rawCols = f64.toUsize(f64.round(usize.toF64(cssW) * ((t1 - t0) / span)))
+            let targetCols = if rawCols < 64 { 64 } else if rawCols > 1600 { 1600 } else { rawCols }
+            let sharpMaxHz = f64.min(sr * 0.5, f64.max(model.vp.f1 * 1.6, 12000.0))
+            let sharpCols = run computeColumns(
+              src,
+              sr,
+              t0,
+              t1,
+              targetCols,
+              &model.sharpWin,
+              sharpMaxHz,
+              0,
+            )
+            run g.setSharpTier(&sharpCols)
+            model.gpuNeedRedraw = true
+          }
+        }
+      }
+
+      // 9. Present WebGPU frame (zero-copy IOSurface swap chain!).
+      if model.gpuNeedRedraw {
+        model.gpuNeedRedraw = false
+        run g.draw(&model.vp)
+      }
+    }
+
+    return surfaceChanged
+  }
+
+  effect fn syncGpu(
+    self: &mut Self,
+    state: &mut Runtime<Overtone, Message, Command>,
+    tree: &mut UiTree<'_>,
+  ) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let changed = run Effect.catchAll(self.syncGpuInner(&mut state.model), gpuSyncFailed)
+    if changed {
+      run state.render(&mut tree)
+    }
+  }
+}
+
+impl WindowClient<Runtime<Overtone, Message, Command>, OutOfMemoryError, &mut Allocator> for OvertoneClient {
+  effect fn canvases(
+    self: &mut Self,
+    state: &mut Runtime<Overtone, Message, Command>,
+    presenter: CanvasPresenter,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop state
+    self.presenter = Option<CanvasPresenter>.some(move presenter)
+  }
+
+  fn configure(self: &Self, state: &Runtime<Overtone, Message, Command>, options: &mut WindowOptions<'_>) -> () {
+    drop state
+    options.titleBar = TitleBar.Transparent
+    options.titleBarHeight = TITLE_BAR_H
+  }
+
+  effect fn start(
+    self: &mut Self,
+    state: &mut Runtime<Overtone, Message, Command>,
+    tree: &mut UiTree<'_>,
+  ) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.stylesheets.preload(&mut tree)
+    // Open the WebGPU spectrogram surface before the initial Loom render (do NOT call state.render yet).
+    drop run Effect.catchAll(self.syncGpuInner(&mut state.model), gpuSyncFailed)
+    run state.start(&mut tree, 0.0)
+    run self.syncGpu(&mut state, &mut tree)
+  }
+
+  effect fn event(
+    self: &mut Self,
+    state: &mut Runtime<Overtone, Message, Command>,
+    tree: &mut UiTree<'_>,
+    event: &Event,
+  ) -> bool
+    ! WindowError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    match &event.* {
+      Event.KeyDown { key, modifiers, repeat, imeHandled, .. } => {
+        if !imeHandled && !state.model.textInputFocused {
+          let keyStr = match &key {
+            Key.Character { text } => run String.copy(String.view(&text))
+            Key.Named { key: named } => run String.copy(keyName(named))
+          }
+          let mods = u32.bitAnd(modifiers.bits(), 15)
+          let ks = String.view(&keyStr)
+          if state.model.handlesGlobalKey(ks, mods) {
+            // Suppress key-repeat on toggle/transport shortcuts (Space, R, D, E, etc.)
+            // while still allowing held arrows/+/- for smooth pan/zoom.
+            let allowRepeat = ks == "ArrowLeft" || ks == "ArrowRight" || ks == "=" || ks == "+" || ks == "-"
+            if repeat && !allowRepeat {
+              return true
+            }
+            state.send(Message.GlobalKeyDown { key: move keyStr, modifiers: mods })
+            run drain(&mut state, &mut tree)
+            run self.syncGpu(&mut state, &mut tree)
+            return true
+          }
+        }
+      }
+      Event.KeyUp { key, modifiers, .. } => {
+        // Consume KeyUp for every global shortcut so SilkUI's focused-button Space/Enter
+        // keyboardClick handler NEVER double-fires after our KeyDown toggled Play/Pause/Rec!
+        if !state.model.textInputFocused {
+          let keyStr = match &key {
+            Key.Character { text } => run String.copy(String.view(&text))
+            Key.Named { key: named } => run String.copy(keyName(named))
+          }
+          let mods = u32.bitAnd(modifiers.bits(), 15)
+          if state.model.handlesGlobalKey(String.view(&keyStr), mods) {
+            return true
+          }
+        }
+      }
+      Event.MouseDown { button, position, .. } => {
+        // Allow dragging the window from the far-left empty traffic-light zone
+        if button == MouseButton.Left && position.y < TITLE_BAR_H && position.x < 74.0 {
+          self.windowDrag = true
+          return true
+        }
+      }
+      Event.DialogClosed { dialog, paths } => {
+        let mut kind: u32 = 0
+        let mut i: usize = 0
+        while i < self.dialogs.length() {
+          if self.dialogs.asSlice()[i].id == dialog.value {
+            kind = self.dialogs.remove(i).kind
+            break
+          }
+          i = i + 1
+        }
+        if paths.length() > 0 {
+          let chosen = run String.copy(String.view(&paths.asSlice()[0]))
+          if kind == DIALOG_OPEN {
+            state.send(Message.FileChosen { path: move chosen })
+            run drain(&mut state, &mut tree)
+            run self.syncGpu(&mut state, &mut tree)
+          } else if kind == DIALOG_SAVE {
+            state.send(Message.SaveChosen { path: move chosen })
+            run drain(&mut state, &mut tree)
+          }
+        }
+        return true
+      }
+      Event.FileDropped { paths, .. } => {
+        if paths.length() > 0 {
+          let chosen = run String.copy(String.view(&paths.asSlice()[0]))
+          state.send(Message.FileChosen { path: move chosen })
+          run drain(&mut state, &mut tree)
+          run self.syncGpu(&mut state, &mut tree)
+        }
+        return true
+      }
+      _ => ()
+    }
+    return false
+  }
+
+  effect fn update(
+    self: &mut Self,
+    state: &mut Runtime<Overtone, Message, Command>,
+    tree: &mut UiTree<'_>,
+    platform: &mut HostPlatform,
+    window: WindowId,
+  ) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop tree
+    if self.windowDrag {
+      self.windowDrag = false
+      Platform.startWindowDrag(&mut platform.*, window)
+    }
+    if state.model.pendingOpenDialog {
+      state.model.pendingOpenDialog = false
+      let mut opts = OpenDialog.file("Open Audio File", "wav,mp3,m4a,aac,flac,aiff,caf")
+      opts.parent = Option<WindowId>.some(window)
+      let dialog = run platform.openFileDialog(&opts)
+      run self.dialogs.append(PendingDialog { id: dialog.value, kind: DIALOG_OPEN })
+    }
+    if state.model.pendingSaveDialog {
+      state.model.pendingSaveDialog = false
+      let mut opts = SaveDialog.named("Export 16-bit WAV", "glint-take.wav", "wav")
+      opts.parent = Option<WindowId>.some(window)
+      let dialog = run platform.saveFileDialog(&opts)
+      run self.dialogs.append(PendingDialog { id: dialog.value, kind: DIALOG_SAVE })
+    }
+    return false
+  }
+
+  effect fn poll(
+    self: &mut Self,
+    state: &mut Runtime<Overtone, Message, Command>,
+    tree: &mut UiTree<'_>,
+    time: f64,
+  ) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    self.lastTime = time
+    state.model.nowTime = time
+    run self.syncGpu(&mut state, &mut tree)
+    return false
+  }
+
+  fn wakeAfter(self: &Self, state: &Runtime<Overtone, Message, Command>) -> Option<f64> {
+    if state.model.gpuNeedSharp && !state.model.recording {
+      return Option<f64>.some(0.016)
+    }
+    return Option<f64>.None
+  }
+
+  effect fn pump(
+    self: &mut Self,
+    state: &mut Runtime<Overtone, Message, Command>,
+    tree: &mut UiTree<'_>,
+  ) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop run pump(&mut state, &mut tree)
+    drop state.takePrevented()
+    run self.syncGpu(&mut state, &mut tree)
+  }
+
+  effect fn decide(
+    self: &mut Self,
+    state: &mut Runtime<Overtone, Message, Command>,
+    tree: &mut UiTree<'_>,
+  ) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop run pump(&mut state, &mut tree)
+    run self.syncGpu(&mut state, &mut tree)
+    return state.takePrevented()
+  }
+
+  effect fn tick(
+    self: &mut Self,
+    state: &mut Runtime<Overtone, Message, Command>,
+    tree: &mut UiTree<'_>,
+    time: f64,
+    animation: bool,
+  ) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    self.lastTime = time
+    run tick(&mut state, &mut tree, time, animation)
+    run self.syncGpu(&mut state, &mut tree)
+  }
+
+  effect fn resize(
+    self: &mut Self,
+    state: &mut Runtime<Overtone, Message, Command>,
+    tree: &mut UiTree<'_>,
+    width: f32,
+    height: f32,
+  ) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run resize(&mut state, &mut tree, width, height)
+    run self.syncGpu(&mut state, &mut tree)
+  }
+
+  effect fn layout(
+    self: &mut Self,
+    state: &mut Runtime<Overtone, Message, Command>,
+    tree: &mut UiTree<'_>,
+    input: FrameInput,
+  ) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let root = tree.current
+    drop run self.stylesheets.serve(&mut tree, root)
+    run frame(&mut state, &mut tree, input)
+    run self.syncGpu(&mut state, &mut tree)
+  }
+
+  effect fn layoutRoot(
+    self: &mut Self,
+    state: &mut Runtime<Overtone, Message, Command>,
+    tree: &mut UiTree<'_>,
+    root: u32,
+    input: FrameInput,
+  ) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop run self.stylesheets.serve(&mut tree, root)
+    run frameRoot(&mut state, &mut tree, root, input)
+    run self.syncGpu(&mut state, &mut tree)
+  }
+
+  fn nextDeadline(self: &Self, state: &Runtime<Overtone, Message, Command>) -> Option<f64> {
+    return state.nextDeadline()
+  }
+
+  fn wantsFrames(self: &Self, state: &Runtime<Overtone, Message, Command>) -> bool {
+    return state.wantsFrames()
+  }
+}
+
+pub effect fn runOvertone(fonts: &FontCollection, platform: Option<Launched>) -> i32
+  ! WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let model = run Overtone.init()
+  let mut runtime = Runtime<Overtone, Message, Command>.make(move model)
+  let mut stylesheets = StyleAssets.make()
+  let compiler = cssCompiler()
+  if let Option<Bytes>.Some { value: compiled } = compiler.call(String.utf8Bytes(APP_CSS)) {
+    run stylesheets.append(compiled.asSlice())
+  } else {
+    StderrWriter.print("glint: warning — failed to compile Tailwind stylesheet\n", &())
+  }
+  let mut client = OvertoneClient {
+    presenter: Option<CanvasPresenter>.None,
+    gpu: Option<GpuSpectrogram>.None,
+    stylesheets: move stylesheets,
+    dialogs: List<PendingDialog>.make(),
+    windowDrag: false,
+    lastTime: 0.0,
+  }
+  let options = RunOptions {
+    title: "Glint",
+    width: 1460.0,
+    height: 880.0,
+    check: false,
+    checkClick: "",
+    checkExpect: "",
+    lowestLatency: false,
+    platform: move platform,
+    gpu: Option<StartedGpu>.None,
+  }
+  let inspector = run startInspector(InspectorOptions.make())
+  return run runWindow<OvertoneClient, Runtime<Overtone, Message, Command>, OutOfMemoryError, &mut Allocator>(
+    &mut runtime,
+    fonts,
+    List<Mutation>.make(),
+    move options,
+    move inspector,
+    &mut client,
+  )
+}

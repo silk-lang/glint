@@ -1,0 +1,357 @@
+//! Transport & Practice Mode finite state machine built on Silk's standard `silk.machine` statecharts.
+//!
+//! Single source of truth for all audio transport & practice controls:
+//!   - Idle / Playing / PlayingRef / Recording / Scrubbing
+//!   - Repeat Drill (DrillPlayRef -> DrillListen -> DrillRecord -> DrillCooldown -> DrillPlayRef)
+//!   - Echo Mirror  (EchoListen -> EchoRecord -> EchoPlayback -> EchoCooldown -> EchoListen)
+//!
+//! Every transition and its exact side-effects (`TransportEffect`) are declared statically in
+//! `Chart` and verified by the Silk compiler against `TransportState` and `TransportEvent`.
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.ownership { Copy }
+import silk.machine.chart { Chart, Machine }
+import silk.machine.snapshot { Snapshot, Status, Steps, Timer, TransitionLoopError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.schema.schema { Schema }
+
+pub union TransportState {
+  Idle,
+  Playing,
+  PlayingRef,
+  Recording,
+  Scrubbing,
+  DrillPlayRef,
+  DrillListen,
+  DrillRecord,
+  DrillCooldown,
+  EchoListen,
+  EchoRecord,
+  EchoPlayback,
+  EchoCooldown,
+}
+
+impl Copy for TransportState {}
+impl Schema for TransportState {}
+
+pub union TransportEvent {
+  TogglePlay,
+  ToggleRecord,
+  PlayRef,
+  PlayFromCursor,
+  PlaybackEnded,
+  ScrubStart,
+  ScrubEnd,
+  ToggleDrill,
+  ToggleEcho,
+  PracticeSpeechStarted,
+  PracticeSilenceDone,
+  PracticeCooldownDone,
+  StopAll,
+  MicFailed,
+  PlayFailed,
+}
+
+impl Copy for TransportEvent {}
+impl Schema for TransportEvent {}
+
+pub struct TransportContext {}
+
+impl Copy for TransportContext {}
+impl Schema for TransportContext {}
+
+pub union TransportEffect {
+  StartAudioPlayback,
+  PauseAudioPlayback,
+  StopAudioOnly,
+  StartRefPlayback,
+  StartMicRecording,
+  StopAndSaveRecording,
+  StartScrubAudio,
+  StopScrubAudio,
+  StartDrillRefPlay,
+  ArmPracticeMic,
+  BeginPracticeRec,
+  FinishPracticeRecOnly,
+  FinishPracticeRecAndEcho,
+  StartPracticeCooldown,
+  AbortPractice,
+}
+
+impl Copy for TransportEffect {}
+impl Schema for TransportEffect {}
+
+pub type TransportSnapshot = Snapshot<TransportState, TransportEvent, TransportContext, TransportEffect>
+
+impl Machine<TransportEvent, TransportContext, TransportEffect> for TransportState {
+  static fn chart() -> Chart<TransportState, TransportEvent, TransportContext, TransportEffect> {
+    return Chart<TransportState, TransportEvent, TransportContext, TransportEffect>.of()
+      |> Chart.initial(TransportState.Idle)
+      // --- Idle ---
+      |> Chart.on("Idle", "TogglePlay", TransportState.Playing)
+      |> Chart.leaves(&[TransportEffect.StartAudioPlayback])
+      |> Chart.on("Idle", "PlayFromCursor", TransportState.Playing)
+      |> Chart.leaves(&[TransportEffect.StartAudioPlayback])
+      |> Chart.on("Idle", "PlayRef", TransportState.PlayingRef)
+      |> Chart.leaves(&[TransportEffect.StartRefPlayback])
+      |> Chart.on("Idle", "ToggleRecord", TransportState.Recording)
+      |> Chart.leaves(&[TransportEffect.StartMicRecording])
+      |> Chart.on("Idle", "ScrubStart", TransportState.Scrubbing)
+      |> Chart.leaves(&[TransportEffect.StartScrubAudio])
+      |> Chart.on("Idle", "ToggleDrill", TransportState.DrillPlayRef)
+      |> Chart.leaves(&[TransportEffect.StartDrillRefPlay])
+      |> Chart.on("Idle", "ToggleEcho", TransportState.EchoListen)
+      |> Chart.leaves(&[TransportEffect.ArmPracticeMic])
+      // --- Playing (Space/Pause ALWAYS pauses cleanly at current cursor, never restarts!) ---
+      |> Chart.on("Playing", "TogglePlay", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.PauseAudioPlayback])
+      |> Chart.on("Playing", "PlaybackEnded", TransportState.Idle)
+      |> Chart.on("Playing", "PlayFailed", TransportState.Idle)
+      |> Chart.on("Playing", "PlayFromCursor", TransportState.Playing)
+      |> Chart.leaves(&[TransportEffect.StopAudioOnly, TransportEffect.StartAudioPlayback])
+      |> Chart.on("Playing", "PlayRef", TransportState.PlayingRef)
+      |> Chart.leaves(&[TransportEffect.StopAudioOnly, TransportEffect.StartRefPlayback])
+      |> Chart.on("Playing", "ToggleRecord", TransportState.Recording)
+      |> Chart.leaves(&[TransportEffect.StopAudioOnly, TransportEffect.StartMicRecording])
+      |> Chart.on("Playing", "ToggleDrill", TransportState.DrillPlayRef)
+      |> Chart.leaves(&[TransportEffect.StopAudioOnly, TransportEffect.StartDrillRefPlay])
+      |> Chart.on("Playing", "ToggleEcho", TransportState.EchoListen)
+      |> Chart.leaves(&[TransportEffect.StopAudioOnly, TransportEffect.ArmPracticeMic])
+      |> Chart.on("Playing", "StopAll", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.StopAudioOnly])
+      // --- PlayingRef ---
+      |> Chart.on("PlayingRef", "TogglePlay", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.StopAudioOnly])
+      |> Chart.on("PlayingRef", "PlaybackEnded", TransportState.Idle)
+      |> Chart.on("PlayingRef", "PlayFailed", TransportState.Idle)
+      |> Chart.on("PlayingRef", "PlayRef", TransportState.PlayingRef)
+      |> Chart.leaves(&[TransportEffect.StopAudioOnly, TransportEffect.StartRefPlayback])
+      |> Chart.on("PlayingRef", "PlayFromCursor", TransportState.Playing)
+      |> Chart.leaves(&[TransportEffect.StopAudioOnly, TransportEffect.StartAudioPlayback])
+      |> Chart.on("PlayingRef", "ToggleRecord", TransportState.Recording)
+      |> Chart.leaves(&[TransportEffect.StopAudioOnly, TransportEffect.StartMicRecording])
+      |> Chart.on("PlayingRef", "ToggleDrill", TransportState.DrillPlayRef)
+      |> Chart.leaves(&[TransportEffect.StopAudioOnly, TransportEffect.StartDrillRefPlay])
+      |> Chart.on("PlayingRef", "ToggleEcho", TransportState.EchoListen)
+      |> Chart.leaves(&[TransportEffect.StopAudioOnly, TransportEffect.ArmPracticeMic])
+      |> Chart.on("PlayingRef", "StopAll", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.StopAudioOnly])
+      // --- Recording (Space/Pause OR Rec ALWAYS stops & saves — never starts playing!) ---
+      |> Chart.on("Recording", "ToggleRecord", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.StopAndSaveRecording])
+      |> Chart.on("Recording", "TogglePlay", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.StopAndSaveRecording])
+      |> Chart.on("Recording", "StopAll", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.StopAndSaveRecording])
+      |> Chart.on("Recording", "PlayRef", TransportState.PlayingRef)
+      |> Chart.leaves(&[TransportEffect.StopAndSaveRecording, TransportEffect.StartRefPlayback])
+      |> Chart.on("Recording", "ToggleDrill", TransportState.DrillPlayRef)
+      |> Chart.leaves(&[TransportEffect.StopAndSaveRecording, TransportEffect.StartDrillRefPlay])
+      |> Chart.on("Recording", "ToggleEcho", TransportState.EchoListen)
+      |> Chart.leaves(&[TransportEffect.StopAndSaveRecording, TransportEffect.ArmPracticeMic])
+      |> Chart.on("Recording", "MicFailed", TransportState.Idle)
+      // --- Scrubbing (WSOLA freeze-hold granular scrub) ---
+      |> Chart.on("Scrubbing", "ScrubEnd", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.StopScrubAudio])
+      |> Chart.on("Scrubbing", "StopAll", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.StopScrubAudio])
+      // --- Repeat Drill Cycle ---
+      |> Chart.on("DrillPlayRef", "PlaybackEnded", TransportState.DrillListen)
+      |> Chart.leaves(&[TransportEffect.ArmPracticeMic])
+      |> Chart.on("DrillPlayRef", "PlayFailed", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("DrillPlayRef", "ToggleDrill", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("DrillPlayRef", "TogglePlay", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("DrillPlayRef", "ToggleEcho", TransportState.EchoListen)
+      |> Chart.leaves(&[TransportEffect.AbortPractice, TransportEffect.ArmPracticeMic])
+      |> Chart.on("DrillPlayRef", "StopAll", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("DrillListen", "PracticeSpeechStarted", TransportState.DrillRecord)
+      |> Chart.leaves(&[TransportEffect.BeginPracticeRec])
+      |> Chart.on("DrillListen", "MicFailed", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("DrillListen", "ToggleDrill", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("DrillListen", "TogglePlay", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("DrillListen", "ToggleEcho", TransportState.EchoListen)
+      |> Chart.leaves(&[TransportEffect.AbortPractice, TransportEffect.ArmPracticeMic])
+      |> Chart.on("DrillListen", "StopAll", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("DrillRecord", "PracticeSilenceDone", TransportState.DrillCooldown)
+      |> Chart.leaves(&[TransportEffect.FinishPracticeRecOnly, TransportEffect.StartPracticeCooldown])
+      |> Chart.on("DrillRecord", "ToggleDrill", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("DrillRecord", "TogglePlay", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("DrillRecord", "StopAll", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("DrillCooldown", "PracticeCooldownDone", TransportState.DrillPlayRef)
+      |> Chart.leaves(&[TransportEffect.StartDrillRefPlay])
+      |> Chart.on("DrillCooldown", "ToggleDrill", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("DrillCooldown", "TogglePlay", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("DrillCooldown", "StopAll", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      // --- Echo Mirror Cycle ---
+      |> Chart.on("EchoListen", "PracticeSpeechStarted", TransportState.EchoRecord)
+      |> Chart.leaves(&[TransportEffect.BeginPracticeRec])
+      |> Chart.on("EchoListen", "MicFailed", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("EchoListen", "ToggleEcho", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("EchoListen", "TogglePlay", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("EchoListen", "ToggleDrill", TransportState.DrillPlayRef)
+      |> Chart.leaves(&[TransportEffect.AbortPractice, TransportEffect.StartDrillRefPlay])
+      |> Chart.on("EchoListen", "StopAll", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("EchoRecord", "PracticeSilenceDone", TransportState.EchoPlayback)
+      |> Chart.leaves(&[TransportEffect.FinishPracticeRecAndEcho])
+      |> Chart.on("EchoRecord", "ToggleEcho", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("EchoRecord", "TogglePlay", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("EchoRecord", "StopAll", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("EchoPlayback", "PlaybackEnded", TransportState.EchoCooldown)
+      |> Chart.leaves(&[TransportEffect.StartPracticeCooldown])
+      |> Chart.on("EchoPlayback", "ToggleEcho", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("EchoPlayback", "TogglePlay", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("EchoPlayback", "StopAll", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("EchoCooldown", "PracticeCooldownDone", TransportState.EchoListen)
+      |> Chart.leaves(&[TransportEffect.ArmPracticeMic])
+      |> Chart.on("EchoCooldown", "ToggleEcho", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("EchoCooldown", "TogglePlay", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+      |> Chart.on("EchoCooldown", "StopAll", TransportState.Idle)
+      |> Chart.leaves(&[TransportEffect.AbortPractice])
+  }
+}
+
+effect fn ignoreLoopBegin(err: TransitionLoopError) -> TransportSnapshot
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  drop err
+  return TransportSnapshot {
+    version: 2,
+    status: Status.Active,
+    value: TransportState.Idle,
+    context: TransportContext {},
+    mailbox: List<TransportEvent>.make(),
+    pending: List<TransportEffect>.make(),
+    clock: 0,
+    timers: List<Timer>.make(),
+  }
+}
+
+effect fn ignoreLoopSend(err: TransitionLoopError) -> bool {
+  drop err
+  return false
+}
+
+pub effect fn beginTransport() -> TransportSnapshot
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run Effect.catch<TransitionLoopError>(
+    Steps.begin<TransportState, TransportEvent, TransportContext, TransportEffect>(TransportContext {}, 0),
+    ignoreLoopBegin,
+  )
+}
+
+/// Sends an event into the transport statechart and drains the resulting ordered effects list.
+pub effect fn stepTransport(snap: &mut TransportSnapshot, event: TransportEvent) -> List<TransportEffect>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  drop run Effect.catch<TransitionLoopError>(
+    Steps.send<TransportState, TransportEvent, TransportContext, TransportEffect>(&mut snap.*, event),
+    ignoreLoopSend,
+  )
+  let mut effects = List<TransportEffect>.make()
+  while snap.pending.length() > 0 {
+    run effects.append(snap.pending.remove(0))
+  }
+  return move effects
+}
+
+pub fn isPlaying(s: TransportState) -> bool {
+  return match s {
+    TransportState.Playing => true
+    TransportState.PlayingRef => true
+    TransportState.DrillPlayRef => true
+    TransportState.EchoPlayback => true
+    _ => false
+  }
+}
+
+pub fn isPlayingUser(s: TransportState) -> bool {
+  return match s {
+    TransportState.Playing => true
+    _ => false
+  }
+}
+
+pub fn isPlayingRefOnly(s: TransportState) -> bool {
+  return match s {
+    TransportState.PlayingRef => true
+    TransportState.DrillPlayRef => true
+    _ => false
+  }
+}
+
+pub fn isRecording(s: TransportState) -> bool {
+  return match s {
+    TransportState.Recording => true
+    TransportState.DrillRecord => true
+    TransportState.EchoRecord => true
+    _ => false
+  }
+}
+
+pub fn isManualRecording(s: TransportState) -> bool {
+  return match s {
+    TransportState.Recording => true
+    _ => false
+  }
+}
+
+pub fn isPractice(s: TransportState) -> bool {
+  return match s {
+    TransportState.DrillPlayRef => true
+    TransportState.DrillListen => true
+    TransportState.DrillRecord => true
+    TransportState.DrillCooldown => true
+    TransportState.EchoListen => true
+    TransportState.EchoRecord => true
+    TransportState.EchoPlayback => true
+    TransportState.EchoCooldown => true
+    _ => false
+  }
+}
+
+pub fn isDrill(s: TransportState) -> bool {
+  return match s {
+    TransportState.DrillPlayRef => true
+    TransportState.DrillListen => true
+    TransportState.DrillRecord => true
+    TransportState.DrillCooldown => true
+    _ => false
+  }
+}
+
+pub fn isEcho(s: TransportState) -> bool {
+  return match s {
+    TransportState.EchoListen => true
+    TransportState.EchoRecord => true
+    TransportState.EchoPlayback => true
+    TransportState.EchoCooldown => true
+    _ => false
+  }
+}
