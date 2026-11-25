@@ -74,6 +74,7 @@ import overlays {
   GuideBadge,
   OverlayOptions,
   VowelBadge,
+  VowelChartDot,
   VowelSpan,
   appendFixed,
   buildLtasDrawing,
@@ -89,6 +90,9 @@ import overlays {
   computeGuideBadges,
   computeTimeTicks,
   computeVowelBadges,
+  computeVowelChartDots,
+  vowelF1OfY,
+  vowelF2OfX,
   formatCents,
   formatDb,
   formatHz,
@@ -183,11 +187,27 @@ pub const CTX_EXPLORER_ROOT: u32 = 7
 pub const CTX_LIB_SORT: u32 = 8
 pub const CTX_FORMANTS: u32 = 9
 pub const CTX_ISOLATE: u32 = 10
+pub const CTX_VOICE_LAB: u32 = 11
 
 // Vowel / consonant audio isolation modes
 pub const ISOLATE_FULL: u32 = 0
 pub const ISOLATE_VOWELS: u32 = 1
 pub const ISOLATE_CONSONANTS: u32 = 2
+
+// Isolation timing modes
+pub const TIMING_INPLACE: u32 = 0
+pub const TIMING_COMPACT: u32 = 1
+pub const TIMING_STRETCH: u32 = 2
+
+// Voice Lab source-filter audio transforms
+pub const LAB_OFF: u32 = 0
+pub const LAB_WHISPER: u32 = 1
+pub const LAB_MONOTONE: u32 = 2
+pub const LAB_GLOTTAL: u32 = 3
+pub const LAB_SOLO_F1: u32 = 4
+pub const LAB_SOLO_F2: u32 = 5
+pub const LAB_SOLO_F3: u32 = 6
+pub const LAB_BREATH: u32 = 7
 
 // Virtualized Explorer row layout metrics (Glint 26px crisp single-line rows)
 pub const EXPLORER_ROW_H: f32 = 26.0
@@ -390,13 +410,21 @@ pub union Message {
   ToggleNeural,
   NeuralReady { pub jobId: i32, pub isRef: bool, pub hasPitch: bool, pub hasFormants: bool },
   NeuralStatus { pub flags: i32 },
-  // Vowel / consonant isolation & lazy Allosaurus neural IPA upgrade
+  // Vowel / consonant isolation, TD-PSOLA stretch, Voice Lab & Klatt vowel synth
   SetIsolateMode { pub mode: u32 },
-  SetIsolateCompact { pub compact: bool },
+  SetIsolateTiming { pub timing: u32 },
+  SetVoiceLabMode { pub mode: u32 },
   SetNeuralPhonemes { pub enabled: bool },
   ToggleNeuralPhonemes,
   ToggleVowelOverlay,
   PhonemesReady { pub jobId: i32, pub isRef: bool },
+  SelectVowelSpan { pub idx: usize },
+  StepVowelSpan { pub delta: i32 },
+  PlayKlattAtCursor,
+  PlayKlattAtRef,
+  PlayKlattAtSelection,
+  ClickVowelChart { pub x: f32, pub y: f32 },
+  VowelChartLayout { pub rect: Rect<f32> },
   // Hear in your voice (source-filter preview resynthesis)
   ToggleVoicePreview,
   PlaySynthAdjusted,
@@ -737,9 +765,10 @@ pub struct Overtone {
   pub refNeuralGen: i32,
   pub neuralStatusFlags: i32,
 
-  // Vowel / consonant isolation (Option 1 instant acoustic + Option 2 lazy Allosaurus IPA)
+  // Vowel / consonant isolation (Option 1 instant acoustic + Option 2 lazy Allosaurus IPA) & Voice Lab
   pub isolateMode: u32,
-  pub isolateCompact: bool,
+  pub isolateTiming: u32,
+  pub voiceLabMode: u32,
   pub useNeuralPhonemes: bool,
   pub showVowelRegions: bool,
   pub takePhoneGen: i32,
@@ -749,6 +778,8 @@ pub struct Overtone {
   pub takeVowelSpans: List<VowelSpan>,
   pub refVowelSpans: List<VowelSpan>,
   pub vowelBadges: List<VowelBadge>,
+  pub vowelChartDots: List<VowelChartDot>,
+  pub vowelChartRect: Rect<f32>,
 
   // Hear in your voice (Pitch / Size / Weight preview resynthesis)
   pub showVoicePreview: bool,
@@ -1095,7 +1126,8 @@ impl Overtone {
       neuralStatusFlags: 0,
 
       isolateMode: ISOLATE_FULL,
-      isolateCompact: false,
+      isolateTiming: TIMING_INPLACE,
+      voiceLabMode: LAB_OFF,
       useNeuralPhonemes: false,
       showVowelRegions: false,
       takePhoneGen: 0,
@@ -1105,6 +1137,8 @@ impl Overtone {
       takeVowelSpans: List<VowelSpan>.make(),
       refVowelSpans: List<VowelSpan>.make(),
       vowelBadges: List<VowelBadge>.make(),
+      vowelChartDots: List<VowelChartDot>.make(),
+      vowelChartRect: Rect<f32> { xMin: 0.0, yMin: 0.0, xMax: 268.0, yMax: VOWEL_H },
 
       showVoicePreview: false,
       enablePinchZoom: false,
@@ -2660,7 +2694,7 @@ impl Overtone {
       }
       run self.pullVowelSpansFromHost(false)
     }
-    run self.updateViewportDrawings()
+    run self.rebuildDrawings(false)
   }
 
   fn requestNeuralForTake(self: &mut Self) -> () {
@@ -3825,6 +3859,16 @@ impl Overtone {
     }
   }
 
+  fn monoTargetHz(self: &Self) -> f64 {
+    if self.refClip.active && self.refClip.summary.medianF0 > 55.0 {
+      return self.refClip.summary.medianF0
+    }
+    if self.voiceMetrics.summary.medianF0 > 55.0 {
+      return self.voiceMetrics.summary.medianF0
+    }
+    return 195.0
+  }
+
   effect fn doStartPlayback(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
@@ -3849,8 +3893,19 @@ impl Overtone {
     }
     let sr = self.gpuSampleRate()
     let onRef = self.isPlottingOnRef()
-    let started = if self.isolateMode != ISOLATE_FULL {
-      audio_native.playFiltered(onRef, self.gpuSamples(), sr, startSec, endSec, self.loopSelection, self.isolateMode, self.isolateCompact)
+    let started = if self.isolateMode != ISOLATE_FULL || self.voiceLabMode != LAB_OFF {
+      audio_native.playFiltered(
+        onRef,
+        self.gpuSamples(),
+        sr,
+        startSec,
+        endSec,
+        self.loopSelection,
+        self.isolateMode,
+        self.isolateTiming,
+        self.voiceLabMode,
+        self.monoTargetHz(),
+      )
     } else {
       audio_native.playRange(self.gpuSamples(), sr, startSec, endSec, self.loopSelection)
     }
@@ -3869,8 +3924,19 @@ impl Overtone {
       run self.sendTransport(TransportEvent.PlayFailed)
       return ()
     }
-    let started = if self.isolateMode != ISOLATE_FULL {
-      audio_native.playFiltered(true, self.refClip.samples.asSlice(), self.refClip.sampleRate, 0.0, self.refClip.durationSec, false, self.isolateMode, self.isolateCompact)
+    let started = if self.isolateMode != ISOLATE_FULL || self.voiceLabMode != LAB_OFF {
+      audio_native.playFiltered(
+        true,
+        self.refClip.samples.asSlice(),
+        self.refClip.sampleRate,
+        0.0,
+        self.refClip.durationSec,
+        false,
+        self.isolateMode,
+        self.isolateTiming,
+        self.voiceLabMode,
+        self.monoTargetHz(),
+      )
     } else {
       audio_native.playRange(self.refClip.samples.asSlice(), self.refClip.sampleRate, 0.0, self.refClip.durationSec, false)
     }
@@ -4271,12 +4337,20 @@ impl Overtone {
         ffOpt,
         self.voiceMetrics.frames.asSlice(),
         self.voiceMetrics.summary,
+        self.takeVowelSpans.asSlice(),
         self.refClip.voiceFrames.asSlice(),
         self.refClip.summary,
+        self.refVowelSpans.asSlice(),
         self.compare.points.asSlice(),
         inspectSec,
         self.refClip.active,
         self.vowelMode,
+      )
+      self.vowelChartDots = run computeVowelChartDots(
+        self.takeVowelSpans.asSlice(),
+        self.voiceMetrics.frames.asSlice(),
+        rightPlotW,
+        VOWEL_H,
       )
     }
   }
@@ -4485,12 +4559,20 @@ impl Overtone {
       ffOpt,
       self.voiceMetrics.frames.asSlice(),
       self.voiceMetrics.summary,
+      self.takeVowelSpans.asSlice(),
       self.refClip.voiceFrames.asSlice(),
       self.refClip.summary,
+      self.refVowelSpans.asSlice(),
       self.compare.points.asSlice(),
       inspectSec,
       self.refClip.active,
       self.vowelMode,
+    )
+    self.vowelChartDots = run computeVowelChartDots(
+      self.takeVowelSpans.asSlice(),
+      self.voiceMetrics.frames.asSlice(),
+      rightPlotW,
+      VOWEL_H,
     )
     self.overviewDrawing = run buildWaveformOverview(
       self.gpuSamples(),
@@ -4911,7 +4993,7 @@ impl Overtone {
             run self.sendTransport(TransportEvent.StopAll)
           }
           audio_native.playStop()
-          if self.isolateMode != ISOLATE_FULL {
+          if self.isolateMode != ISOLATE_FULL || self.voiceLabMode != LAB_OFF {
             drop audio_native.playFiltered(
               true,
               self.refClip.samples.asSlice(),
@@ -4920,7 +5002,9 @@ impl Overtone {
               self.selCompare.refEnd,
               false,
               self.isolateMode,
-              self.isolateCompact,
+              self.isolateTiming,
+              self.voiceLabMode,
+              self.monoTargetHz(),
             )
           } else {
             drop audio_native.playRange(
@@ -6136,15 +6220,31 @@ impl Overtone {
         run self.updateViewportDrawings()
       }
 
-      Message.SetIsolateCompact { compact } => {
-        if self.isolateCompact != compact {
-          self.isolateCompact = compact
+      Message.SetIsolateTiming { timing } => {
+        if self.isolateTiming != timing {
+          self.isolateTiming = timing
+          // Auto-switch from Full -> Vowels if user picked Compact or Stretch timing!
+          if timing != TIMING_INPLACE && self.isolateMode == ISOLATE_FULL {
+            self.isolateMode = ISOLATE_VOWELS
+            run self.updateViewportDrawings()
+          }
           if self.playing && self.isolateMode != ISOLATE_FULL {
             if self.playingRefOnly {
               run self.doStartRefPlayback()
             } else {
               run self.doStartPlayback()
             }
+          }
+        }
+      }
+
+      Message.SetVoiceLabMode { mode } => {
+        self.voiceLabMode = mode
+        if self.playing {
+          if self.playingRefOnly {
+            run self.doStartRefPlayback()
+          } else {
+            run self.doStartPlayback()
           }
         }
       }
@@ -6157,7 +6257,7 @@ impl Overtone {
           if self.refClip.active {
             run self.refreshVowelAnalysis(true)
           }
-          run self.updateViewportDrawings()
+          run self.rebuildDrawings(false)
         }
       }
 
@@ -6168,7 +6268,7 @@ impl Overtone {
         if self.refClip.active {
           run self.refreshVowelAnalysis(true)
         }
-        run self.updateViewportDrawings()
+        run self.rebuildDrawings(false)
       }
 
       Message.ToggleVowelOverlay => {
@@ -6178,6 +6278,173 @@ impl Overtone {
 
       Message.PhonemesReady { jobId, isRef } => {
         run self.applyPhonemesReady(jobId, isRef)
+      }
+
+      Message.SelectVowelSpan { idx } => {
+        let onRef = self.isPlottingOnRef()
+        let spans = if onRef { self.refVowelSpans.asSlice() } else { self.takeVowelSpans.asSlice() }
+        if idx < spans.length {
+          let t0 = spans[idx].t0
+          let t1 = spans[idx].t1
+          self.hasSelection = true
+          self.selStart = t0
+          self.selEnd = t1
+          self.cursorSec = t0
+          self.loopSelection = true
+          self.ctxMenuKind = CTX_NONE
+          run self.updateSelectionReadout()
+          run self.rebuildDrawings(true)
+          if self.playing && !self.playingRefOnly {
+            run self.doStartPlayback()
+          } else {
+            run self.sendTransport(TransportEvent.TogglePlay)
+          }
+        }
+      }
+
+      Message.StepVowelSpan { delta } => {
+        let onRef = self.isPlottingOnRef()
+        let spans = if onRef { self.refVowelSpans.asSlice() } else { self.takeVowelSpans.asSlice() }
+        if spans.length > 0 {
+          let curMid = if self.hasSelection { 0.5 * (self.selStart + self.selEnd) } else { self.cursorSec }
+          let mut bestIdx: usize = 0
+          let mut bestDist = 1e9
+          let mut i: usize = 0
+          while i < spans.length {
+            let m = 0.5 * (spans[i].t0 + spans[i].t1)
+            let d = f64.abs(m - curMid)
+            if d < bestDist {
+              bestDist = d
+              bestIdx = i
+            }
+            i = i + 1
+          }
+          let nextIdx: usize = if delta < 0 {
+            if bestIdx > 0 { bestIdx - 1 } else { spans.length - 1 }
+          } else {
+            if bestIdx + 1 < spans.length { bestIdx + 1 } else { 0 }
+          }
+          run self.handleMessage(Message.SelectVowelSpan { idx: nextIdx })
+        }
+      }
+
+      Message.PlayKlattAtCursor => {
+        let mut f0 = if self.voiceMetrics.summary.medianF0 > 55.0 { self.voiceMetrics.summary.medianF0 } else { 195.0 }
+        let mut f1 = if self.voiceMetrics.summary.formantCount > 0 { self.voiceMetrics.summary.meanF1 } else { 520.0 }
+        let mut f2 = if self.voiceMetrics.summary.formantCount > 0 { self.voiceMetrics.summary.meanF2 } else { 1650.0 }
+        let mut f3 = 2750.0
+        let mut f4 = 3650.0
+        let tilt = self.voiceMetrics.summary.medianH1H2Db * 0.45
+        if let Option<PitchFrame>.Some { value: pf } = self.pitchTrack.nearest(self.cursorSec) {
+          if pf.voiced && pf.frequency > 55.0 { f0 = pf.frequency }
+        }
+        if let Option<FormantFrame>.Some { value: ff } = self.formantTrack.nearest(self.cursorSec) {
+          if ff.tracked && ff.f1 > 160.0 && ff.f2 > ff.f1 + 120.0 {
+            f1 = ff.f1
+            f2 = ff.f2
+            if ff.f3 > ff.f2 + 180.0 { f3 = ff.f3 }
+            if ff.f4 > f3 + 350.0 { f4 = ff.f4 }
+          }
+        }
+        drop audio_native.klattPlay(f0, f1, f2, f3, f4, 0.65, tilt)
+      }
+
+      Message.PlayKlattAtRef => {
+        if self.refClip.active {
+          let mut f0 = if self.refClip.summary.medianF0 > 55.0 { self.refClip.summary.medianF0 } else { 210.0 }
+          let mut f1 = if self.refClip.summary.formantCount > 0 { self.refClip.summary.meanF1 } else { 520.0 }
+          let mut f2 = if self.refClip.summary.formantCount > 0 { self.refClip.summary.meanF2 } else { 1750.0 }
+          let mut f3 = 2850.0
+          let tilt = self.refClip.summary.medianH1H2Db * 0.45
+          // Prefer Ref's aligned frame at cursor if available
+          let pts = self.compare.points.asSlice()
+          let mut bestDist = 1e9
+          let mut i: usize = 0
+          while i < pts.length {
+            let d = f64.abs(pts[i].time - self.cursorSec)
+            if d < bestDist && pts[i].voiced {
+              bestDist = d
+              if pts[i].f0 > 55.0 { f0 = pts[i].f0 }
+              if pts[i].hasFormants && pts[i].f1 > 160.0 && pts[i].f2 > pts[i].f1 + 120.0 {
+                f1 = pts[i].f1
+                f2 = pts[i].f2
+                f3 = f64.max(f2 + 520.0, 2800.0)
+              }
+            }
+            i = i + 1
+          }
+          drop audio_native.klattPlay(f0, f1, f2, f3, f3 + 850.0, 0.65, tilt)
+        }
+      }
+
+      Message.PlayKlattAtSelection => {
+        if self.hasSelection {
+          let lo = f64.min(self.selStart, self.selEnd)
+          let hi = f64.max(self.selStart, self.selEnd)
+          let margin = f64.min(0.015, (hi - lo) * 0.15)
+          let a = lo + margin
+          let b = hi - margin
+          let mut sf0 = 0.0
+          let mut cf0: usize = 0
+          let mut sf1 = 0.0
+          let mut sf2 = 0.0
+          let mut sf3 = 0.0
+          let mut sf4 = 0.0
+          let mut cfmt: usize = 0
+          let pfs = self.pitchTrack.frames.asSlice()
+          let mut i: usize = 0
+          while i < pfs.length {
+            if pfs[i].time >= a && pfs[i].time <= b && pfs[i].voiced && pfs[i].frequency > 55.0 {
+              sf0 = sf0 + pfs[i].frequency
+              cf0 = cf0 + 1
+            }
+            i = i + 1
+          }
+          let ffs = self.formantTrack.frames.asSlice()
+          i = 0
+          while i < ffs.length {
+            if ffs[i].time >= a && ffs[i].time <= b && ffs[i].tracked && ffs[i].f1 > 160.0 && ffs[i].f2 > ffs[i].f1 + 120.0 {
+              sf1 = sf1 + ffs[i].f1
+              sf2 = sf2 + ffs[i].f2
+              sf3 = sf3 + (if ffs[i].f3 > ffs[i].f2 + 180.0 { ffs[i].f3 } else { 2750.0 })
+              sf4 = sf4 + (if ffs[i].f4 > 3100.0 { ffs[i].f4 } else { 3650.0 })
+              cfmt = cfmt + 1
+            }
+            i = i + 1
+          }
+          let f0 = if cf0 > 0 { sf0 / usize.toF64(cf0) } else if self.voiceMetrics.summary.medianF0 > 55.0 { self.voiceMetrics.summary.medianF0 } else { 195.0 }
+          let f1 = if cfmt > 0 { sf1 / usize.toF64(cfmt) } else { 520.0 }
+          let f2 = if cfmt > 0 { sf2 / usize.toF64(cfmt) } else { 1650.0 }
+          let f3 = if cfmt > 0 { sf3 / usize.toF64(cfmt) } else { 2750.0 }
+          let f4 = if cfmt > 0 { sf4 / usize.toF64(cfmt) } else { 3650.0 }
+          let tilt = self.voiceMetrics.summary.medianH1H2Db * 0.45
+          drop audio_native.klattPlay(f0, f1, f2, f3, f4, 0.72, tilt)
+        } else {
+          run self.handleMessage(Message.PlayKlattAtCursor)
+        }
+      }
+
+      Message.VowelChartLayout { rect } => {
+        self.vowelChartRect = rect
+      }
+
+      Message.ClickVowelChart { x, y } => {
+        let rx = x - self.vowelChartRect.xMin
+        let ry = y - self.vowelChartRect.yMin
+        let w = f32.max(120.0, self.vowelChartRect.width())
+        let h = f32.max(60.0, self.vowelChartRect.height())
+        let f2 = vowelF2OfX(rx, w)
+        let f1 = vowelF1OfY(ry, h)
+        let f3 = f64.max(f2 + 420.0, if self.vowelMode == 1 { 2520.0 } else { 2880.0 })
+        let f0 = if self.voiceMetrics.summary.medianF0 > 55.0 {
+          self.voiceMetrics.summary.medianF0
+        } else if self.vowelMode == 1 {
+          125.0
+        } else {
+          215.0
+        }
+        let tilt = self.voiceMetrics.summary.medianH1H2Db * 0.45
+        drop audio_native.klattPlay(f0, f1, f2, f3, f3 + 850.0, 0.58, tilt)
       }
 
       Message.ToggleVoicePreview => {
@@ -6312,11 +6579,20 @@ impl Overtone {
       }
 
       Message.ApplyVowelGuides { idx, useMasc } => {
-        if !self.clickVowelAddsGuides {
-          return ()
-        }
         if idx < VOWELS_FEM.length {
           let v = if useMasc { VOWELS_MASC[idx] } else { VOWELS_FEM[idx] }
+          // Always audition the clicked Hillenbrand IPA target through the Klatt formant synth!
+          let f0 = if self.voiceMetrics.summary.medianF0 > 55.0 {
+            self.voiceMetrics.summary.medianF0
+          } else if useMasc {
+            125.0
+          } else {
+            215.0
+          }
+          drop audio_native.klattPlay(f0, v.f1, v.f2, v.f3, v.f3 + 850.0, 0.62, self.voiceMetrics.summary.medianH1H2Db * 0.4)
+          if !self.clickVowelAddsGuides {
+            return ()
+          }
           self.guides.clear()
           run self.guides.append(v.f1)
           run self.guides.append(v.f2)

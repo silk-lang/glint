@@ -11,6 +11,7 @@ import {
   buildIsolatedAudio,
   mapCompactTimeToSource,
 } from "./vowel-isolator.js";
+import { synthesizeKlattVowel, applyVoiceLabTransform } from "./voice-lab.js";
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
@@ -1423,6 +1424,13 @@ const glintImports = {
       acoustic,
       spans: acoustic.spans,
       isNeural: false,
+      f0Times,
+      f0Hz,
+      f0Conf,
+      fmtTimes,
+      fmtF1,
+      fmtF2,
+      fmtF3,
     };
 
     if (wantNeural && neuralWorker) {
@@ -1462,27 +1470,60 @@ const glintImports = {
     }
     return n;
   },
-  ov_play_filtered: (isRef, samplesPtr, count, sampleRate, startSec, endSec, loop, mode, compact) => {
+  ov_play_filtered: (isRef, samplesPtr, count, sampleRate, startSec, endSec, loop, mode, timingMode, labMode, targetMonoHz) => {
     if (count < 64 || sampleRate <= 0) return 0;
-    const pcm = readF32Copy(samplesPtr, count);
-    if (mode === 0) {
-      return startPlayback(pcm, sampleRate, startSec, endSec, loop !== 0, null);
-    }
+    let pcm = readF32Copy(samplesPtr, count);
     const slot = isRef ? 1 : 0;
     let st = vowelSlots[slot];
-    if (!st || !st.acoustic || Math.abs(st.acoustic.durationSec - count / sampleRate) > 0.08) {
+    if (mode !== 0 && (!st || !st.acoustic || Math.abs(st.acoustic.durationSec - count / sampleRate) > 0.08)) {
       const ac = computeAcousticVowelAnalysis(pcm, sampleRate);
-      st = { jobId: 0, acoustic: ac, spans: ac.spans, isNeural: false };
+      st = {
+        jobId: 0,
+        acoustic: ac,
+        spans: ac.spans,
+        isNeural: false,
+        f0Times: st?.f0Times || null,
+        f0Hz: st?.f0Hz || null,
+        f0Conf: st?.f0Conf || null,
+        fmtTimes: st?.fmtTimes || null,
+        fmtF1: st?.fmtF1 || null,
+        fmtF2: st?.fmtF2 || null,
+        fmtF3: st?.fmtF3 || null,
+      };
       vowelSlots[slot] = st;
+    }
+
+    // Stage 1: Voice Lab acoustic transform (Whisperize, Monotone, Glottal, Solo F1/F2/F3, Breathiness)
+    if (labMode > 0) {
+      pcm = applyVoiceLabTransform(
+        pcm,
+        sampleRate,
+        labMode,
+        st?.f0Times || null,
+        st?.f0Hz || null,
+        st?.f0Conf || null,
+        st?.fmtTimes || null,
+        st?.fmtF1 || null,
+        st?.fmtF2 || null,
+        st?.fmtF3 || null,
+        targetMonoHz || 0.0,
+      );
+    }
+
+    // Stage 2: Vowel / Consonant isolation + Timing (0=In-place, 1=Compact, 2=TD-PSOLA Stretch/Hold)
+    if (mode === 0) {
+      return startPlayback(pcm, sampleRate, startSec, endSec, loop !== 0, null);
     }
     const iso = buildIsolatedAudio(
       pcm,
       sampleRate,
       st.spans,
       mode,
-      compact !== 0,
+      timingMode | 0,
       startSec,
       endSec,
+      st?.f0Times || null,
+      st?.f0Hz || null,
     );
     return startPlayback(
       iso.samples,
@@ -1493,9 +1534,41 @@ const glintImports = {
       iso.timeMap,
     );
   },
+  ov_klatt_play: (f0, f1, f2, f3, f4, durSec, tiltDb) => {
+    try {
+      const ctx = ensureAudioCtx();
+      const sr = ctx.sampleRate || 48000;
+      const samples = synthesizeKlattVowel(f0, f1, f2, f3, f4, durSec, tiltDb, sr);
+      if (klattNode) {
+        try {
+          klattNode.stop();
+          klattNode.disconnect();
+        } catch {}
+        klattNode = null;
+      }
+      const buf = ctx.createBuffer(1, samples.length, Math.round(sr));
+      buf.copyToChannel(samples, 0);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      const gain = ctx.createGain();
+      gain.gain.value = audioState.volume;
+      src.connect(gain);
+      gain.connect(ctx.destination);
+      klattNode = src;
+      src.onended = () => {
+        if (klattNode === src) klattNode = null;
+      };
+      src.start();
+      return 1;
+    } catch (err) {
+      console.warn("[Prism Klatt] Vowel synthesis failed:", err);
+      return 0;
+    }
+  },
 };
 
 let synthAudio = null;
+let klattNode = null;
 const vowelSlots = [
   { jobId: 0, acoustic: null, spans: [], isNeural: false },
   { jobId: 0, acoustic: null, spans: [], isNeural: false },

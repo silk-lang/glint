@@ -86,8 +86,17 @@ pub struct VowelSpan {
 }
 
 pub struct VowelBadge {
+  pub idx: usize,
   pub x: f32,
   pub w: f32,
+  pub hasLabel: bool,
+  pub label: String,
+}
+
+pub struct VowelChartDot {
+  pub idx: usize,
+  pub x: f32,
+  pub y: f32,
   pub label: String,
 }
 
@@ -1046,15 +1055,24 @@ pub effect fn computeVowelBadges(
   let mut i: usize = 0
   while i < spans.length {
     let sp = &spans[i]
-    let lbl = String.view(&sp.label)
-    if String.byteLength(lbl) > 0 && sp.t1 >= vp.t0 && sp.t0 <= vp.t1 {
+    if sp.t1 >= vp.t0 && sp.t0 <= vp.t1 {
       let x0 = f32.max(0.0, f32.min(width, xOfTime(vp, sp.t0, width)))
       let x1 = f32.max(0.0, f32.min(width, xOfTime(vp, sp.t1, width)))
       let w = x1 - x0
-      let cx = 0.5 * (x0 + x1)
-      if w >= 8.0 && cx - 8.0 >= lastRight && cx <= width - 12.0 {
-        run out.append(VowelBadge { x: x0, w: f32.max(16.0, w), label: run String.copy(lbl) })
-        lastRight = x0 + f32.max(16.0, w) + 2.0
+      let lbl = String.view(&sp.label)
+      let hasLbl = String.byteLength(lbl) > 0
+      let pillW = f32.max(if hasLbl { 16.0 } else { 12.0 }, w)
+      if w >= 6.0 && x0 >= lastRight - 2.0 && x0 <= width - 10.0 {
+        run out.append(
+          VowelBadge {
+            idx: i,
+            x: x0,
+            w: pillW,
+            hasLabel: hasLbl,
+            label: if hasLbl { run String.copy(lbl) } else { run String.copy("•") },
+          },
+        )
+        lastRight = x0 + pillW + 2.0
       }
     }
     i = i + 1
@@ -1535,14 +1553,87 @@ fn nearestAlignedAt(alignedRef: &[AlignedRefPoint], t: f64) -> Option<AlignedRef
   return Option<AlignedRefPoint>.None
 }
 
+pub fn vowelF2OfX(x: f32, width: f32) -> f64 {
+  let u = f64.max(0.04, f64.min(0.96, f32.toF64(x / f32.max(1.0, width))))
+  return 3100.0 - u * 2450.0
+}
+
+pub fn vowelF1OfY(y: f32, height: f32) -> f64 {
+  let u = f64.max(0.06, f64.min(0.92, f32.toF64(y / f32.max(1.0, height))))
+  return 220.0 + u * 800.0
+}
+
+fn isTimeInVowelCore(t: f64, spans: &[VowelSpan]) -> bool {
+  let mut i: usize = 0
+  while i < spans.length {
+    let sp = &spans[i]
+    let dur = sp.t1 - sp.t0
+    let margin = f64.min(0.015, dur * 0.14)
+    if t >= sp.t0 + margin && t <= sp.t1 - margin {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+pub effect fn computeVowelChartDots(
+  spans: &[VowelSpan],
+  frames: &[VoiceFrame],
+  width: f32,
+  height: f32,
+) -> List<VowelChartDot>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<VowelChartDot>.make()
+  if width <= 16.0 || height <= 16.0 || spans.length == 0 || frames.length == 0 {
+    return move out
+  }
+  let mut i: usize = 0
+  while i < spans.length {
+    let sp = &spans[i]
+    let lbl = String.view(&sp.label)
+    if String.byteLength(lbl) > 0 {
+      let dur = sp.t1 - sp.t0
+      let margin = f64.min(0.016, dur * 0.18)
+      let lo = sp.t0 + margin
+      let hi = sp.t1 - margin
+      let mut sumF1 = 0.0
+      let mut sumF2 = 0.0
+      let mut cnt: usize = 0
+      let mut k: usize = 0
+      while k < frames.length {
+        let tf = frames[k]
+        if tf.time >= lo && tf.time <= hi && tf.voiced && tf.hasFormants && tf.f1 > 170.0 && tf.f2 > tf.f1 + 120.0 {
+          sumF1 = sumF1 + tf.f1
+          sumF2 = sumF2 + tf.f2
+          cnt = cnt + 1
+        }
+        k = k + 1
+      }
+      if cnt > 0 {
+        let mf1 = sumF1 / usize.toF64(cnt)
+        let mf2 = sumF2 / usize.toF64(cnt)
+        let vx = f32.max(6.0, f32.min(width - 18.0, vowelX(mf2, width) - 5.0))
+        let vy = f32.max(4.0, f32.min(height - 14.0, vowelY(mf1, height) - 6.0))
+        run out.append(VowelChartDot { idx: i, x: vx, y: vy, label: run String.copy(lbl) })
+      }
+    }
+    i = i + 1
+  }
+  return move out
+}
+
 pub effect fn buildVowelChartDrawing(
   width: f32,
   height: f32,
   formant: Option<FormantFrame>,
   takeFrames: &[VoiceFrame],
   takeSummary: VoiceSummary,
+  takeVowelSpans: &[VowelSpan],
   refFrames: &[VoiceFrame],
   refSummary: VoiceSummary,
+  refVowelSpans: &[VowelSpan],
   alignedRef: &[AlignedRefPoint],
   inspectSec: f64,
   hasRef: bool,
@@ -1620,13 +1711,23 @@ pub effect fn buildVowelChartDrawing(
     run cmds.append(CanvasCommand.Stroke { color: Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 0.14 }, width: 0.8 })
   }
 
-  // Whole-sentence Reference vowel cloud (crisp steel-teal goal!) + soft halo + ringed centroid
+  // Whole-sentence Reference vowel cloud (filtered to detected vowel cores!) + soft halo + ringed centroid
+  let mut refMeanF1 = refSummary.meanF1
+  let mut refMeanF2 = refSummary.meanF2
+  let mut hasRefCentroid = hasRef && refSummary.formantCount > 0
   if hasRef && refFrames.length > 0 {
-    let step = if refFrames.length > 160 { refFrames.length / 160 } else { 1 }
+    let filterRef = refVowelSpans.length > 0
+    let mut sumRf1 = 0.0
+    let mut sumRf2 = 0.0
+    let mut cntRf: usize = 0
+    let step = if refFrames.length > 180 { refFrames.length / 180 } else { 1 }
     let mut k: usize = 0
     while k < refFrames.length {
       let rf = refFrames[k]
-      if rf.voiced && rf.hasFormants {
+      if rf.voiced && rf.hasFormants && (!filterRef || isTimeInVowelCore(rf.time, refVowelSpans)) {
+        sumRf1 = sumRf1 + rf.f1
+        sumRf2 = sumRf2 + rf.f2
+        cntRf = cntRf + 1
         let rx = vowelX(rf.f2, width)
         let ry = vowelY(rf.f1, height)
         run cmds.append(
@@ -1636,15 +1737,20 @@ pub effect fn buildVowelChartDrawing(
             width: 4.0,
             height: 4.0,
             radius: 2.0,
-            color: Rgba<f32> { r: 0.180, g: 0.490, b: 0.588, a: 0.34 },
+            color: Rgba<f32> { r: 0.180, g: 0.490, b: 0.588, a: 0.36 },
           },
         )
       }
       k = k + step
     }
-    if refSummary.formantCount > 0 {
-      let rcx = vowelX(refSummary.meanF2, width)
-      let rcy = vowelY(refSummary.meanF1, height)
+    if cntRf > 0 {
+      refMeanF1 = sumRf1 / usize.toF64(cntRf)
+      refMeanF2 = sumRf2 / usize.toF64(cntRf)
+      hasRefCentroid = true
+    }
+    if hasRefCentroid {
+      let rcx = vowelX(refMeanF2, width)
+      let rcy = vowelY(refMeanF1, height)
       run cmds.append(
         CanvasCommand.FillRect {
           x: rcx - 11.0,
@@ -1678,35 +1784,45 @@ pub effect fn buildVowelChartDrawing(
     }
   }
 
-  // Whole-sentence Your Take vowel cloud (ink 16%) + solid #0B0B0C centroid
+  // Whole-sentence Your Take vowel cloud (filtered to detected vowel cores!) + solid #0B0B0C centroid
   if takeFrames.length > 0 {
-    let step = if takeFrames.length > 160 { takeFrames.length / 160 } else { 1 }
+    let filterTake = takeVowelSpans.length > 0
+    let mut sumTf1 = 0.0
+    let mut sumTf2 = 0.0
+    let mut cntTf: usize = 0
+    let step = if takeFrames.length > 180 { takeFrames.length / 180 } else { 1 }
     let mut k: usize = 0
     while k < takeFrames.length {
       let tf = takeFrames[k]
-      if tf.voiced && tf.hasFormants {
+      if tf.voiced && tf.hasFormants && (!filterTake || isTimeInVowelCore(tf.time, takeVowelSpans)) {
+        sumTf1 = sumTf1 + tf.f1
+        sumTf2 = sumTf2 + tf.f2
+        cntTf = cntTf + 1
         let tx = vowelX(tf.f2, width)
         let ty = vowelY(tf.f1, height)
         run cmds.append(
           CanvasCommand.FillRect {
-            x: tx - 1.6,
-            y: ty - 1.6,
-            width: 3.2,
-            height: 3.2,
-            radius: 1.6,
-            color: Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 0.16 },
+            x: tx - 1.8,
+            y: ty - 1.8,
+            width: 3.6,
+            height: 3.6,
+            radius: 1.8,
+            color: Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 0.22 },
           },
         )
       }
       k = k + step
     }
-    if takeSummary.formantCount > 0 {
-      let tcx = vowelX(takeSummary.meanF2, width)
-      let tcy = vowelY(takeSummary.meanF1, height)
+    let hasTakeCentroid = cntTf > 0 || takeSummary.formantCount > 0
+    let takeMeanF1 = if cntTf > 0 { sumTf1 / usize.toF64(cntTf) } else { takeSummary.meanF1 }
+    let takeMeanF2 = if cntTf > 0 { sumTf2 / usize.toF64(cntTf) } else { takeSummary.meanF2 }
+    if hasTakeCentroid {
+      let tcx = vowelX(takeMeanF2, width)
+      let tcy = vowelY(takeMeanF1, height)
       // Vermilion shift vector from Take -> Ref when both exist
-      if hasRef && refSummary.formantCount > 0 {
-        let rcx = vowelX(refSummary.meanF2, width)
-        let rcy = vowelY(refSummary.meanF1, height)
+      if hasRefCentroid {
+        let rcx = vowelX(refMeanF2, width)
+        let rcy = vowelY(refMeanF1, height)
         run cmds.append(CanvasCommand.MoveTo { x: tcx, y: tcy })
         run cmds.append(CanvasCommand.LineTo { x: rcx, y: rcy })
         run cmds.append(CanvasCommand.Stroke { color: COL_VERMILION, width: 1.3 })

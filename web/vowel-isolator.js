@@ -1,7 +1,8 @@
 // Prism Vowel & Consonant Isolation Engine
 // Option 1: Instant (<10 ms) acoustic + SwiftF0 voicing + FormantsTracker vowel nucleus detector
 // Option 2: Refines Allosaurus neural IPA phone events onto exact acoustic boundaries
-// Audio filter: Click-free raised-cosine in-place gating OR compacted vowel stitching with playhead map
+// Audio filter: Click-free raised-cosine in-place gating, compact stitching, OR TD-PSOLA vowel stretch/hold
+import { stretchVowelSegmentPsola } from "./voice-lab.js";
 
 function makeFftTables(n) {
   const bits = Math.round(Math.log2(n));
@@ -507,13 +508,26 @@ export function refineNeuralPhonemeSpans(phones, acoustic) {
 /**
  * Builds isolated playback audio from `samples` and vowel `spans`.
  * mode: 0 = Full, 1 = Vowels only, 2 = Consonants only
- * compact: false = In-place (exact original timing), true = Compacted (stitched segments + timeMap)
+ * timingMode: 0 = In-place (exact original timing), 1 = Compact (stitched segments),
+ *             2 = Stretch / Hold (TD-PSOLA pitch-locked stretch to >= 0.48s per vowel!)
  */
-export function buildIsolatedAudio(samples, sampleRate, spans, mode, compact, rangeStartSec = 0, rangeEndSec = -1) {
+export function buildIsolatedAudio(
+  samples,
+  sampleRate,
+  spans,
+  mode,
+  timingMode,
+  rangeStartSec = 0,
+  rangeEndSec = -1,
+  f0Times = null,
+  f0Hz = null,
+) {
   const n = samples ? samples.length : 0;
   if (n === 0 || sampleRate <= 0 || mode === 0) {
     return { samples, sampleRate, timeMap: null, startSec: rangeStartSec, endSec: rangeEndSec };
   }
+  const compact = timingMode === 1;
+  const stretch = timingMode === 2;
   const dur = n / sampleRate;
   const r0 = Math.max(0.0, Math.min(dur, rangeStartSec || 0.0));
   const r1 = rangeEndSec > r0 ? Math.min(dur, rangeEndSec) : dur;
@@ -544,8 +558,8 @@ export function buildIsolatedAudio(samples, sampleRate, spans, mode, compact, ra
     }
   }
 
-  // Filter out silent-only segments when compacting Consonants so dead air isn't kept
-  if (compact && mode === 2 && kept.length > 0) {
+  // Filter out silent-only segments when compacting/stretching Consonants so dead air isn't kept
+  if ((compact || stretch) && mode === 2 && kept.length > 0) {
     let globalPeak = 1e-5;
     for (let i = 0; i < n; i += 4) {
       const a = Math.abs(samples[i]);
@@ -581,7 +595,7 @@ export function buildIsolatedAudio(samples, sampleRate, spans, mode, compact, ra
     kept = trimmed;
   }
 
-  if (!compact) {
+  if (!compact && !stretch) {
     // In-place smooth raised-cosine mask over the entire clip
     const out = new Float32Array(n);
     const fadeSamp = Math.max(16, Math.round(sampleRate * 0.014));
@@ -614,25 +628,33 @@ export function buildIsolatedAudio(samples, sampleRate, spans, mode, compact, ra
     return { samples: out, sampleRate, timeMap: null, startSec: r0, endSec: r1 };
   }
 
-  // Compacted mode: stitch kept segments with smooth 22 ms fade + tiny 24 ms breath gap
+  // Compacted OR Stretched mode
   if (kept.length === 0) {
     const empty = new Float32Array(Math.max(16, Math.round(sampleRate * 0.05)));
     return { samples: empty, sampleRate, timeMap: [{ out0: 0, out1: empty.length / sampleRate, src0: r0, src1: r0 }], startSec: 0, endSec: empty.length / sampleRate };
   }
 
-  const gapSamp = Math.round(sampleRate * 0.024);
-  const fadeSamp = Math.max(16, Math.round(sampleRate * 0.016));
+  const gapSamp = Math.round(sampleRate * (stretch ? 0.058 : 0.024));
+  const fadeSamp = Math.max(16, Math.round(sampleRate * (stretch ? 0.022 : 0.016)));
   const slices = [];
   let totalLen = 0;
   for (let idx = 0; idx < kept.length; idx++) {
     const seg = kept[idx];
-    const i0 = Math.max(0, Math.floor(seg.t0 * sampleRate));
-    const i1 = Math.min(n, Math.ceil(seg.t1 * sampleRate));
-    const len = i1 - i0;
-    if (len < 16) continue;
+    const segDur = seg.t1 - seg.t0;
+    let buf = null;
+    if (stretch) {
+      // Stretch short vowels up to >= 0.48s (or 2.4x, capped at 1.15s) via pitch-locked TD-PSOLA!
+      const targetDur = Math.min(1.15, Math.max(0.48, segDur * 2.4));
+      buf = stretchVowelSegmentPsola(samples, sampleRate, seg.t0, seg.t1, targetDur, f0Times, f0Hz);
+    } else {
+      const i0 = Math.max(0, Math.floor(seg.t0 * sampleRate));
+      const i1 = Math.min(n, Math.ceil(seg.t1 * sampleRate));
+      if (i1 - i0 >= 16) buf = samples.subarray(i0, i1);
+    }
+    if (!buf || buf.length < 16) continue;
     if (slices.length > 0) totalLen += gapSamp;
-    slices.push({ i0, len, outOffset: totalLen, src0: i0 / sampleRate, src1: i1 / sampleRate });
-    totalLen += len;
+    slices.push({ buf, len: buf.length, outOffset: totalLen, src0: seg.t0, src1: seg.t1 });
+    totalLen += buf.length;
   }
 
   if (totalLen < 16) {
@@ -652,7 +674,7 @@ export function buildIsolatedAudio(samples, sampleRate, spans, mode, compact, ra
         const d = sl.len - 1 - k;
         g = 0.5 - 0.5 * Math.cos((Math.PI * (d + 0.5)) / fLen);
       }
-      out[sl.outOffset + k] = samples[sl.i0 + k] * g;
+      out[sl.outOffset + k] = sl.buf[k] * g;
     }
     timeMap.push({
       out0: sl.outOffset / sampleRate,

@@ -5,7 +5,7 @@ import audio_native { SORT_ALPHA, SORT_OVERALL, SORT_PITCH, SORT_SIZE, SORT_VOWE
 import colormap { paletteIndex, paletteName }
 import compare { HEATMAP_OVERALL, HEATMAP_PITCH, HEATMAP_SIZE, HEATMAP_VOWEL, HEATMAP_WEIGHT }
 import formants { VOWELS_FEM, VOWELS_MASC, VOWEL_MODE_BOTH, VOWEL_MODE_FEM, VOWEL_MODE_MASC }
-import overlays { AxisTick, GuideBadge, VowelBadge, vowelX, vowelY }
+import overlays { AxisTick, GuideBadge, VowelBadge, VowelChartDot, vowelX, vowelY }
 import studio {
   AXIS_W,
   CTX_AUDIO,
@@ -14,9 +14,20 @@ import studio {
   CTX_LIB_SORT,
   CTX_PALETTE,
   CTX_SPEED,
+  CTX_VOICE_LAB,
   ISOLATE_CONSONANTS,
   ISOLATE_FULL,
   ISOLATE_VOWELS,
+  LAB_BREATH,
+  LAB_GLOTTAL,
+  LAB_MONOTONE,
+  LAB_OFF,
+  LAB_SOLO_F1,
+  LAB_SOLO_F2,
+  LAB_SOLO_F3,
+  LAB_WHISPER,
+  TIMING_COMPACT,
+  TIMING_STRETCH,
   DRAG_EXPLORER_SCROLL,
   DRAG_GUIDE,
   DRAG_NONE,
@@ -412,15 +423,72 @@ fn renderToolbar(m: &Overtone, h: &Document<Message>) -> Node {
               txt(
                 h,
                 if m.isolateMode == ISOLATE_VOWELS {
-                  if m.isolateCompact { "Vowels · Stitch ▾" } else { "Vowels ▾" }
+                  if m.isolateTiming == TIMING_STRETCH {
+                    "Vowels · Stretch ▾"
+                  } else if m.isolateTiming == TIMING_COMPACT {
+                    "Vowels · Stitch ▾"
+                  } else {
+                    "Vowels ▾"
+                  }
                 } else if m.isolateMode == ISOLATE_CONSONANTS {
-                  if m.isolateCompact { "Consonants · Stitch ▾" } else { "Consonants ▾" }
+                  if m.isolateTiming == TIMING_STRETCH {
+                    "Cons · Stretch ▾"
+                  } else if m.isolateTiming == TIMING_COMPACT {
+                    "Cons · Stitch ▾"
+                  } else {
+                    "Consonants ▾"
+                  }
                 } else if (m.neuralStatusFlags & 16) != 0 {
                   "Isolate… ▾"
                 } else {
                   "Isolate ▾"
                 },
                 if m.isolateMode != ISOLATE_FULL {
+                  "text-[12px] leading-[16px] font-medium text-white"
+                } else {
+                  "text-[12px] leading-[16px]"
+                },
+              ),
+            ],
+          ),
+          h.box(
+            &[
+              h.testId("voice-lab-btn"),
+              h.class("flex items-center gap-[5px] h-[28px] px-[9px] rounded-[6px]"),
+              h.classSelect(
+                m.voiceLabMode != LAB_OFF,
+                "bg-[#0E0E10] text-white",
+                "text-[#6B6B70] glint-btn-hover",
+              ),
+              h.cursor(Cursor.Pointer),
+              h.onClick(Message.OpenContextMenu { kind: CTX_VOICE_LAB, x: 375.0, y: 84.0 }),
+            ],
+            &[
+              if m.voiceLabMode != LAB_OFF {
+                h.box(&[h.class("w-[6px] h-[6px] rounded-full bg-[#F5A9B8] shrink-0")], &[])
+              } else {
+                h.empty()
+              },
+              txt(
+                h,
+                if m.voiceLabMode == LAB_WHISPER {
+                  "Whisper ▾"
+                } else if m.voiceLabMode == LAB_MONOTONE {
+                  "Monotone ▾"
+                } else if m.voiceLabMode == LAB_GLOTTAL {
+                  "Glottal ▾"
+                } else if m.voiceLabMode == LAB_SOLO_F1 {
+                  "Solo F1 ▾"
+                } else if m.voiceLabMode == LAB_SOLO_F2 {
+                  "Solo F2 ▾"
+                } else if m.voiceLabMode == LAB_SOLO_F3 {
+                  "Solo F3+ ▾"
+                } else if m.voiceLabMode == LAB_BREATH {
+                  "Breath ▾"
+                } else {
+                  "Lab ▾"
+                },
+                if m.voiceLabMode != LAB_OFF {
                   "text-[12px] leading-[16px] font-medium text-white"
                 } else {
                   "text-[12px] leading-[16px]"
@@ -1349,7 +1417,7 @@ fn renderSpectrogramWell(m: &Overtone, h: &Document<Message>) -> Node {
               if selValid {
                 h.row(
                   &[
-                    h.class("absolute bottom-[8px] items-center gap-[2px] p-[3px] bg-[#0E0E10] rounded-[5px] border border-white/15 text-[11px] leading-[14px] text-[#E8E8EA]"),
+                    h.class("absolute bottom-[28px] items-center gap-[2px] p-[3px] bg-[#0E0E10] rounded-[5px] border border-white/15 text-[11px] leading-[14px] text-[#E8E8EA]"),
                     h.style(&[css.left(px(selLeftPx))]),
                   ],
                   &[
@@ -1358,6 +1426,19 @@ fn renderSpectrogramWell(m: &Overtone, h: &Document<Message>) -> Node {
                     } else {
                       h.empty()
                     },
+                    selActBtn(h, "♫ Synth", false, Message.PlayKlattAtSelection),
+                    if m.takeVowelSpans.length() > 1 {
+                      h.row(
+                        &[h.class("items-center gap-[1px]")],
+                        &[
+                          selActBtn(h, "‹", false, Message.StepVowelSpan { delta: -1 }),
+                          selActBtn(h, "›", false, Message.StepVowelSpan { delta: 1 }),
+                        ],
+                      )
+                    } else {
+                      h.empty()
+                    },
+                    h.box(&[h.class("w-[1px] h-[14px] bg-white/20 mx-[2px]")], &[]),
                     selActBtn(h, "Copy", false, Message.CopySelection),
                     selActBtn(h, "Cut", false, Message.CutSelection),
                     selActBtn(h, "Delete", false, Message.DeleteSelection),
@@ -1409,17 +1490,11 @@ fn renderSpectrogramWell(m: &Overtone, h: &Document<Message>) -> Node {
                   h.empty()
                 },
               ),
-              // IPA vowel phoneme badges along bottom edge when Neural IPA is active
+              // Clickable vowel badges along bottom edge (click any vowel to select & loop it!)
               if (m.showVowelRegions || m.isolateMode != ISOLATE_FULL) && m.vowelBadges.length() > 0 {
                 h.each<VowelBadge>(
                   m.vowelBadges.asSlice(),
-                  |vb| h.box(
-                    &[
-                      h.class("absolute bottom-[5px] px-[4px] py-[1px] rounded-[3px] bg-[#0E0E10]/85 border border-[#5BCEFA]/40 pointer-events-none flex items-center justify-center"),
-                      h.style(&[css.left(px(vb.x)), css.minWidth(px(16.0))]),
-                    ],
-                    &[txt(h, String.view(&vb.label), "text-[10px] leading-[12px] font-medium text-[#5BCEFA]")],
-                  ),
+                  |vb| vowelBadgeNode(h, vb),
                 )
               } else {
                 h.empty()
@@ -2057,6 +2132,33 @@ fn renderSizeWeightPad(m: &Overtone, h: &Document<Message>) -> Node {
   )
 }
 
+fn vowelBadgeNode(h: &Document<Message>, vb: &VowelBadge) -> Node {
+  let vidx = vb.idx
+  return h.box(
+    &[
+      h.class("absolute bottom-[5px] px-[4px] py-[1px] rounded-[3px] bg-[#0E0E10]/90 hover:bg-[#5BCEFA] border border-[#5BCEFA]/50 flex items-center justify-center"),
+      h.style(&[css.left(px(vb.x)), css.minWidth(px(if vb.hasLabel { 16.0 } else { 12.0 }))]),
+      h.cursor(Cursor.Pointer),
+      h.onPointerDown(|_| Reply<Message>.EmitAndStop { message: Message.SelectVowelSpan { idx: vidx } }),
+    ],
+    &[txt(h, String.view(&vb.label), "text-[10px] leading-[12px] font-medium text-[#5BCEFA]")],
+  )
+}
+
+fn vowelChartDotNode(h: &Document<Message>, vd: &VowelChartDot) -> Node {
+  let vidx = vd.idx
+  return txtA(
+    h,
+    String.view(&vd.label),
+    &[
+      h.class("absolute px-[2px] rounded-[2px] bg-[#5BCEFA]/20 text-[9px] leading-[11px] font-semibold text-[#1E6B86] hover:bg-[#5BCEFA] hover:text-[#0E0E10]"),
+      h.style(&[css.left(px(vd.x)), css.top(px(vd.y))]),
+      h.cursor(Cursor.Pointer),
+      h.onPointerDown(|_| Reply<Message>.EmitAndStop { message: Message.SelectVowelSpan { idx: vidx } }),
+    ],
+  )
+}
+
 fn vowelLabelNode(h: &Document<Message>, idx: usize, useMasc: bool, plotW: f32) -> Node {
   let v = if useMasc { VOWELS_MASC[idx] } else { VOWELS_FEM[idx] }
   let vx = f32.max(4.0, f32.min(plotW - 18.0, vowelX(v.f2, plotW) - 6.0))
@@ -2068,7 +2170,7 @@ fn vowelLabelNode(h: &Document<Message>, idx: usize, useMasc: bool, plotW: f32) 
       h.class("absolute text-[10px] leading-[12px] font-semibold text-[#3A3A40] hover:text-[#D9381E]"),
       h.style(&[css.left(px(vx)), css.top(px(vy))]),
       h.cursor(Cursor.Pointer),
-      h.onClick(Message.ApplyVowelGuides { idx: idx, useMasc: useMasc }),
+      h.onPointerDown(|_| Reply<Message>.EmitAndStop { message: Message.ApplyVowelGuides { idx: idx, useMasc: useMasc } }),
     ],
   )
 }
@@ -2084,7 +2186,7 @@ fn renderVowelsCard(m: &Overtone, h: &Document<Message>) -> Node {
         &[h.class("items-center justify-between")],
         &[
           h.row(
-            &[h.class("items-center gap-[6px]")],
+            &[h.class("items-center gap-[5px]")],
             &[
               txt(h, "Vowels", "text-[11px] leading-[14px] font-semibold tracking-[0.06em] uppercase text-[#6B6B70]"),
               if m.readoutVowel != "—" {
@@ -2092,9 +2194,26 @@ fn renderVowelsCard(m: &Overtone, h: &Document<Message>) -> Node {
               } else {
                 h.empty()
               },
-              txt(h, "● now", "text-[10px] leading-[12px] text-[#D9381E] font-medium"),
+              txtA(
+                h,
+                "♫ Hear",
+                &[
+                  h.testId("klatt-hear-btn"),
+                  h.class("px-[5px] py-[1px] rounded-[4px] bg-[#F1F1F2] hover:bg-[#0E0E10] hover:text-white text-[10px] leading-[13px] font-medium text-[#0B0B0C]"),
+                  h.cursor(Cursor.Pointer),
+                  h.onClick(Message.PlayKlattAtCursor),
+                ],
+              ),
               if m.refClip.active {
-                txt(h, "● ref", "text-[10px] leading-[12px] text-[#2E7D96] font-medium")
+                txtA(
+                  h,
+                  "♫ Ref",
+                  &[
+                    h.class("px-[5px] py-[1px] rounded-[4px] bg-[#2E7D96]/12 hover:bg-[#2E7D96] hover:text-white text-[10px] leading-[13px] font-medium text-[#2E7D96]"),
+                    h.cursor(Cursor.Pointer),
+                    h.onClick(Message.PlayKlattAtRef),
+                  ],
+                )
               } else {
                 h.empty()
               },
@@ -2120,11 +2239,19 @@ fn renderVowelsCard(m: &Overtone, h: &Document<Message>) -> Node {
       ),
       h.box(
         &[
+          h.testId("vowel-chart-box"),
           h.class("w-full relative rounded-[4px] bg-[#F7F7F8] overflow-hidden"),
           h.style(&[css.height(px(VOWEL_H))]),
+          h.cursor(Cursor.Pointer),
+          h.onLayout(|r| Message.VowelChartLayout { rect: r }),
+          h.onPointerDown(|e| Reply<Message>.EmitAndStop { message: Message.ClickVowelChart { x: e.x, y: e.y } }),
         ],
         &[
           h.drawing(&m.vowelDrawing, &[h.class("absolute inset-0 w-full h-full pointer-events-none")]),
+          h.each<VowelChartDot>(
+            m.vowelChartDots.asSlice(),
+            |vd| vowelChartDotNode(h, vd),
+          ),
           vowelLabelNode(h, 0, useMasc, plotW),
           vowelLabelNode(h, 1, useMasc, plotW),
           vowelLabelNode(h, 3, useMasc, plotW),

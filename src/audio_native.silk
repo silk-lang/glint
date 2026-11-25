@@ -12,6 +12,7 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.pointer { Pointer }
 import silk.num.f64
 import silk.num.i32
+import silk.num.u32
 import silk.num.usize
 import silk.text.string { InvalidUtf8, String }
 
@@ -287,8 +288,19 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
     endSec: f64,
     loop: i32,
     mode: i32,
-    compact: i32,
+    timingMode: i32,
+    labMode: i32,
+    targetMonoHz: f64,
   ) -> i32 as "glint#ov_play_filtered"
+  unsafe extern "C" fn ov_klatt_play(
+    f0: f64,
+    f1: f64,
+    f2: f64,
+    f3: f64,
+    f4: f64,
+    durSec: f64,
+    tiltDb: f64,
+  ) -> i32 as "glint#ov_klatt_play"
 } else {
   unsafe extern "C" fn ov_audio_refresh_devices() -> i32
   unsafe extern "C" fn ov_audio_input_count() -> i32
@@ -1704,13 +1716,17 @@ pub fn playFiltered(
   endSec: f64,
   loop: bool,
   mode: u32,
-  compact: bool,
+  timingMode: u32,
+  labMode: u32,
+  targetMonoHz: f64,
 ) -> bool {
   static if Intrinsic.targetArchitecture() == "wasm32" {
     if samples.length == 0 {
       return false
     }
     let modeI32: i32 = if mode == 1 { 1 } else if mode == 2 { 2 } else { 0 }
+    let timingI32: i32 = if timingMode == 2 { 2 } else if timingMode == 1 { 1 } else { 0 }
+    let labI32: i32 = if labMode <= 7 { usize.toI32(u32.toUsize(labMode)) } else { 0 }
     return unsafe ov_play_filtered(
       if isRef { 1 } else { 0 },
       Pointer.fromSlice(samples),
@@ -1720,12 +1736,31 @@ pub fn playFiltered(
       endSec,
       if loop { 1 } else { 0 },
       modeI32,
-      if compact { 1 } else { 0 },
+      timingI32,
+      labI32,
+      targetMonoHz,
     ) != 0
   } else {
     drop isRef
     drop mode
-    drop compact
+    drop timingMode
+    drop labMode
+    drop targetMonoHz
     return playRange(samples, sampleRate, startSec, endSec, loop)
+  }
+}
+
+pub fn klattPlay(f0: f64, f1: f64, f2: f64, f3: f64, f4: f64, durSec: f64, tiltDb: f64) -> bool {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    return unsafe ov_klatt_play(f0, f1, f2, f3, f4, durSec, tiltDb) != 0
+  } else {
+    drop f0
+    drop f1
+    drop f2
+    drop f3
+    drop f4
+    drop durSec
+    drop tiltDb
+    return false
   }
 }

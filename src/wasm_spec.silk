@@ -351,15 +351,17 @@ impl WasmSpectrogram {
       && self.coarseHzPerBin <= desiredHzPerBin * 1.15
   }
 
-  pub fn sharpCovers(self: &Self, vp: &Viewport, desiredStepSec: f64) -> bool {
+  pub fn sharpCovers(self: &Self, vp: &Viewport, desiredStepSec: f64, interactive: bool) -> bool {
     if !self.sharp.valid {
       return false
     }
+    let hiMult: f64 = if interactive { 1.75 } else { 1.30 }
+    let loMult: f64 = if interactive { 0.30 } else { 0.42 }
     return self.sharp.t0 <= vp.t0 + 0.001
       && self.sharp.t1 >= vp.t1 - 0.001
       && self.sharp.maxHz >= vp.f1 * 0.99
-      && self.sharpStepSec <= desiredStepSec * 1.30
-      && self.sharpStepSec >= desiredStepSec * 0.42
+      && self.sharpStepSec <= desiredStepSec * hiMult
+      && self.sharpStepSec >= desiredStepSec * loMult
   }
 
   pub fn draw(self: &Self, vp: &Viewport) -> () {
