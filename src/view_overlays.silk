@@ -1,15 +1,14 @@
 //! Glint floating overlays: Guides popover, all 8 Context Menus, Settings Modal (7 tabs), and Drag Ghost.
 import audio_native { AudioDeviceInfo, SORT_ALPHA, SORT_OVERALL, SORT_PITCH, SORT_SIZE, SORT_VOWEL, SORT_WEIGHT }
-import coach { TARGET_BALANCED, TARGET_CUSTOM, TARGET_FULL_HEAVY, TARGET_LIGHT_SMALL, TARGET_NEUTRAL }
 import colormap { paletteIndex }
 import formants { VOWEL_MODE_BOTH, VOWEL_MODE_FEM, VOWEL_MODE_MASC }
 import overlays { GuideBadge }
 import studio {
   CTX_AUDIO,
-  CTX_COACH_TARGET,
   CTX_EXPLORER_DIR,
   CTX_EXPLORER_FILE,
   CTX_EXPLORER_ROOT,
+  CTX_FORMANTS,
   CTX_LIB_SORT,
   CTX_NONE,
   CTX_PALETTE,
@@ -450,24 +449,27 @@ pub fn renderContextMenu(m: &Overtone, h: &Document<Message>) -> Node {
         menuItem(h, false, "Re-score all visible", "", false, false, Message.RescoreVisibleClips),
       ],
     )
-  } else if m.ctxMenuKind == CTX_COACH_TARGET {
+  } else if m.ctxMenuKind == CTX_FORMANTS {
+    let menuX = clampMenuX(m.ctxMenuX, 232.0)
+    let menuY = clampMenuY(m.ctxMenuY, 270.0)
+    let on = m.showFormants
+    let fm = m.formantMask
     h.column(
       &[
-        h.class("absolute right-[16px] top-[116px] w-[236px] p-[4px] glint-menu"),
+        h.class("absolute z-10 w-[228px] p-[4px] glint-menu"),
+        h.style(&[css.left(px(menuX)), css.top(px(menuY))]),
       ],
       &[
-        menuHeader(h, "Coach target preset"),
-        menuItem(h, m.coachTarget == TARGET_LIGHT_SMALL, "Light & small", "180–245 Hz", false, false, Message.SetCoachTarget { target: TARGET_LIGHT_SMALL }),
-        menuItem(h, m.coachTarget == TARGET_BALANCED, "Balanced", "145–192 Hz", false, false, Message.SetCoachTarget { target: TARGET_BALANCED }),
-        menuItem(h, m.coachTarget == TARGET_FULL_HEAVY, "Full & heavy", "95–148 Hz", false, false, Message.SetCoachTarget { target: TARGET_FULL_HEAVY }),
-        menuItem(h, m.coachTarget == TARGET_NEUTRAL, "Neutral · technique", "no pitch", false, false, Message.SetCoachTarget { target: TARGET_NEUTRAL }),
-        if m.coachTarget == TARGET_CUSTOM {
-          menuItem(h, true, "Custom pad point", "active", false, false, Message.CloseContextMenu)
-        } else {
-          h.empty()
-        },
+        menuHeader(h, "Formant tracks"),
+        formantMenuRow(h, on && (fm & 1) != 0, "bg-[#F56B5C]", "F1", "vowel height", Message.ToggleFormantBit { bit: 1 }),
+        formantMenuRow(h, on && (fm & 2) != 0, "bg-[#F2CC52]", "F2", "frontness", Message.ToggleFormantBit { bit: 2 }),
+        formantMenuRow(h, on && (fm & 4) != 0, "bg-[#61D1E5]", "F3", "brightness", Message.ToggleFormantBit { bit: 4 }),
+        formantMenuRow(h, on && (fm & 8) != 0, "bg-[#B894F5]", "F4", "upper", Message.ToggleFormantBit { bit: 8 }),
         menuSep(h),
-        menuItem(h, false, "Pin current take as ref", "P", false, false, Message.PinReference),
+        menuItem(h, on && fm == 3, "F1 + F2 only", "", false, false, Message.SetFormantMask { mask: 3 }),
+        menuItem(h, on && fm == 7, "F1 – F3", "", false, false, Message.SetFormantMask { mask: 7 }),
+        menuItem(h, on && fm == 15, "All (F1 – F4)", "", false, false, Message.SetFormantMask { mask: 15 }),
+        menuItem(h, !on || fm == 0, "Hide formants", "", false, false, Message.SetFormantMask { mask: 0 }),
       ],
     )
   } else {
@@ -475,11 +477,45 @@ pub fn renderContextMenu(m: &Overtone, h: &Document<Message>) -> Node {
   }
 
   return h.box(
+    &[h.class("fixed inset-0 z-50")],
     &[
-      h.class("fixed inset-0 z-50"),
-      h.onClick(Message.CloseContextMenu),
+      h.box(
+        &[
+          h.class("absolute inset-0"),
+          h.onClick(Message.CloseContextMenu),
+        ],
+        &[],
+      ),
+      content,
     ],
-    &[content],
+  )
+}
+
+fn formantMenuRow(
+  h: &Document<Message>,
+  checked: bool,
+  dotCls: string,
+  name: string,
+  sub: string,
+  msg: Message,
+) -> Node {
+  return h.row(
+    &[
+      h.class("items-center justify-between px-[8px] py-[5px] rounded-[4px] glint-btn-hover"),
+      h.cursor(Cursor.Pointer),
+      h.onClick(move msg),
+    ],
+    &[
+      h.row(
+        &[h.class("items-center gap-[7px]")],
+        &[
+          txt(h, if checked { "✓" } else { " " }, "w-[11px] text-[11px] font-bold text-[#0B0B0C]"),
+          h.box(&[h.class("w-[8px] h-[8px] rounded-[4px] shrink-0"), h.class(dotCls)], &[]),
+          txt(h, name, "text-[12px] leading-[16px] font-semibold text-[#0B0B0C]"),
+          txt(h, sub, "text-[11px] leading-[14px] text-[#8A8A90]"),
+        ],
+      ),
+    ],
   )
 }
 

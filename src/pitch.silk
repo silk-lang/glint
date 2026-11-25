@@ -670,6 +670,79 @@ impl PitchTrack {
       }
       i = i + 1
     }
+
+    // Post-Viterbi subharmonic / octave-halving cleanup:
+    // Suppresses brief vocal-fry octave drops (~0.5x of main F0 median) that otherwise clutter pitch & H1-H2.
+    let mut strongF0s = List<f64>.make()
+    i = 0
+    while i < n {
+      if fsMut[i].voiced && fsMut[i].clarity >= 0.62 && fsMut[i].frequency > 50.0 {
+        run strongF0s.append(fsMut[i].frequency)
+      }
+      i = i + 1
+    }
+    if strongF0s.length() >= 10 {
+      // Insertion sort to find upper-median modal F0 (70th percentile resists creak contamination)
+      let sfSl = strongF0s.asMutSlice()
+      let mut a: usize = 1
+      while a < sfSl.length {
+        let key = sfSl[a]
+        let mut b = a
+        while b > 0 && sfSl[b - 1] > key {
+          sfSl[b] = sfSl[b - 1]
+          b = b - 1
+        }
+        sfSl[b] = key
+        a = a + 1
+      }
+      let modalF0 = sfSl[(sfSl.length * 6) / 10]
+      let subHi = modalF0 * 0.64
+      let subLo = modalF0 * 0.34
+
+      let mut rs: usize = 0
+      while rs < n {
+        if !fsMut[rs].voiced {
+          rs = rs + 1
+          continue
+        }
+        let mut re = rs
+        let mut sumF: f64 = 0.0
+        while re < n && fsMut[re].voiced {
+          sumF = sumF + fsMut[re].frequency
+          re = re + 1
+        }
+        let rLen = re - rs
+        let meanF = sumF / usize.toF64(rLen)
+        if rLen <= 24 && meanF >= subLo && meanF <= subHi {
+          // Try snapping each frame to a ~2x candidate if present; otherwise unvoice the brief subharmonic glitch
+          let mut k = rs
+          while k < re {
+            let targetF = fsMut[k].frequency * 2.0
+            let cnd = candsSl[k]
+            let mut foundIdx: usize = cnd.count
+            let mut bestErr: f64 = 0.18
+            let mut ci: usize = 0
+            while ci < cnd.count {
+              let err = f64.abs(f64.log2(f64.max(20.0, cnd.freqs[ci]) / targetF))
+              if err < bestErr && cnd.rawClarity[ci] >= voiceThresh * 0.85 {
+                bestErr = err
+                foundIdx = ci
+              }
+              ci = ci + 1
+            }
+            if foundIdx < cnd.count {
+              fsMut[k].frequency = cnd.freqs[foundIdx]
+              fsMut[k].clarity = f64.max(voiceThresh, cnd.rawClarity[foundIdx])
+            } else {
+              fsMut[k].voiced = false
+              fsMut[k].frequency = 0.0
+            }
+            k = k + 1
+          }
+        }
+        rs = re
+      }
+    }
   }
 
   /// Looks up the nearest pitch frame to `timeSec`.

@@ -7,6 +7,7 @@
 //!   6. Root -> (frequency, bandwidth) with Praat's 50 Hz safety margin & ascending sort.
 //!   7. LPC vocal-tract spectral envelope evaluation & IPA vowel classification from (F1, F2).
 import audio_native
+import pitch { PitchFrame }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
@@ -41,6 +42,10 @@ pub struct FormantFrame {
   pub f4: f64,
   pub bw4: f64,
   pub intensityDb: f64,
+  pub tracked: bool,
+  pub candCount: usize,
+  pub candFreqs: [f64; 6],
+  pub candBws: [f64; 6],
 }
 
 impl Copy for FormantFrame {}
@@ -55,6 +60,10 @@ impl FormantFrame {
       f3: 0.0, bw3: 0.0,
       f4: 0.0, bw4: 0.0,
       intensityDb: intensityDb,
+      tracked: false,
+      candCount: 0,
+      candFreqs: [0.0; 6],
+      candBws: [0.0; 6],
     }
   }
 }
@@ -550,22 +559,37 @@ impl FormantTrack {
     }
 
     let mut frame = FormantFrame.empty(centreSec, intensityDb)
-    frame.count = pCount
-    if pCount >= 1 {
-      frame.f1 = peaks[0].freq
-      frame.bw1 = peaks[0].bw
+    // Save up to 6 sharp candidate Burg roots for Viterbi formant tracking
+    let mut kept: usize = 0
+    i = 0
+    while i < pCount && kept < 6 {
+      let pf = peaks[i].freq
+      let pbw = peaks[i].bw
+      let bwLim = if pf < 1200.0 { 460.0 } else if pf < 2600.0 { 600.0 } else { 740.0 }
+      if pbw <= bwLim {
+        frame.candFreqs[kept] = pf
+        frame.candBws[kept] = pbw
+        kept = kept + 1
+      }
+      i = i + 1
     }
-    if pCount >= 2 {
-      frame.f2 = peaks[1].freq
-      frame.bw2 = peaks[1].bw
+    frame.candCount = kept
+    frame.count = kept
+    if kept >= 1 {
+      frame.f1 = frame.candFreqs[0]
+      frame.bw1 = frame.candBws[0]
     }
-    if pCount >= 3 {
-      frame.f3 = peaks[2].freq
-      frame.bw3 = peaks[2].bw
+    if kept >= 2 {
+      frame.f2 = frame.candFreqs[1]
+      frame.bw2 = frame.candBws[1]
     }
-    if pCount >= 4 {
-      frame.f4 = peaks[3].freq
-      frame.bw4 = peaks[3].bw
+    if kept >= 3 {
+      frame.f3 = frame.candFreqs[2]
+      frame.bw3 = frame.candBws[2]
+    }
+    if kept >= 4 {
+      frame.f4 = frame.candFreqs[3]
+      frame.bw4 = frame.candBws[3]
     }
     return frame
   }
@@ -614,5 +638,428 @@ impl FormantTrack {
       return Option<FormantFrame>.some(self.frames.get(n - 1))
     }
     return Option<FormantFrame>.some(self.frames.get(idx))
+  }
+
+  /// Voicing-gated Praat-style Viterbi formant tracking + temporal smoothing.
+  /// Eliminates unvoiced consonant confetti, F1<->F2<->F3 slot swaps, and frame-to-frame jitter.
+  pub effect fn refineTracked(self: &mut Self, pitchFrames: &[PitchFrame], displayClarity: f64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let n = self.frames.length()
+    if n == 0 {
+      return ()
+    }
+    let ceiling = self.workingRate * 0.5
+    let scale = f64.max(0.75, f64.min(1.25, ceiling / 5500.0))
+    let refF1 = 550.0 * scale
+    let refF2 = 1650.0 * scale
+    let refF3 = 2750.0 * scale
+    let refF4 = 3850.0 * scale
+
+    // 1. Determine active voiced speech frames via pitch track + relative intensity
+    let mut peakDb: f64 = -120.0
+    let mut i: usize = 0
+    while i < n {
+      let db = self.frames.asSlice()[i].intensityDb
+      if db > peakDb {
+        peakDb = db
+      }
+      i = i + 1
+    }
+    let minActiveDb = f64.max(-58.0, peakDb - 34.0)
+
+    let mut active = List<bool>.make()
+    run active.appendRepeated(false, n)
+    let actSl = active.asMutSlice()
+    let mut frameF0 = List<f64>.make()
+    run frameF0.appendRepeated(0.0, n)
+    let f0Sl = frameF0.asMutSlice()
+
+    let mut pIdx: usize = 0
+    i = 0
+    while i < n {
+      let ft = self.frames.asSlice()[i].time
+      let fDb = self.frames.asSlice()[i].intensityDb
+      let mut isVoiced = false
+      let mut matchedF0: f64 = 0.0
+      if pitchFrames.length > 0 {
+        while pIdx + 1 < pitchFrames.length && pitchFrames[pIdx + 1].time < ft {
+          pIdx = pIdx + 1
+        }
+        let mut bestP = pIdx
+        if pIdx + 1 < pitchFrames.length {
+          let d0 = f64.abs(pitchFrames[pIdx].time - ft)
+          let d1 = f64.abs(pitchFrames[pIdx + 1].time - ft)
+          if d1 < d0 {
+            bestP = pIdx + 1
+          }
+        }
+        let pf = pitchFrames[bestP]
+        if f64.abs(pf.time - ft) <= 0.035 && pf.voiced && pf.clarity >= displayClarity && fDb >= minActiveDb {
+          isVoiced = true
+          matchedF0 = pf.frequency
+        }
+      } else if fDb >= minActiveDb {
+        isVoiced = true
+      }
+      actSl[i] = isVoiced && self.frames.asSlice()[i].candCount >= 2
+      f0Sl[i] = matchedF0
+      i = i + 1
+    }
+
+    // 2. Drop tiny isolated 1-2 frame voiced blips
+    i = 0
+    while i < n {
+      if actSl[i] {
+        let mut j = i
+        while j < n && actSl[j] {
+          j = j + 1
+        }
+        if j - i < 3 {
+          let mut k = i
+          while k < j {
+            actSl[k] = false
+            k = k + 1
+          }
+        }
+        i = j
+      } else {
+        i = i + 1
+      }
+    }
+
+    // 3. Process each contiguous voiced run with Viterbi DP over ordered candidate tuples (F1 < F2 < F3 [< F4])
+    // Max candidates = 6 -> at most C(6,3) = 20 triples per frame (super fast!)
+    let maxStates: usize = 24
+    let bigInf: f64 = 1.0e18
+
+    let mut runStart: usize = 0
+    while runStart < n {
+      if !actSl[runStart] {
+        let frMut = self.frames.asMutSlice()
+        frMut[runStart].tracked = false
+        runStart = runStart + 1
+        continue
+      }
+      let mut runEnd = runStart
+      while runEnd < n && actSl[runEnd] {
+        runEnd = runEnd + 1
+      }
+      let rLen = runEnd - runStart
+
+      // Enumerate valid candidate states for each frame in the run
+      let mut stCount = List<usize>.make()
+      run stCount.appendRepeated(0, rLen)
+      let mut stF1 = List<f64>.make()
+      run stF1.appendRepeated(0.0, rLen * maxStates)
+      let mut stF2 = List<f64>.make()
+      run stF2.appendRepeated(0.0, rLen * maxStates)
+      let mut stF3 = List<f64>.make()
+      run stF3.appendRepeated(0.0, rLen * maxStates)
+      let mut stF4 = List<f64>.make()
+      run stF4.appendRepeated(0.0, rLen * maxStates)
+      let mut stB1 = List<f64>.make()
+      run stB1.appendRepeated(0.0, rLen * maxStates)
+      let mut stB2 = List<f64>.make()
+      run stB2.appendRepeated(0.0, rLen * maxStates)
+      let mut stB3 = List<f64>.make()
+      run stB3.appendRepeated(0.0, rLen * maxStates)
+      let mut stB4 = List<f64>.make()
+      run stB4.appendRepeated(0.0, rLen * maxStates)
+      let mut stEmit = List<f64>.make()
+      run stEmit.appendRepeated(bigInf, rLen * maxStates)
+
+      let stCntSl = stCount.asMutSlice()
+      let f1Sl = stF1.asMutSlice()
+      let f2Sl = stF2.asMutSlice()
+      let f3Sl = stF3.asMutSlice()
+      let f4Sl = stF4.asMutSlice()
+      let b1Sl = stB1.asMutSlice()
+      let b2Sl = stB2.asMutSlice()
+      let b3Sl = stB3.asMutSlice()
+      let b4Sl = stB4.asMutSlice()
+      let emSl = stEmit.asMutSlice()
+      let frSl = self.frames.asSlice()
+
+      let mut t: usize = 0
+      while t < rLen {
+        let fr = frSl[runStart + t]
+        let curF0 = f0Sl[runStart + t]
+        let f1Floor = f64.max(200.0, curF0 * 1.10)
+        let cc = fr.candCount
+        let base = t * maxStates
+        let mut sc: usize = 0
+
+        if cc >= 3 {
+          let mut a: usize = 0
+          while a < cc && sc < maxStates {
+            let fa = fr.candFreqs[a]
+            let ba = fr.candBws[a]
+            if fa >= f1Floor && fa <= 1180.0 {
+              let mut b = a + 1
+              while b < cc && sc < maxStates {
+                let fb = fr.candFreqs[b]
+                let bb = fr.candBws[b]
+                if fb >= 550.0 && fb <= 3300.0 && fb >= fa + 150.0 {
+                  let mut c = b + 1
+                  while c < cc && sc < maxStates {
+                    let fc = fr.candFreqs[c]
+                    let bc = fr.candBws[c]
+                    if fc >= 1450.0 && fc <= 4300.0 && fc >= fb + 180.0 {
+                      // Pick best optional F4 > F3
+                      let mut fd: f64 = 0.0
+                      let mut bd: f64 = 0.0
+                      let mut d = c + 1
+                      let mut bestDScore: f64 = 1.0e9
+                      while d < cc {
+                        let candD = fr.candFreqs[d]
+                        let candBd = fr.candBws[d]
+                        if candD >= 2500.0 && candD >= fc + 200.0 && candD <= ceiling - 80.0 {
+                          let ds = f64.abs(f64.log2(candD / refF4)) + 0.35 * (candBd / candD)
+                          if ds < bestDScore {
+                            bestDScore = ds
+                            fd = candD
+                            bd = candBd
+                          }
+                        }
+                        d = d + 1
+                      }
+                      // Gentle physiological band prior + bandwidth sharpness preference
+                      let d1 = f64.log2(fa / refF1)
+                      let d2 = f64.log2(fb / refF2)
+                      let d3 = f64.log2(fc / refF3)
+                      let f0ProxPen = if curF0 > 50.0 && fa < curF0 * 1.28 { 1.4 } else { 0.0 }
+                      let priorCost = 0.85 * d1 * d1 + 0.65 * d2 * d2 + 1.15 * d3 * d3 + f0ProxPen
+                      let bwCost = 0.45 * (ba / fa) + 0.40 * (bb / fb) + 0.35 * (bc / fc)
+                      f1Sl[base + sc] = fa
+                      f2Sl[base + sc] = fb
+                      f3Sl[base + sc] = fc
+                      f4Sl[base + sc] = fd
+                      b1Sl[base + sc] = ba
+                      b2Sl[base + sc] = bb
+                      b3Sl[base + sc] = bc
+                      b4Sl[base + sc] = bd
+                      emSl[base + sc] = priorCost + bwCost
+                      sc = sc + 1
+                    }
+                    c = c + 1
+                  }
+                }
+                b = b + 1
+              }
+            }
+            a = a + 1
+          }
+        }
+
+        // Fallback if fewer than 3 valid physiological roots exist in this frame
+        if sc == 0 && cc >= 2 {
+          f1Sl[base] = fr.candFreqs[0]
+          b1Sl[base] = fr.candBws[0]
+          f2Sl[base] = fr.candFreqs[1]
+          b2Sl[base] = fr.candBws[1]
+          if cc >= 3 {
+            f3Sl[base] = fr.candFreqs[2]
+            b3Sl[base] = fr.candBws[2]
+          }
+          if cc >= 4 {
+            f4Sl[base] = fr.candFreqs[3]
+            b4Sl[base] = fr.candBws[3]
+          }
+          emSl[base] = 2.0
+          sc = 1
+        }
+        stCntSl[t] = sc
+        t = t + 1
+      }
+
+      // Viterbi forward pass
+      let mut dp = List<f64>.make()
+      run dp.appendRepeated(bigInf, rLen * maxStates)
+      let mut bk = List<usize>.make()
+      run bk.appendRepeated(0, rLen * maxStates)
+      let dpSl = dp.asMutSlice()
+      let bkSl = bk.asMutSlice()
+
+      let mut s: usize = 0
+      while s < stCntSl[0] {
+        dpSl[s] = emSl[s]
+        s = s + 1
+      }
+
+      t = 1
+      while t < rLen {
+        let base = t * maxStates
+        let pBase = (t - 1) * maxStates
+        let curN = stCntSl[t]
+        let prevN = stCntSl[t - 1]
+        s = 0
+        while s < curN {
+          let cf1 = f1Sl[base + s]
+          let cf2 = f2Sl[base + s]
+          let cf3 = f3Sl[base + s]
+          let mut bestCost = bigInf
+          let mut bestPrev: usize = 0
+          let mut ps: usize = 0
+          while ps < prevN {
+            let pCost = dpSl[pBase + ps]
+            if pCost < bigInf * 0.5 {
+              let pf1 = f1Sl[pBase + ps]
+              let pf2 = f2Sl[pBase + ps]
+              let pf3 = f3Sl[pBase + ps]
+              let j1 = if cf1 > 1.0 && pf1 > 1.0 { f64.abs(f64.log2(cf1 / pf1)) } else { 0.4 }
+              let j2 = if cf2 > 1.0 && pf2 > 1.0 { f64.abs(f64.log2(cf2 / pf2)) } else { 0.4 }
+              let j3 = if cf3 > 1.0 && pf3 > 1.0 { f64.abs(f64.log2(cf3 / pf3)) } else { 0.25 }
+              let trans = 9.5 * j1 + 9.0 * j2 + 7.5 * j3
+              let total = pCost + trans
+              if total < bestCost {
+                bestCost = total
+                bestPrev = ps
+              }
+            }
+            ps = ps + 1
+          }
+          dpSl[base + s] = bestCost + emSl[base + s]
+          bkSl[base + s] = bestPrev
+          s = s + 1
+        }
+        t = t + 1
+      }
+
+      // Backtrack optimal formant track
+      let mut chosen = List<usize>.make()
+      run chosen.appendRepeated(0, rLen)
+      let chSl = chosen.asMutSlice()
+      let lastBase = (rLen - 1) * maxStates
+      let mut bestEnd: usize = 0
+      let mut bestEndCost = bigInf
+      s = 0
+      while s < stCntSl[rLen - 1] {
+        if dpSl[lastBase + s] < bestEndCost {
+          bestEndCost = dpSl[lastBase + s]
+          bestEnd = s
+        }
+        s = s + 1
+      }
+      chSl[rLen - 1] = bestEnd
+      let mut bt = rLen - 1
+      while bt > 0 {
+        chSl[bt - 1] = bkSl[bt * maxStates + chSl[bt]]
+        bt = bt - 1
+      }
+
+      // Extract raw tracked arrays for 3-point median + [0.22, 0.56, 0.22] Gaussian smoothing
+      let mut rF1 = List<f64>.make()
+      let mut rF2 = List<f64>.make()
+      let mut rF3 = List<f64>.make()
+      let mut rF4 = List<f64>.make()
+      run rF1.appendRepeated(0.0, rLen)
+      run rF2.appendRepeated(0.0, rLen)
+      run rF3.appendRepeated(0.0, rLen)
+      run rF4.appendRepeated(0.0, rLen)
+      let r1Sl = rF1.asMutSlice()
+      let r2Sl = rF2.asMutSlice()
+      let r3Sl = rF3.asMutSlice()
+      let r4Sl = rF4.asMutSlice()
+
+      t = 0
+      while t < rLen {
+        let idx = t * maxStates + chSl[t]
+        r1Sl[t] = f1Sl[idx]
+        r2Sl[t] = f2Sl[idx]
+        r3Sl[t] = f3Sl[idx]
+        r4Sl[t] = f4Sl[idx]
+        t = t + 1
+      }
+
+      run smoothPositiveBand(rF1.asMutSlice())
+      run smoothPositiveBand(rF2.asMutSlice())
+      run smoothPositiveBand(rF3.asMutSlice())
+      run smoothPositiveBand(rF4.asMutSlice())
+
+      // Write tracked & smoothed formants back into `self.frames`
+      let s1 = rF1.asSlice()
+      let s2 = rF2.asSlice()
+      let s3 = rF3.asSlice()
+      let s4 = rF4.asSlice()
+      let frMut = self.frames.asMutSlice()
+      t = 0
+      while t < rLen {
+        let idx = t * maxStates + chSl[t]
+        let dstIdx = runStart + t
+        let v1 = s1[t]
+        let v2 = s2[t]
+        let v3 = s3[t]
+        let v4 = s4[t]
+        let mut cnt: usize = 0
+        if v1 > 1.0 { cnt = 1 }
+        if v2 > v1 + 60.0 { cnt = 2 }
+        if v3 > v2 + 80.0 { cnt = 3 }
+        if v4 > v3 + 80.0 { cnt = 4 }
+        frMut[dstIdx].f1 = v1
+        frMut[dstIdx].bw1 = b1Sl[idx]
+        frMut[dstIdx].f2 = v2
+        frMut[dstIdx].bw2 = b2Sl[idx]
+        frMut[dstIdx].f3 = v3
+        frMut[dstIdx].bw3 = b3Sl[idx]
+        frMut[dstIdx].f4 = v4
+        frMut[dstIdx].bw4 = b4Sl[idx]
+        frMut[dstIdx].count = cnt
+        frMut[dstIdx].tracked = cnt >= 2
+        t = t + 1
+      }
+
+      runStart = runEnd
+    }
+  }
+}
+
+fn median3(a: f64, b: f64, c: f64) -> f64 {
+  if a <= b {
+    if b <= c { return b }
+    if a <= c { return c }
+    return a
+  }
+  if a <= c { return a }
+  if b <= c { return c }
+  return b
+}
+
+/// 3-point median despiking followed by gentle [0.22, 0.56, 0.22] Gaussian smoothing (zeros preserved).
+effect fn smoothPositiveBand(vals: &mut [f64]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let n = vals.length
+  if n < 3 {
+    return ()
+  }
+  let mut med = List<f64>.make()
+  run med.appendRepeated(0.0, n)
+  let mSl = med.asMutSlice()
+
+  let mut i: usize = 0
+  while i < n {
+    let cur = vals[i]
+    if cur <= 1.0 {
+      mSl[i] = 0.0
+    } else if i > 0 && i + 1 < n && vals[i - 1] > 1.0 && vals[i + 1] > 1.0 {
+      mSl[i] = median3(vals[i - 1], cur, vals[i + 1])
+    } else {
+      mSl[i] = cur
+    }
+    i = i + 1
+  }
+
+  i = 0
+  while i < n {
+    let cur = mSl[i]
+    if cur <= 1.0 {
+      vals[i] = 0.0
+    } else if i > 0 && i + 1 < n && mSl[i - 1] > 1.0 && mSl[i + 1] > 1.0 {
+      vals[i] = 0.22 * mSl[i - 1] + 0.56 * cur + 0.22 * mSl[i + 1]
+    } else {
+      vals[i] = cur
+    }
+    i = i + 1
   }
 }

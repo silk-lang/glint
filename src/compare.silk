@@ -61,6 +61,13 @@ impl ReferenceClip {
   }
 }
 
+/// Heatmap metric selector when comparing against a Reference.
+pub const HEATMAP_OVERALL: u32 = 0
+pub const HEATMAP_PITCH: u32 = 1
+pub const HEATMAP_SIZE: u32 = 2
+pub const HEATMAP_WEIGHT: u32 = 3
+pub const HEATMAP_VOWEL: u32 = 4
+
 /// One warped point projected onto the target timeline (used for BOTH Ref-on-Take and Take-on-Ref!).
 pub struct AlignedRefPoint {
   pub time: f64,
@@ -74,6 +81,13 @@ pub struct AlignedRefPoint {
   pub f1: f64,
   pub f2: f64,
   pub hasFormants: bool,
+  /// Per-frame normalized divergence [0 = exact match .. 1 = large divergence] for the spectrogram heatmap.
+  pub bothVoiced: bool,
+  pub divOverall: f64,
+  pub divPitch: f64,
+  pub divSize: f64,
+  pub divWeight: f64,
+  pub divVowel: f64,
 }
 
 impl Copy for AlignedRefPoint {}
@@ -448,6 +462,106 @@ effect fn computeMatchScore(
   }
 }
 
+struct FrameDiv {
+  bothVoiced: bool,
+  overall: f64,
+  pitch: f64,
+  size: f64,
+  weight: f64,
+  vowel: f64,
+}
+
+impl Copy for FrameDiv {}
+
+fn computeFrameDiv(tf: VoiceFrame, rf: VoiceFrame, weights: MatchWeights) -> FrameDiv {
+  if !tf.voiced || !rf.voiced || tf.f0 <= 40.0 || rf.f0 <= 40.0 {
+    return FrameDiv { bothVoiced: false, overall: 0.0, pitch: 0.0, size: 0.0, weight: 0.0, vowel: 0.0 }
+  }
+  let dSemi = f64.abs(12.0 * f64.log2(tf.f0 / rf.f0))
+  let dp = f64.min(1.0, dSemi / 6.0)
+  let ds = if tf.vtlCm > 1.0 && rf.vtlCm > 1.0 {
+    f64.min(1.0, f64.abs(tf.vtlCm - rf.vtlCm) / 2.6)
+  } else {
+    f64.min(1.0, f64.abs(tf.sizeNorm - rf.sizeNorm) / 0.45)
+  }
+  let dw = f64.min(1.0, f64.abs(tf.h1h2Db - rf.h1h2Db) / 8.0)
+  let dv = if tf.hasFormants && rf.hasFormants && tf.f1 > 100.0 && rf.f1 > 100.0 && tf.f2 > 300.0 && rf.f2 > 300.0 {
+    let e1 = 12.0 * f64.log2(tf.f1 / rf.f1)
+    let e2 = 12.0 * f64.log2(tf.f2 / rf.f2)
+    f64.min(1.0, f64.sqrt(e1 * e1 + e2 * e2) / 6.0)
+  } else {
+    ds
+  }
+  let wSum = f64.max(1.0, weights.pitch + weights.size + weights.weight + weights.vowel)
+  let ov = (weights.pitch * dp + weights.size * ds + weights.weight * dw + weights.vowel * dv) / wSum
+  return FrameDiv {
+    bothVoiced: true,
+    overall: f64.min(1.0, ov),
+    pitch: dp,
+    size: ds,
+    weight: dw,
+    vowel: dv,
+  }
+}
+
+effect fn smoothDivergence(pts: &mut [AlignedRefPoint]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let n = pts.length
+  if n < 3 {
+    return ()
+  }
+  let mut sOv = List<f64>.make()
+  let mut sP = List<f64>.make()
+  let mut sS = List<f64>.make()
+  let mut sW = List<f64>.make()
+  let mut sV = List<f64>.make()
+  run sOv.appendRepeated(0.0, n)
+  run sP.appendRepeated(0.0, n)
+  run sS.appendRepeated(0.0, n)
+  run sW.appendRepeated(0.0, n)
+  run sV.appendRepeated(0.0, n)
+  let ovSl = sOv.asMutSlice()
+  let pSl = sP.asMutSlice()
+  let sSl = sS.asMutSlice()
+  let wSl = sW.asMutSlice()
+  let vSl = sV.asMutSlice()
+
+  let mut i: usize = 0
+  while i < n {
+    let cur = pts[i]
+    if !cur.bothVoiced {
+      ovSl[i] = 0.0
+      pSl[i] = 0.0
+      sSl[i] = 0.0
+      wSl[i] = 0.0
+      vSl[i] = 0.0
+    } else {
+      let hasL = i > 0 && pts[i - 1].bothVoiced && (cur.time - pts[i - 1].time) <= 0.14
+      let hasR = i + 1 < n && pts[i + 1].bothVoiced && (pts[i + 1].time - cur.time) <= 0.14
+      let w0: f64 = 0.50
+      let wL: f64 = if hasL { 0.25 } else { 0.0 }
+      let wR: f64 = if hasR { 0.25 } else { 0.0 }
+      let inv = 1.0 / (w0 + wL + wR)
+      ovSl[i] = (w0 * cur.divOverall + (if hasL { wL * pts[i - 1].divOverall } else { 0.0 }) + (if hasR { wR * pts[i + 1].divOverall } else { 0.0 })) * inv
+      pSl[i] = (w0 * cur.divPitch + (if hasL { wL * pts[i - 1].divPitch } else { 0.0 }) + (if hasR { wR * pts[i + 1].divPitch } else { 0.0 })) * inv
+      sSl[i] = (w0 * cur.divSize + (if hasL { wL * pts[i - 1].divSize } else { 0.0 }) + (if hasR { wR * pts[i + 1].divSize } else { 0.0 })) * inv
+      wSl[i] = (w0 * cur.divWeight + (if hasL { wL * pts[i - 1].divWeight } else { 0.0 }) + (if hasR { wR * pts[i + 1].divWeight } else { 0.0 })) * inv
+      vSl[i] = (w0 * cur.divVowel + (if hasL { wL * pts[i - 1].divVowel } else { 0.0 }) + (if hasR { wR * pts[i + 1].divVowel } else { 0.0 })) * inv
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < n {
+    pts[i].divOverall = ovSl[i]
+    pts[i].divPitch = pSl[i]
+    pts[i].divSize = sSl[i]
+    pts[i].divWeight = wSl[i]
+    pts[i].divVowel = vSl[i]
+    i = i + 1
+  }
+}
+
 /// Aligns Take <-> Reference bidirectionally via banded DTW (or straight clock time if `!useDtw`),
 /// producing both `Ref-on-Take` and `Take-on-Ref` overlays plus deltas and MatchScore.
 pub effect fn buildCompareAlignment(
@@ -492,6 +606,18 @@ pub effect fn buildCompareAlignment(
     let mut i: usize = 0
     while i < refFs.length {
       let rf = refFs[i]
+      // Match nearest take frame by time for linear fallback divergence
+      let tIdx = if takeFrames.length > 0 {
+        let clamped = if i < takeFrames.length { i } else { takeFrames.length - 1 }
+        clamped
+      } else {
+        0
+      }
+      let fd = if takeFrames.length > 0 {
+        computeFrameDiv(takeFrames[tIdx], rf, weights)
+      } else {
+        FrameDiv { bothVoiced: false, overall: 0.0, pitch: 0.0, size: 0.0, weight: 0.0, vowel: 0.0 }
+      }
       run refOnTake.append(AlignedRefPoint {
         time: rf.time,
         refTime: rf.time,
@@ -503,12 +629,28 @@ pub effect fn buildCompareAlignment(
         f1: rf.f1,
         f2: rf.f2,
         hasFormants: rf.hasFormants,
+        bothVoiced: fd.bothVoiced,
+        divOverall: fd.overall,
+        divPitch: fd.pitch,
+        divSize: fd.size,
+        divWeight: fd.weight,
+        divVowel: fd.vowel,
       })
       i = i + 1
     }
     i = 0
     while i < takeFrames.length {
       let tf = takeFrames[i]
+      let rIdx = if refFs.length > 0 {
+        if i < refFs.length { i } else { refFs.length - 1 }
+      } else {
+        0
+      }
+      let fd = if refFs.length > 0 {
+        computeFrameDiv(tf, refFs[rIdx], weights)
+      } else {
+        FrameDiv { bothVoiced: false, overall: 0.0, pitch: 0.0, size: 0.0, weight: 0.0, vowel: 0.0 }
+      }
       run takeOnRef.append(AlignedRefPoint {
         time: tf.time,
         refTime: tf.time,
@@ -520,9 +662,17 @@ pub effect fn buildCompareAlignment(
         f1: tf.f1,
         f2: tf.f2,
         hasFormants: tf.hasFormants,
+        bothVoiced: fd.bothVoiced,
+        divOverall: fd.overall,
+        divPitch: fd.pitch,
+        divSize: fd.size,
+        divWeight: fd.weight,
+        divVowel: fd.vowel,
       })
       i = i + 1
     }
+    run smoothDivergence(refOnTake.asMutSlice())
+    run smoothDivergence(takeOnRef.asMutSlice())
     // Linear fallback mapping for score & selection bisecting if both have active speech
     let mut linMap = List<usize>.make()
     if n >= 3 && m >= 3 {
@@ -651,13 +801,14 @@ pub effect fn buildCompareAlignment(
     guard = guard - 1
   }
 
-  // 1. Reference projected onto Take's timestamps + store matched frame pairs for selection bisecting
+  // 1. Reference projected onto Take's timestamps + store matched frame pairs + per-frame divergence
   i = 0
   while i < n {
     let tIdx = aSl[i].origIdx
     let rIdx = bSl[mapJSl[i]].origIdx
     let tf = takeFrames[tIdx]
     let rf = refFs[rIdx]
+    let fd = computeFrameDiv(tf, rf, weights)
     run pairs.append(DtwPair { takeIdx: tIdx, refIdx: rIdx })
     run refOnTake.append(AlignedRefPoint {
       time: tf.time,
@@ -670,6 +821,12 @@ pub effect fn buildCompareAlignment(
       f1: rf.f1,
       f2: rf.f2,
       hasFormants: rf.hasFormants,
+      bothVoiced: fd.bothVoiced,
+      divOverall: fd.overall,
+      divPitch: fd.pitch,
+      divSize: fd.size,
+      divWeight: fd.weight,
+      divVowel: fd.vowel,
     })
     i = i + 1
   }
@@ -679,6 +836,7 @@ pub effect fn buildCompareAlignment(
   while j < m {
     let rf = refFs[bSl[j].origIdx]
     let tf = takeFrames[aSl[mapISl[j]].origIdx]
+    let fd = computeFrameDiv(tf, rf, weights)
     run takeOnRef.append(AlignedRefPoint {
       time: rf.time,
       refTime: tf.time,
@@ -690,9 +848,18 @@ pub effect fn buildCompareAlignment(
       f1: tf.f1,
       f2: tf.f2,
       hasFormants: tf.hasFormants,
+      bothVoiced: fd.bothVoiced,
+      divOverall: fd.overall,
+      divPitch: fd.pitch,
+      divSize: fd.size,
+      divWeight: fd.weight,
+      divVowel: fd.vowel,
     })
     j = j + 1
   }
+
+  run smoothDivergence(refOnTake.asMutSlice())
+  run smoothDivergence(takeOnRef.asMutSlice())
 
   let score = run computeMatchScore(
     takeSummary,

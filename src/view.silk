@@ -2,14 +2,14 @@
 //!
 //! Muted light-chrome studio + darkroom spectrogram well.
 import audio_native { SORT_ALPHA, SORT_OVERALL, SORT_PITCH, SORT_SIZE, SORT_VOWEL, SORT_WEIGHT }
-import coach { CoachTip, targetLabel }
 import colormap { paletteIndex, paletteName }
+import compare { HEATMAP_OVERALL, HEATMAP_PITCH, HEATMAP_SIZE, HEATMAP_VOWEL, HEATMAP_WEIGHT }
 import formants { VOWELS_FEM, VOWELS_MASC, VOWEL_MODE_BOTH, VOWEL_MODE_FEM, VOWEL_MODE_MASC }
 import overlays { AxisTick, GuideBadge, vowelX, vowelY }
 import studio {
   AXIS_W,
   CTX_AUDIO,
-  CTX_COACH_TARGET,
+  CTX_FORMANTS,
   CTX_LIB_SORT,
   CTX_PALETTE,
   CTX_SPEED,
@@ -266,6 +266,42 @@ fn topAction(h: &Document<Message>, label: string, msg: Message) -> Node {
 // Toolbar (40px) — 3 States: Normal / Recording / Drill or Echo
 // ============================================================================
 
+fn formantBtnLabel(on: bool, mask: u32) -> string<'static> {
+  if !on || mask == 0 {
+    return "Formants ▾"
+  }
+  if mask == 15 {
+    return "F1–F4 ▾"
+  }
+  if mask == 7 {
+    return "F1–F3 ▾"
+  }
+  if mask == 3 {
+    return "F1–F2 ▾"
+  }
+  if mask == 1 {
+    return "F1 ▾"
+  }
+  if mask == 2 {
+    return "F2 ▾"
+  }
+  if mask == 4 {
+    return "F3 ▾"
+  }
+  if mask == 8 {
+    return "F4 ▾"
+  }
+  return "Formants ▾"
+}
+
+fn heatmapMetricLabel(metric: u32) -> string<'static> {
+  if metric == HEATMAP_PITCH { return "Pitch" }
+  if metric == HEATMAP_SIZE { return "Size" }
+  if metric == HEATMAP_WEIGHT { return "Weight" }
+  if metric == HEATMAP_VOWEL { return "Vowels" }
+  return "Overall"
+}
+
 fn renderToolbar(m: &Overtone, h: &Document<Message>) -> Node {
   if m.practiceMode != PRACTICE_OFF {
     return renderDrillToolbar(m, h)
@@ -340,12 +376,22 @@ fn renderToolbar(m: &Overtone, h: &Document<Message>) -> Node {
         &[h.class("items-center gap-[2px] shrink-0")],
         &[
           overlayPill(h, "Pitch", m.showPitch, Message.TogglePitch),
-          overlayPill(h, "Formants", m.showFormants, Message.ToggleFormants),
+          overlayPill(
+            h,
+            formantBtnLabel(m.showFormants, m.formantMask),
+            m.showFormants && m.formantMask != 0,
+            Message.OpenContextMenu { kind: CTX_FORMANTS, x: 350.0, y: 84.0 },
+          ),
           overlayPill(h, "Overtones", m.showHarmonics, Message.ToggleHarmonics),
-          overlayPill(h, "Size/Wt", m.showMetricsLane, Message.ToggleMetricsLane),
+          overlayPill(h, "Contours", m.showMetricsLane, Message.ToggleMetricsLane),
           overlayPill(h, "Grid", m.showNoteGrid, Message.ToggleNoteGrid),
           overlayPill(h, if guideCount > 0 { "Guides ·" } else { "Guides" }, m.showGuidesPanel || guideCount > 0, Message.ToggleGuidesPanel),
           overlayPill(h, "DTW", m.useDtwAlign, Message.ToggleDtwAlign),
+          if m.refClip.active {
+            overlayPill(h, "Heatmap", m.showHeatmap, Message.ToggleHeatmap)
+          } else {
+            h.empty()
+          },
           if m.refClip.active {
             overlayPill(h, "Ref wave", m.showRefWave, Message.ToggleRefWave)
           } else {
@@ -1400,25 +1446,73 @@ fn renderSizeWeightLane(m: &Overtone, h: &Document<Message>) -> Node {
     &[h.class("shrink-0 gap-[4px]")],
     &[
       h.row(
-        &[h.class("items-center gap-[14px] pl-[46px] text-[11px] leading-[14px] text-[#6B6B70]")],
+        &[h.class("items-center gap-[12px] pl-[46px] text-[11px] leading-[14px] text-[#6B6B70]")],
         &[
-          txt(h, "Size & weight", "font-semibold text-[#0B0B0C]"),
           h.row(
-            &[h.class("items-center gap-[5px]")],
+            &[h.class("items-center gap-[2px] p-[2px] rounded-[5px] bg-[#F1F1F2]")],
             &[
-              h.box(&[h.class("w-[12px] h-[2px] bg-[#0B0B0C]")], &[]),
-              h.text("You"),
+              miniTabBtn(h, "Pitch contour", m.showPitchLaneTab, Message.SetBottomLaneTab { pitch: true }),
+              miniTabBtn(h, "Size & weight", !m.showPitchLaneTab, Message.SetBottomLaneTab { pitch: false }),
             ],
           ),
-          h.row(
-            &[h.class("items-center gap-[5px]")],
-            &[
-              h.box(&[h.class("w-[12px] h-[1.5px] bg-[#8A8A90]")], &[]),
-              h.text("Ref"),
-            ],
-          ),
+          if m.showPitchLaneTab {
+            h.row(
+              &[h.class("items-center gap-[10px]")],
+              &[
+                h.row(
+                  &[h.class("items-center gap-[5px]")],
+                  &[
+                    h.box(&[h.class("w-[12px] h-[2px] bg-[#0B0B0C]")], &[]),
+                    h.text("You"),
+                  ],
+                ),
+                if m.refClip.active {
+                  h.row(
+                    &[h.class("items-center gap-[5px]")],
+                    &[
+                      h.box(&[h.class("w-[12px] h-[2px] bg-[#2E7D96]")], &[]),
+                      txt(h, "Ref (±1st target)", "text-[#2E7D96]"),
+                    ],
+                  )
+                } else {
+                  h.empty()
+                },
+              ],
+            )
+          } else {
+            h.row(
+              &[h.class("items-center gap-[10px]")],
+              &[
+                h.row(
+                  &[h.class("items-center gap-[5px]")],
+                  &[
+                    h.box(&[h.class("w-[12px] h-[2px] bg-[#0B0B0C]")], &[]),
+                    h.text("Size (small ↑)"),
+                  ],
+                ),
+                h.row(
+                  &[h.class("items-center gap-[5px]")],
+                  &[
+                    h.box(&[h.class("w-[12px] h-[2px] bg-[#C47B1E]")], &[]),
+                    h.text("Weight (light ↑)"),
+                  ],
+                ),
+                if m.refClip.active {
+                  h.row(
+                    &[h.class("items-center gap-[5px]")],
+                    &[
+                      h.box(&[h.class("w-[12px] h-[1.5px] bg-[#2E7D96]")], &[]),
+                      txt(h, "Ref", "text-[#2E7D96]"),
+                    ],
+                  )
+                } else {
+                  h.empty()
+                },
+              ],
+            )
+          },
           h.box(&[h.class("flex-1")], &[]),
-          h.text("Small / light ↑"),
+          h.text(if m.showPitchLaneTab { "Higher pitch ↑" } else { "Small / light ↑" }),
         ],
       ),
       h.row(
@@ -1427,8 +1521,8 @@ fn renderSizeWeightLane(m: &Overtone, h: &Document<Message>) -> Node {
           h.column(
             &[h.class("w-[46px] shrink-0 justify-between items-end pr-[8px] py-[4px] text-[10px] leading-[12px] text-[#9A9AA0]")],
             &[
-              h.text("Size"),
-              h.text("Wt"),
+              txt(h, if m.showPitchLaneTab { "High" } else { "Small" }, ""),
+              txt(h, if m.showPitchLaneTab { "Low" } else { "Heavy" }, ""),
             ],
           ),
           h.box(
@@ -1437,7 +1531,11 @@ fn renderSizeWeightLane(m: &Overtone, h: &Document<Message>) -> Node {
               h.style(&[css.height(px(METRICS_H))]),
             ],
             &[
-              h.drawing(&m.metricsLaneDrawing, &[h.class("absolute inset-0 w-full h-full pointer-events-none")]),
+              if m.showPitchLaneTab {
+                h.drawing(&m.pitchLaneDrawing, &[h.class("absolute inset-0 w-full h-full pointer-events-none")])
+              } else {
+                h.drawing(&m.metricsLaneDrawing, &[h.class("absolute inset-0 w-full h-full pointer-events-none")])
+              },
               if selValid && selW > 0.05 {
                 h.box(
                   &[
@@ -1562,11 +1660,6 @@ fn renderReadoutsRail(m: &Overtone, h: &Document<Message>) -> Node {
 }
 
 fn renderMatchCard(m: &Overtone, h: &Document<Message>) -> Node {
-  let showCoach = !m.refClip.active || m.coachPreferView
-  if showCoach {
-    return renderCoachCard(m, h)
-  }
-
   let useSel = m.hasSelection && m.selCompare.valid
   let sc = if useSel { m.selCompare.score } else { m.compare.score }
   let valid = m.refClip.active && sc.valid
@@ -1576,35 +1669,23 @@ fn renderMatchCard(m: &Overtone, h: &Document<Message>) -> Node {
     &[h.class("px-[16px] pt-[12px] pb-[12px] gap-[10px] border-b border-[#E6E6E8] shrink-0")],
     &[
       h.row(
-        &[h.class("items-center justify-between gap-[6px]")],
+        &[h.class("items-center justify-between")],
         &[
-          h.row(
-            &[h.class("items-center gap-[6px]")],
-            &[
-              txt(
-                h,
-                if useSel { "Match vs ref · sel" } else { "Match vs ref" },
-                "text-[11px] leading-[14px] font-semibold tracking-[0.06em] uppercase text-[#6B6B70]",
-              ),
-              h.row(
-                &[h.class("gap-[2px]")],
-                &[
-                  miniTabBtn(h, "Ref", true, Message.SetCoachViewMode { coach: false }),
-                  miniTabBtn(h, "Coach", false, Message.SetCoachViewMode { coach: true }),
-                ],
-              ),
-            ],
+          txt(
+            h,
+            if useSel { "Match vs ref · sel" } else { "Match vs ref" },
+            "text-[11px] leading-[14px] font-semibold tracking-[0.06em] uppercase text-[#6B6B70]",
           ),
           h.row(
-            &[h.class("items-center gap-[6px]")],
+            &[h.class("items-center gap-[8px]")],
             &[
               txtA(
                 h,
-                "Weights ▾",
+                if m.refClip.active { "Weights ▾" } else { "Pin ref" },
                 &[
                   h.class("text-[11px] leading-[14px] text-[#6B6B70] hover:text-[#0B0B0C]"),
                   h.cursor(Cursor.Pointer),
-                  h.onClick(Message.OpenSettingsTab { tab: SET_COMPARE }),
+                  h.onClick(if m.refClip.active { Message.OpenSettingsTab { tab: SET_COMPARE } } else { Message.PinReference }),
                 ],
               ),
               railHeaderBtn(h, "›", false, Message.ToggleReadouts),
@@ -1617,19 +1698,23 @@ fn renderMatchCard(m: &Overtone, h: &Document<Message>) -> Node {
           &[h.class("items-center gap-[16px]")],
           &[
             h.row(
-              &[h.class("items-baseline gap-[2px] shrink-0")],
+              &[
+                h.class("items-baseline gap-[2px] shrink-0"),
+                h.cursor(Cursor.Pointer),
+                h.onClick(Message.SetHeatmapMetric { metric: HEATMAP_OVERALL }),
+              ],
               &[
                 txt(h, overallNum, "text-[46px] leading-[44px] font-extrabold tracking-[-0.05em] text-[#0B0B0C]"),
                 txt(h, "%", "text-[16px] font-semibold text-[#6B6B70]"),
               ],
             ),
             h.column(
-              &[h.class("flex-1 gap-[5px]")],
+              &[h.class("flex-1 gap-[3px]")],
               &[
-                scoreBarRow(h, "Pitch", u32.toI32(sc.pitchScore), m.readoutWeakestMetric == 1),
-                scoreBarRow(h, "Size", u32.toI32(sc.sizeScore), m.readoutWeakestMetric == 2),
-                scoreBarRow(h, "Weight", u32.toI32(sc.weightScore), m.readoutWeakestMetric == 3),
-                scoreBarRow(h, "Vowels", u32.toI32(sc.vowelScore), m.readoutWeakestMetric == 4),
+                scoreBarRowClick(h, "Pitch", u32.toI32(sc.pitchScore), m.readoutWeakestMetric == 1, m.heatmapMetric == HEATMAP_PITCH, Message.SetHeatmapMetric { metric: HEATMAP_PITCH }),
+                scoreBarRowClick(h, "Size", u32.toI32(sc.sizeScore), m.readoutWeakestMetric == 2, m.heatmapMetric == HEATMAP_SIZE, Message.SetHeatmapMetric { metric: HEATMAP_SIZE }),
+                scoreBarRowClick(h, "Weight", u32.toI32(sc.weightScore), m.readoutWeakestMetric == 3, m.heatmapMetric == HEATMAP_WEIGHT, Message.SetHeatmapMetric { metric: HEATMAP_WEIGHT }),
+                scoreBarRowClick(h, "Vowels", u32.toI32(sc.vowelScore), m.readoutWeakestMetric == 4, m.heatmapMetric == HEATMAP_VOWEL, Message.SetHeatmapMetric { metric: HEATMAP_VOWEL }),
               ],
             ),
           ],
@@ -1637,12 +1722,51 @@ fn renderMatchCard(m: &Overtone, h: &Document<Message>) -> Node {
       } else {
         txt(
           h,
-          "Pin any take as a reference (P) to score pitch, vocal tract size, weight, and vowel match.",
+          "Pin any take as a reference (P) to compare pitch, size, weight, vowels, and divergence heatmap.",
           "text-[12px] leading-[17px] text-[#6B6B70]",
         )
+      },
+      if valid {
+        h.row(
+          &[h.class("w-full items-center justify-between gap-[6px] pt-[2px]")],
+          &[
+            h.row(
+              &[
+                h.class("items-center gap-[5px]"),
+                h.cursor(Cursor.Pointer),
+                h.onClick(Message.ToggleHeatmap),
+              ],
+              &[
+                txt(h, "Heatmap ·", "text-[10px] leading-[12px] text-[#6B6B70]"),
+                txt(
+                  h,
+                  if m.showHeatmap { heatmapMetricLabel(m.heatmapMetric) } else { "Off" },
+                  "text-[10px] leading-[12px] font-semibold text-[#0B0B0C]",
+                ),
+              ],
+            ),
+            h.row(
+              &[h.class("items-center gap-[4px]")],
+              &[
+                txt(h, "match", "text-[9px] text-[#8A8A90]"),
+                h.row(
+                  &[h.class("w-[42px] h-[5px] rounded-[2px] overflow-hidden")],
+                  &[
+                    h.box(&[h.class("flex-1 bg-[#3E8E68]")], &[]),
+                    h.box(&[h.class("flex-1 bg-[#D99B26]")], &[]),
+                    h.box(&[h.class("flex-1 bg-[#D9381E]")], &[]),
+                  ],
+                ),
+                txt(h, "drift", "text-[9px] text-[#8A8A90]"),
+              ],
+            ),
+          ],
+        )
+      } else {
+        h.empty()
       },
       if valid && String.byteLength(String.view(&m.readoutCoachHint)) > 0 {
-        txt(h, String.view(&m.readoutCoachHint), "text-[12px] leading-[16px] text-[#3A3A40]")
+        txt(h, String.view(&m.readoutCoachHint), "text-[11px] leading-[15px] text-[#3A3A40]")
       } else {
         h.empty()
       },
@@ -1650,157 +1774,22 @@ fn renderMatchCard(m: &Overtone, h: &Document<Message>) -> Node {
   )
 }
 
-fn renderCoachCard(m: &Overtone, h: &Document<Message>) -> Node {
-  let cr = &m.coachReport
-  let valid = cr.valid
-  let overallNum = if valid { pctDigits(u32.toI32(cr.overall)) } else { "—" }
-  let b1Label = if cr.isNeutral { "Balance" } else { "Pitch" }
-  let b2Label = if cr.isNeutral { "Clarity" } else { "Size" }
-  let b3Label = if cr.isNeutral { "Steady" } else { "Weight" }
-  let b4Label = if cr.isNeutral { "Flow" } else { "Balance" }
-  let tips = cr.tips.asSlice()
-
-  return h.column(
-    &[h.class("px-[16px] pt-[12px] pb-[12px] gap-[10px] border-b border-[#E6E6E8] shrink-0")],
-    &[
-      h.row(
-        &[h.class("items-center justify-between gap-[6px]")],
-        &[
-          h.row(
-            &[h.class("items-center gap-[6px]")],
-            &[
-              txt(h, "Coach", "text-[11px] leading-[14px] font-semibold tracking-[0.06em] uppercase text-[#6B6B70]"),
-              if m.refClip.active {
-                h.row(
-                  &[h.class("gap-[2px]")],
-                  &[
-                    miniTabBtn(h, "Ref", false, Message.SetCoachViewMode { coach: false }),
-                    miniTabBtn(h, "Coach", true, Message.SetCoachViewMode { coach: true }),
-                  ],
-                )
-              } else {
-                h.empty()
-              },
-            ],
-          ),
-          h.row(
-            &[h.class("items-center gap-[6px]")],
-            &[
-              h.row(
-                &[
-                  h.class("items-center gap-[3px] px-[6px] py-[2px] rounded-[4px] border border-[#E2E2E5] bg-white glint-btn-hover"),
-                  h.cursor(Cursor.Pointer),
-                  h.onClick(Message.OpenContextMenu { kind: CTX_COACH_TARGET, x: 1180.0, y: 116.0 }),
-                ],
-                &[
-                  txt(h, targetLabel(m.coachTarget), "text-[11px] leading-[14px] text-[#0B0B0C] font-medium"),
-                  txt(h, "▾", "text-[10px] text-[#8A8A90]"),
-                ],
-              ),
-              railHeaderBtn(h, "›", false, Message.ToggleReadouts),
-            ],
-          ),
-        ],
-      ),
-      if valid {
-        h.row(
-          &[h.class("items-center gap-[16px]")],
-          &[
-            h.row(
-              &[h.class("items-baseline gap-[2px] shrink-0")],
-              &[
-                txt(h, overallNum, "text-[46px] leading-[44px] font-extrabold tracking-[-0.05em] text-[#0B0B0C]"),
-                txt(h, "%", "text-[16px] font-semibold text-[#6B6B70]"),
-              ],
-            ),
-            h.column(
-              &[h.class("flex-1 gap-[5px]")],
-              &[
-                scoreBarRow(h, b1Label, u32.toI32(cr.bar1), cr.weakestMetric == 1),
-                scoreBarRow(h, b2Label, u32.toI32(cr.bar2), cr.weakestMetric == 2),
-                scoreBarRow(h, b3Label, u32.toI32(cr.bar3), cr.weakestMetric == 3),
-                scoreBarRow(h, b4Label, u32.toI32(cr.bar4), cr.weakestMetric == 4),
-              ],
-            ),
-          ],
-        )
-      } else {
-        txt(
-          h,
-          "Record or open a voiced take to get real-time resonance, weight, clarity, and phrasing tips.",
-          "text-[12px] leading-[17px] text-[#6B6B70]",
-        )
-      },
-      if valid && tips.length > 0 {
-        h.column(
-          &[h.class("w-full gap-[6px]")],
-          &[
-            h.each<CoachTip>(
-              tips,
-              |tip| h.column(
-                &[
-                  h.class("w-full px-[8px] py-[6px] rounded-[5px] gap-[3px] border"),
-                  h.classSelect(
-                    tip.isPrimary,
-                    "bg-[#FDF6F4] border-[#F3D5CE]",
-                    "bg-[#F8F8F9] border-[#ECECEE]",
-                  ),
-                  if tip.hasSpan { h.cursor(Cursor.Pointer) } else { h.none() },
-                  if tip.hasSpan {
-                    h.onClick(Message.FocusCoachSpan { t0: tip.t0, t1: tip.t1 })
-                  } else {
-                    h.none()
-                  },
-                ],
-                &[
-                  h.row(
-                    &[h.class("w-full items-center justify-between gap-[6px]")],
-                    &[
-                      txtA(
-                        h,
-                        String.view(&tip.title),
-                        &[
-                          h.class("text-[11px] leading-[14px] font-semibold"),
-                          h.classSelect(tip.isPrimary, "text-[#D9381E]", "text-[#0B0B0C]"),
-                        ],
-                      ),
-                      if tip.hasSpan {
-                        txt(
-                          h,
-                          String.view(&tip.spanLabel),
-                          "px-[5px] py-[1px] rounded-[3px] bg-white border border-[#E2E2E5] glint-mono text-[9px] leading-[12px] text-[#6B6B70] shrink-0",
-                        )
-                      } else {
-                        h.empty()
-                      },
-                    ],
-                  ),
-                  txt(h, String.view(&tip.detail), "text-[11px] leading-[15px] text-[#3A3A40]"),
-                ],
-              ),
-            ),
-          ],
-        )
-      } else if valid && String.byteLength(String.view(&cr.summaryLine)) > 0 {
-        txt(h, String.view(&cr.summaryLine), "text-[12px] leading-[16px] text-[#3A3A40]")
-      } else {
-        h.empty()
-      },
-    ],
-  )
-}
-
-fn scoreBarRow(h: &Document<Message>, label: string, val: i32, alert: bool) -> Node {
+fn scoreBarRowClick(h: &Document<Message>, label: string, val: i32, alert: bool, selected: bool, msg: Message) -> Node {
   let pct = i32.toF32(if val < 0 { 0 } else if val > 100 { 100 } else { val })
   return h.row(
-    &[h.class("items-center gap-[8px]")],
+    &[
+      h.class("items-center gap-[8px] px-[4px] py-[1px] -mx-[4px] rounded-[4px] glint-btn-hover"),
+      h.classWhen(selected, "bg-[#F1F1F2]"),
+      h.cursor(Cursor.Pointer),
+      h.onClick(move msg),
+    ],
     &[
       txtA(
         h,
         label,
         &[
           h.class("w-[42px] shrink-0 text-[11px] leading-[13px]"),
-          h.classSelect(alert, "text-[#D9381E] font-semibold", "text-[#6B6B70]"),
+          h.classSelect(alert, "text-[#D9381E] font-semibold", if selected { "text-[#0B0B0C] font-semibold" } else { "text-[#6B6B70]" }),
         ],
       ),
       h.box(
@@ -1909,9 +1898,9 @@ fn renderPitchTuner(m: &Overtone, h: &Document<Message>) -> Node {
           h.row(
             &[h.class("w-full justify-between glint-mono text-[9px] leading-[10px] text-[#9A9AA2]")],
             &[
-              h.text("−50"),
-              h.text(if m.readoutVoiced { "0¢" } else { "unvoiced" }),
-              h.text("+50"),
+              txt(h, "−50", ""),
+              txt(h, if m.readoutVoiced { "0¢" } else { "unvoiced" }, ""),
+              txt(h, "+50", ""),
             ],
           ),
         ],
@@ -1921,7 +1910,6 @@ fn renderPitchTuner(m: &Overtone, h: &Document<Message>) -> Node {
 }
 
 fn renderSizeWeightPad(m: &Overtone, h: &Document<Message>) -> Node {
-  let coachMode = !m.refClip.active || m.coachPreferView
   return h.column(
     &[h.class("px-[16px] py-[10px] gap-[6px] border-b border-[#E6E6E8] shrink-0")],
     &[
@@ -1929,10 +1917,16 @@ fn renderSizeWeightPad(m: &Overtone, h: &Document<Message>) -> Node {
         &[h.class("items-center justify-between")],
         &[
           txt(h, "Size × weight", "text-[11px] leading-[14px] font-semibold tracking-[0.06em] uppercase text-[#6B6B70]"),
-          txt(
-            h,
-            if coachMode { "● you ○ target (click)" } else { "● you ○ ref" },
-            "text-[10px] leading-[12px] text-[#6B6B70]",
+          h.row(
+            &[h.class("items-center gap-[8px] text-[10px] leading-[12px]")],
+            &[
+              txt(h, "● you", "text-[#0B0B0C]"),
+              if m.refClip.active {
+                txt(h, "○ ref", "text-[#2E7D96] font-medium")
+              } else {
+                h.empty()
+              },
+            ],
           ),
         ],
       ),
@@ -1941,26 +1935,18 @@ fn renderSizeWeightPad(m: &Overtone, h: &Document<Message>) -> Node {
         &[
           h.row(
             &[h.class("w-full justify-between text-[9px] leading-[11px] text-[#9A9AA0]")],
-            &[h.text("Hollow"), h.text("Light + small")],
+            &[txt(h, "Hollow", ""), txt(h, "Light + small", "")],
           ),
           h.box(
             &[
-              h.testId("size-weight-pad"),
               h.class("w-full rounded-[4px] bg-[#F7F7F8] overflow-hidden"),
               h.style(&[css.height(px(PAD_H))]),
-              if coachMode { h.cursor(Cursor.Crosshair) } else { h.none() },
-              h.onLayout(|r| Message.PadLayout { rect: r }),
-              if coachMode {
-                h.onPointerDown(|e| Reply<Message>.EmitAndStop { message: Message.SetCustomCoachPoint { x: e.x, y: e.y } })
-              } else {
-                h.none()
-              },
             ],
             &[h.drawing(&m.sizeWeightDrawing, &[h.class("w-full h-full pointer-events-none")])],
           ),
           h.row(
             &[h.class("w-full justify-between text-[9px] leading-[11px] text-[#9A9AA0]")],
-            &[h.text("Heavy + big"), h.text("Overfull")],
+            &[txt(h, "Heavy + big", ""), txt(h, "Overfull", "")],
           ),
         ],
       ),
@@ -2000,6 +1986,11 @@ fn renderVowelsCard(m: &Overtone, h: &Document<Message>) -> Node {
               txt(h, "Vowels", "text-[11px] leading-[14px] font-semibold tracking-[0.06em] uppercase text-[#6B6B70]"),
               if m.readoutVowel != "—" {
                 txt(h, m.readoutVowel, "glint-mono text-[11px] font-semibold text-[#0B0B0C]")
+              } else {
+                h.empty()
+              },
+              if m.refClip.active {
+                txt(h, "○ ref", "text-[10px] leading-[12px] text-[#2E7D96] font-medium")
               } else {
                 h.empty()
               },

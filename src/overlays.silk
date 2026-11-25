@@ -5,7 +5,13 @@
 //!   - Power spectrum slice + smooth LPC vocal-tract envelope + F1-F4 / F0 markers
 //!   - 2D Vowel Space (F1 vs F2 phonetic trapezoid with IPA landmarks & live voice position)
 //!   - Waveform overview strip with visible viewport window & playhead
-import compare { AlignedRefPoint }
+import compare {
+  AlignedRefPoint,
+  HEATMAP_PITCH,
+  HEATMAP_SIZE,
+  HEATMAP_VOWEL,
+  HEATMAP_WEIGHT
+}
 import dsp { ColumnData }
 import formants {
   DEFAULT_LPC_ORDER,
@@ -53,8 +59,10 @@ pub const COL_INK: Rgba<f32> = Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 1.0 
 pub const COL_INK_SOFT: Rgba<f32> = Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 0.45 }
 pub const COL_MUTED: Rgba<f32> = Rgba<f32> { r: 0.541, g: 0.541, b: 0.565, a: 1.0 }
 pub const COL_VERMILION: Rgba<f32> = Rgba<f32> { r: 0.851, g: 0.220, b: 0.118, a: 1.0 }
+pub const COL_REF_TEAL: Rgba<f32> = Rgba<f32> { r: 0.180, g: 0.490, b: 0.588, a: 1.0 }
+pub const COL_REF_TEAL_SOFT: Rgba<f32> = Rgba<f32> { r: 0.180, g: 0.490, b: 0.588, a: 0.22 }
 pub const COL_SIZE: Rgba<f32> = Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 1.0 }
-pub const COL_WEIGHT: Rgba<f32> = Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 0.45 }
+pub const COL_WEIGHT: Rgba<f32> = Rgba<f32> { r: 0.769, g: 0.482, b: 0.118, a: 1.0 }
 pub const COL_BREATHY: Rgba<f32> = Rgba<f32> { r: 0.851, g: 0.220, b: 0.118, a: 0.08 }
 
 pub struct AxisTick {
@@ -75,9 +83,12 @@ pub struct OverlayOptions {
   pub showPitch: bool,
   pub showHarmonics: bool,
   pub showFormants: bool,
+  pub formantMask: u32,
   pub showNoteGrid: bool,
   pub showRefOverlay: bool,
   pub showRefWave: bool,
+  pub showHeatmap: bool,
+  pub heatmapMetric: u32,
   pub useDtwAlign: bool,
   pub plotOnRef: bool,
   pub displayClarity: f64,
@@ -483,27 +494,58 @@ effect fn drawFormantBand(
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  let mut i: usize = 0
-  while i < frames.length {
-    let fr = frames[i]
-    if fr.time >= vp.t0 && fr.time <= vp.t1 && fr.count > which {
+  // Draw tracked voiced formant contours as smooth anti-aliased ribbons (dark halo + crisp stroke)
+  // instead of scattered raw dots!
+  let haloCol = Rgba<f32> { r: 0.04, g: 0.04, b: 0.05, a: 0.52 }
+  let strokeW: f32 = if which == 0 { 2.2 } else if which == 1 { 2.1 } else { 1.7 }
+  let haloW: f32 = strokeW + 2.0
+
+  // Pass 0: dark halo backing, Pass 1: crisp formant ribbon
+  let mut pass: usize = 0
+  while pass < 2 {
+    let mut inRun = false
+    let mut runPts: usize = 0
+    let mut prevHz: f64 = 0.0
+    let mut prevT: f64 = 0.0
+    let mut drewAny = false
+    let mut i: usize = 0
+    while i < frames.length {
+      let fr = frames[i]
       let hz = if which == 0 { fr.f1 } else if which == 1 { fr.f2 } else if which == 2 { fr.f3 } else { fr.f4 }
-      if hz >= vp.f0 && hz <= vp.f1 {
+      let ok = fr.tracked
+        && fr.count > which
+        && hz >= vp.f0
+        && hz <= vp.f1
+        && fr.time >= vp.t0 - 0.08
+        && fr.time <= vp.t1 + 0.08
+      if !ok || (inRun && ((fr.time - prevT) > 0.055 || semitonesBetween(prevHz, hz) > 7.5)) {
+        inRun = false
+        runPts = 0
+      }
+      if ok {
         let x = xOfTime(vp, fr.time, width)
         let y = yOfFreq(vp, hz, height)
-        run cmds.append(
-          CanvasCommand.FillRect {
-            x: x - 2.2,
-            y: y - 2.2,
-            width: 4.4,
-            height: 4.4,
-            radius: 2.2,
-            color: color,
-          },
-        )
+        if !inRun {
+          run cmds.append(CanvasCommand.MoveTo { x: x, y: y })
+          inRun = true
+          runPts = 1
+        } else {
+          run cmds.append(CanvasCommand.LineTo { x: x, y: y })
+          runPts = runPts + 1
+          drewAny = true
+        }
+        prevHz = hz
+        prevT = fr.time
       }
+      i = i + 1
     }
-    i = i + 1
+    if drewAny {
+      run cmds.append(CanvasCommand.Stroke {
+        color: if pass == 0 { haloCol } else { color },
+        width: if pass == 0 { haloW } else { strokeW },
+      })
+    }
+    pass = pass + 1
   }
 }
 
@@ -779,6 +821,106 @@ effect fn drawRefWaveformRibbon(
   }
 }
 
+fn heatmapDivergenceAt(pt: AlignedRefPoint, metric: u32) -> f64 {
+  if metric == HEATMAP_PITCH { return pt.divPitch }
+  if metric == HEATMAP_SIZE { return pt.divSize }
+  if metric == HEATMAP_WEIGHT { return pt.divWeight }
+  if metric == HEATMAP_VOWEL { return pt.divVowel }
+  return pt.divOverall
+}
+
+fn heatmapColor(div: f64, alpha: f32) -> Rgba<f32> {
+  // Smooth sage-green (close match) -> warm amber (moderate) -> vermilion (high divergence)
+  let t = f64.toF32(f64.max(0.0, f64.min(1.0, div)))
+  if t <= 0.45 {
+    let u = t / 0.45
+    return Rgba<f32> {
+      r: 0.243 + (0.851 - 0.243) * u,
+      g: 0.557 + (0.608 - 0.557) * u,
+      b: 0.408 + (0.149 - 0.408) * u,
+      a: alpha,
+    }
+  }
+  let u = (t - 0.45) / 0.55
+  return Rgba<f32> {
+    r: 0.851 + (0.851 - 0.851) * u,
+    g: 0.608 + (0.220 - 0.608) * u,
+    b: 0.149 + (0.118 - 0.149) * u,
+    a: alpha,
+  }
+}
+
+effect fn drawDivergenceHeatmap(
+  cmds: &mut List<CanvasCommand>,
+  alignedRef: &[AlignedRefPoint],
+  vp: &Viewport,
+  width: f32,
+  height: f32,
+  opts: OverlayOptions,
+  refWaveVisible: bool,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if alignedRef.length < 2 || width <= 8.0 {
+    return ()
+  }
+  let barY: f32 = if refWaveVisible { 34.0 } else { 0.0 }
+  let barH: f32 = 8.0
+  let washH: f32 = f32.min(height - barY - barH, 120.0)
+
+  // Dark backing rail so the heatmap colors pop cleanly against the spectrogram
+  run cmds.append(
+    CanvasCommand.FillRect {
+      x: 0.0,
+      y: barY,
+      width: width,
+      height: barH,
+      radius: 0.0,
+      color: Rgba<f32> { r: 0.04, g: 0.04, b: 0.05, a: 0.78 },
+    },
+  )
+
+  let mut i: usize = 0
+  while i < alignedRef.length {
+    let pt = alignedRef[i]
+    if pt.bothVoiced && pt.time >= vp.t0 - 0.08 && pt.time <= vp.t1 + 0.08 {
+      let x0 = xOfTime(vp, pt.time, width)
+      let x1 = if i + 1 < alignedRef.length && (alignedRef[i + 1].time - pt.time) < 0.16 {
+        xOfTime(vp, alignedRef[i + 1].time, width)
+      } else {
+        x0 + 5.0
+      }
+      let segW = f32.max(2.5, x1 - x0 + 0.6)
+      let div = heatmapDivergenceAt(pt, opts.heatmapMetric)
+      run cmds.append(
+        CanvasCommand.FillRect {
+          x: x0,
+          y: barY + 1.0,
+          width: segW,
+          height: barH - 2.0,
+          radius: 0.0,
+          color: heatmapColor(div, 0.94),
+        },
+      )
+      // Soft vertical vermilion wash on high-divergence regions so your eye immediately locks onto problem syllables
+      if div > 0.36 && washH > 12.0 {
+        let washA = f64.toF32(f64.min(0.16, (div - 0.36) * 0.24))
+        run cmds.append(
+          CanvasCommand.FillRect {
+            x: x0,
+            y: barY + barH,
+            width: segW,
+            height: washH,
+            radius: 0.0,
+            color: Rgba<f32> { r: 0.851, g: 0.220, b: 0.118, a: washA },
+          },
+        )
+      }
+    }
+    i = i + 1
+  }
+}
+
 pub effect fn buildSpectrogramOverlay(
   vp: &Viewport,
   width: f32,
@@ -843,12 +985,20 @@ pub effect fn buildSpectrogramOverlay(
     g = g + 1
   }
 
-  // 4. Praat Burg Formant tracks (F1 coral, F2 gold, F3 emerald, F4 sky)
+  // 4. Viterbi-tracked Formant ribbons (F1 coral, F2 gold, F3 cyan, F4 violet — individually selectable)
   if opts.showFormants && formantFrames.length > 0 {
-    run drawFormantBand(&mut cmds, formantFrames, 0, vp, width, height, COL_F1)
-    run drawFormantBand(&mut cmds, formantFrames, 1, vp, width, height, COL_F2)
-    run drawFormantBand(&mut cmds, formantFrames, 2, vp, width, height, COL_F3)
-    run drawFormantBand(&mut cmds, formantFrames, 3, vp, width, height, COL_F4)
+    if (opts.formantMask & 1) != 0 {
+      run drawFormantBand(&mut cmds, formantFrames, 0, vp, width, height, COL_F1)
+    }
+    if (opts.formantMask & 2) != 0 {
+      run drawFormantBand(&mut cmds, formantFrames, 1, vp, width, height, COL_F2)
+    }
+    if (opts.formantMask & 4) != 0 {
+      run drawFormantBand(&mut cmds, formantFrames, 2, vp, width, height, COL_F3)
+    }
+    if (opts.formantMask & 8) != 0 {
+      run drawFormantBand(&mut cmds, formantFrames, 3, vp, width, height, COL_F4)
+    }
   }
 
   // 5. Optional harmonic overtone guide tracks (2x, 3x, 4x F0)
@@ -881,8 +1031,14 @@ pub effect fn buildSpectrogramOverlay(
   }
 
   // 7. Optional Reference amplitude waveform ribbon across top of spectrogram
-  if opts.showRefWave && refSamples.length >= 32 && refSampleRate > 0.0 {
+  let refWaveVisible = opts.showRefWave && refSamples.length >= 32 && refSampleRate > 0.0
+  if refWaveVisible {
     run drawRefWaveformRibbon(&mut cmds, refSamples, refSampleRate, alignedRef, vp, width, opts)
+  }
+
+  // 8. Reference divergence heatmap strip (sage green -> amber -> vermilion showing where score dropped)
+  if opts.showHeatmap && alignedRef.length >= 2 {
+    run drawDivergenceHeatmap(&mut cmds, alignedRef, vp, width, height, opts, refWaveVisible)
   }
 
   return run Drawing.make(move cmds)
@@ -1287,7 +1443,7 @@ pub effect fn buildVowelChartDrawing(
     run cmds.append(CanvasCommand.Stroke { color: Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 0.14 }, width: 0.8 })
   }
 
-  // Whole-sentence Reference vowel cloud (subtle muted) + hollow ring centroid
+  // Whole-sentence Reference vowel cloud (crisp steel-teal goal!) + soft halo + ringed centroid
   if hasRef && refFrames.length > 0 {
     let step = if refFrames.length > 160 { refFrames.length / 160 } else { 1 }
     let mut k: usize = 0
@@ -1298,12 +1454,12 @@ pub effect fn buildVowelChartDrawing(
         let ry = vowelY(rf.f1, height)
         run cmds.append(
           CanvasCommand.FillRect {
-            x: rx - 1.6,
-            y: ry - 1.6,
-            width: 3.2,
-            height: 3.2,
-            radius: 1.6,
-            color: Rgba<f32> { r: 0.541, g: 0.541, b: 0.565, a: 0.24 },
+            x: rx - 2.0,
+            y: ry - 2.0,
+            width: 4.0,
+            height: 4.0,
+            radius: 2.0,
+            color: Rgba<f32> { r: 0.180, g: 0.490, b: 0.588, a: 0.34 },
           },
         )
       }
@@ -1314,21 +1470,31 @@ pub effect fn buildVowelChartDrawing(
       let rcy = vowelY(refSummary.meanF1, height)
       run cmds.append(
         CanvasCommand.FillRect {
-          x: rcx - 4.5,
-          y: rcy - 4.5,
-          width: 9.0,
-          height: 9.0,
-          radius: 4.5,
-          color: COL_INK,
+          x: rcx - 11.0,
+          y: rcy - 11.0,
+          width: 22.0,
+          height: 22.0,
+          radius: 11.0,
+          color: Rgba<f32> { r: 0.180, g: 0.490, b: 0.588, a: 0.13 },
         },
       )
       run cmds.append(
         CanvasCommand.FillRect {
-          x: rcx - 3.0,
-          y: rcy - 3.0,
-          width: 6.0,
-          height: 6.0,
-          radius: 3.0,
+          x: rcx - 5.2,
+          y: rcy - 5.2,
+          width: 10.4,
+          height: 10.4,
+          radius: 5.2,
+          color: COL_REF_TEAL,
+        },
+      )
+      run cmds.append(
+        CanvasCommand.FillRect {
+          x: rcx - 3.3,
+          y: rcy - 3.3,
+          width: 6.6,
+          height: 6.6,
+          radius: 3.3,
           color: Rgba<f32> { r: 0.969, g: 0.969, b: 0.973, a: 1.0 },
         },
       )
@@ -1657,10 +1823,10 @@ pub effect fn buildMetricsLaneDrawing(
     i = i + 1
   }
 
-  let baseWeightCol = if plotOnRef { Rgba<f32> { r: 0.541, g: 0.541, b: 0.565, a: 0.55 } } else { COL_INK_SOFT }
-  let baseSizeCol = if plotOnRef { COL_MUTED } else { COL_INK }
-  let alignedSizeCol = if plotOnRef { COL_INK } else { COL_MUTED }
-  let alignedWeightCol = if plotOnRef { COL_INK_SOFT } else { Rgba<f32> { r: 0.541, g: 0.541, b: 0.565, a: 0.65 } }
+  let baseWeightCol = if plotOnRef { Rgba<f32> { r: 0.180, g: 0.490, b: 0.588, a: 0.45 } } else { COL_WEIGHT }
+  let baseSizeCol = if plotOnRef { COL_REF_TEAL } else { COL_SIZE }
+  let alignedSizeCol = if plotOnRef { COL_SIZE } else { COL_REF_TEAL }
+  let alignedWeightCol = if plotOnRef { COL_WEIGHT } else { Rgba<f32> { r: 0.180, g: 0.490, b: 0.588, a: 0.65 } }
 
   // Base timeline Size & Weight curves (solid when Take base, faint ghost when Reference base)
   if takeFrames.length > 1 {
@@ -1806,6 +1972,185 @@ pub effect fn buildMetricsLaneDrawing(
 }
 
 // ============================================================================
+// Dedicated Time-Synced Pitch Contour Comparison Graph (Your line vs. Ref ribbon)
+// ============================================================================
+
+pub effect fn buildPitchContourLaneDrawing(
+  vp: &Viewport,
+  width: f32,
+  height: f32,
+  pitchFrames: &[PitchFrame],
+  alignedRef: &[AlignedRefPoint],
+  showRef: bool,
+  plotOnRef: bool,
+  displayClarity: f64,
+) -> Drawing
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut cmds = List<CanvasCommand>.make()
+  if width <= 4.0 || height <= 4.0 {
+    return run Drawing.make(move cmds)
+  }
+
+  // Glint light card background (#F7F7F8)
+  run cmds.append(
+    CanvasCommand.FillRect {
+      x: 0.0,
+      y: 0.0,
+      width: width,
+      height: height,
+      radius: 4.0,
+      color: Rgba<f32> { r: 0.969, g: 0.969, b: 0.973, a: 1.0 },
+    },
+  )
+
+  // Compute tight log-Hz vertical bounds covering both Your voice and Reference
+  let mut minHz: f64 = 1.0e9
+  let mut maxHz: f64 = 0.0
+  let mut i: usize = 0
+  while i < pitchFrames.length {
+    let pf = pitchFrames[i]
+    if pf.voiced && pf.clarity >= displayClarity && pf.frequency > 50.0 {
+      if pf.frequency < minHz { minHz = pf.frequency }
+      if pf.frequency > maxHz { maxHz = pf.frequency }
+    }
+    i = i + 1
+  }
+  if showRef {
+    i = 0
+    while i < alignedRef.length {
+      let rp = alignedRef[i]
+      if rp.voiced && rp.f0 > 50.0 {
+        if rp.f0 < minHz { minHz = rp.f0 }
+        if rp.f0 > maxHz { maxHz = rp.f0 }
+      }
+      i = i + 1
+    }
+  }
+  if minHz >= maxHz {
+    minHz = 100.0
+    maxHz = 320.0
+  } else {
+    // Give ~3 semitones headroom top & bottom
+    minHz = f64.max(60.0, minHz * 0.84)
+    maxHz = f64.min(600.0, maxHz * 1.19)
+    if maxHz < minHz * 1.45 {
+      let mid = f64.sqrt(minHz * maxHz)
+      minHz = mid / 1.25
+      maxHz = mid * 1.25
+    }
+  }
+
+  let logLo = f64.log2(minHz)
+  let logHi = f64.log2(maxHz)
+  let logSpan = f64.max(0.1, logHi - logLo)
+  let padY: f32 = 6.0
+  let usableH = f32.max(4.0, height - padY * 2.0)
+
+  // Subtle horizontal reference grid (25%, 50%, 75%)
+  let mut g: usize = 1
+  while g < 4 {
+    let gy = padY + usableH * usize.toF32(g) * 0.25
+    run cmds.append(
+      CanvasCommand.FillRect {
+        x: 0.0,
+        y: gy,
+        width: width,
+        height: 1.0,
+        radius: 0.0,
+        color: Rgba<f32> { r: 0.902, g: 0.902, b: 0.910, a: if g == 2 { 1.0 } else { 0.55 } },
+      },
+    )
+    g = g + 1
+  }
+
+  // 1. Reference target contour (soft ±1st steel-teal tolerance ribbon + crisp teal centerline)
+  if showRef && alignedRef.length > 1 {
+    let mut pass: usize = 0
+    while pass < 2 {
+      let mut inRun = false
+      let mut prevF0: f64 = 0.0
+      let mut prevT: f64 = 0.0
+      let mut drew = false
+      i = 0
+      while i < alignedRef.length {
+        let pt = alignedRef[i]
+        let ok = pt.voiced && pt.f0 > 50.0 && pt.time >= vp.t0 - 0.1 && pt.time <= vp.t1 + 0.1
+        if !ok || (inRun && ((pt.time - prevT) > 0.15 || semitonesBetween(prevF0, pt.f0) > MAX_CONNECTED_SEMITONES)) {
+          inRun = false
+        }
+        if ok {
+          let x = xOfTime(vp, pt.time, width)
+          let norm = f64.max(0.0, f64.min(1.0, (f64.log2(pt.f0) - logLo) / logSpan))
+          let y = padY + (1.0 - f64.toF32(norm)) * usableH
+          if !inRun {
+            run cmds.append(CanvasCommand.MoveTo { x: x, y: y })
+            inRun = true
+          } else {
+            run cmds.append(CanvasCommand.LineTo { x: x, y: y })
+            drew = true
+          }
+          prevF0 = pt.f0
+          prevT = pt.time
+        }
+        i = i + 1
+      }
+      if drew {
+        run cmds.append(CanvasCommand.Stroke {
+          color: if pass == 0 {
+            if plotOnRef { Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 0.10 } } else { COL_REF_TEAL_SOFT }
+          } else {
+            if plotOnRef { COL_INK } else { COL_REF_TEAL }
+          },
+          width: if pass == 0 { 8.0 } else { 2.0 },
+        })
+      }
+      pass = pass + 1
+    }
+  }
+
+  // 2. Your pitch contour (bold dark ink trying to stay inside the teal Reference ribbon!)
+  if pitchFrames.length > 1 {
+    let mut inRun = false
+    let mut prevF0: f64 = 0.0
+    let mut prevT: f64 = 0.0
+    let mut drew = false
+    i = 0
+    while i < pitchFrames.length {
+      let pf = pitchFrames[i]
+      let ok = pf.voiced && pf.clarity >= displayClarity && pf.frequency > 50.0
+        && pf.time >= vp.t0 - 0.1 && pf.time <= vp.t1 + 0.1
+      if !ok || (inRun && ((pf.time - prevT) > 0.12 || semitonesBetween(prevF0, pf.frequency) > MAX_CONNECTED_SEMITONES)) {
+        inRun = false
+      }
+      if ok {
+        let x = xOfTime(vp, pf.time, width)
+        let norm = f64.max(0.0, f64.min(1.0, (f64.log2(pf.frequency) - logLo) / logSpan))
+        let y = padY + (1.0 - f64.toF32(norm)) * usableH
+        if !inRun {
+          run cmds.append(CanvasCommand.MoveTo { x: x, y: y })
+          inRun = true
+        } else {
+          run cmds.append(CanvasCommand.LineTo { x: x, y: y })
+          drew = true
+        }
+        prevF0 = pf.frequency
+        prevT = pf.time
+      }
+      i = i + 1
+    }
+    if drew {
+      run cmds.append(CanvasCommand.Stroke {
+        color: if plotOnRef { COL_REF_TEAL } else { COL_INK },
+        width: 2.2,
+      })
+    }
+  }
+
+  return run Drawing.make(move cmds)
+}
+
+// ============================================================================
 // Size x Weight ("Fullness") 2D Pad
 // ============================================================================
 
@@ -1818,9 +2163,6 @@ pub effect fn buildSizeWeightPadDrawing(
   refFrames: &[VoiceFrame],
   refSummary: VoiceSummary,
   hasRef: bool,
-  showTarget: bool,
-  targetSize: f64,
-  targetLight: f64,
 ) -> Drawing
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -1877,7 +2219,7 @@ pub effect fn buildSizeWeightPadDrawing(
     },
   )
 
-  // Reference cloud & hollow ring (#0B0B0C)
+  // Reference cloud (crisp steel-teal goal!) + soft halo + hollow teal ring
   if hasRef && refFrames.length > 0 {
     let step = if refFrames.length > 140 { refFrames.length / 140 } else { 1 }
     let mut k: usize = 0
@@ -1888,12 +2230,12 @@ pub effect fn buildSizeWeightPadDrawing(
         let ry = pad + (1.0 - f64.toF32(rf.weightLightNorm)) * ih
         run cmds.append(
           CanvasCommand.FillRect {
-            x: rx - 1.6,
-            y: ry - 1.6,
-            width: 3.2,
-            height: 3.2,
-            radius: 1.6,
-            color: Rgba<f32> { r: 0.541, g: 0.541, b: 0.565, a: 0.24 },
+            x: rx - 2.0,
+            y: ry - 2.0,
+            width: 4.0,
+            height: 4.0,
+            radius: 2.0,
+            color: Rgba<f32> { r: 0.180, g: 0.490, b: 0.588, a: 0.34 },
           },
         )
       }
@@ -1904,12 +2246,22 @@ pub effect fn buildSizeWeightPadDrawing(
       let cy = pad + (1.0 - f64.toF32(refSummary.medianWeightLight)) * ih
       run cmds.append(
         CanvasCommand.FillRect {
-          x: cx - 5.0,
-          y: cy - 5.0,
-          width: 10.0,
-          height: 10.0,
-          radius: 5.0,
-          color: COL_INK,
+          x: cx - 12.0,
+          y: cy - 12.0,
+          width: 24.0,
+          height: 24.0,
+          radius: 12.0,
+          color: Rgba<f32> { r: 0.180, g: 0.490, b: 0.588, a: 0.13 },
+        },
+      )
+      run cmds.append(
+        CanvasCommand.FillRect {
+          x: cx - 5.4,
+          y: cy - 5.4,
+          width: 10.8,
+          height: 10.8,
+          radius: 5.4,
+          color: COL_REF_TEAL,
         },
       )
       run cmds.append(
@@ -1925,43 +2277,7 @@ pub effect fn buildSizeWeightPadDrawing(
     }
   }
 
-  // Coach target ring & sweet-spot halo when no Reference is shown
-  if showTarget && !hasRef {
-    let gx = pad + f64.toF32(targetSize) * iw
-    let gy = pad + (1.0 - f64.toF32(targetLight)) * ih
-    run cmds.append(
-      CanvasCommand.FillRect {
-        x: gx - 14.0,
-        y: gy - 14.0,
-        width: 28.0,
-        height: 28.0,
-        radius: 14.0,
-        color: Rgba<f32> { r: 0.851, g: 0.220, b: 0.118, a: 0.09 },
-      },
-    )
-    run cmds.append(
-      CanvasCommand.FillRect {
-        x: gx - 5.5,
-        y: gy - 5.5,
-        width: 11.0,
-        height: 11.0,
-        radius: 5.5,
-        color: COL_VERMILION,
-      },
-    )
-    run cmds.append(
-      CanvasCommand.FillRect {
-        x: gx - 3.7,
-        y: gy - 3.7,
-        width: 7.4,
-        height: 7.4,
-        radius: 3.7,
-        color: Rgba<f32> { r: 0.969, g: 0.969, b: 0.973, a: 1.0 },
-      },
-    )
-  }
-
-  // Your Take cloud (#0B0B0C 18%) & solid dot (#0B0B0C) + vermilion delta line to Ref or Target
+  // Your Take cloud (#0B0B0C 18%) & solid dot (#0B0B0C) + vermilion delta line to Ref
   if takeFrames.length > 0 {
     let step = if takeFrames.length > 140 { takeFrames.length / 140 } else { 1 }
     let mut k: usize = 0
@@ -1992,12 +2308,6 @@ pub effect fn buildSizeWeightPadDrawing(
         run cmds.append(CanvasCommand.MoveTo { x: tx, y: ty })
         run cmds.append(CanvasCommand.LineTo { x: rx, y: ry })
         run cmds.append(CanvasCommand.Stroke { color: COL_VERMILION, width: 1.5 })
-      } else if showTarget {
-        let gx = pad + f64.toF32(targetSize) * iw
-        let gy = pad + (1.0 - f64.toF32(targetLight)) * ih
-        run cmds.append(CanvasCommand.MoveTo { x: tx, y: ty })
-        run cmds.append(CanvasCommand.LineTo { x: gx, y: gy })
-        run cmds.append(CanvasCommand.Stroke { color: Rgba<f32> { r: 0.851, g: 0.220, b: 0.118, a: 0.65 }, width: 1.3 })
       }
       run cmds.append(
         CanvasCommand.FillRect {
