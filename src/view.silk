@@ -934,7 +934,7 @@ fn renderLibraryRail(m: &Overtone, h: &Document<Message>) -> Node {
               &[
                 h.each<ExplorerRowSlot>(
                   slots,
-                  |slot| if slot.idx < nodes.length { renderExplorerRow(m, h, slot.idx, slot.y) } else { h.empty() },
+                  |slot| if slot.idx < nodes.length { renderExplorerRow(m, h, slot.idx, slot.y - m.explorerScrollY) } else { h.empty() },
                 ),
               ],
             ),

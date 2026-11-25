@@ -6,5 +6,5 @@ silk-version = "0.1.0-dev.100+8f42b4e7342a"
 kind = "executable"
 
 [dependencies]
-loom = { git = "https://github.com/silk-lang/loom.git", rev = "e5fa26938c44d00f24ced7b7a9cd3fe36ffc9a3e", path = "modules/loom", package = "loom" }
-loom_dom = { git = "https://github.com/silk-lang/loom.git", rev = "e5fa26938c44d00f24ced7b7a9cd3fe36ffc9a3e", path = "modules/loom/dom", package = "loom-dom" }
+loom = { git = "https://github.com/silk-lang/loom.git", rev = "c86b991f03843c079b434a076d25bd8f1a25dcb9", path = "modules/loom", package = "loom" }
+loom_dom = { git = "https://github.com/silk-lang/loom.git", rev = "c86b991f03843c079b434a076d25bd8f1a25dcb9", path = "modules/loom/dom", package = "loom-dom" }
