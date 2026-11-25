@@ -21,7 +21,7 @@ pub const DEFAULT_LPC_ORDER: usize = 10
 pub const DEFAULT_HALF_WINDOW_S: f64 = 0.025
 pub const PREEMPHASIS_FROM_HZ: f64 = 50.0
 pub const SAFETY_MARGIN_HZ: f64 = 50.0
-pub const MAX_FORMANT_BANDWIDTH_HZ: f64 = 750.0
+pub const MAX_FORMANT_BANDWIDTH_HZ: f64 = 900.0
 
 pub struct FormantPeak {
   pub freq: f64,
@@ -599,13 +599,13 @@ impl FormantTrack {
     }
 
     let mut frame = FormantFrame.empty(centreSec, intensityDb)
-    // Save up to 6 sharp candidate Burg roots for Viterbi formant tracking
+    // Save up to 6 candidate Burg roots (wide enough to keep real F1/F2 transitions without slot-shifting)
     let mut kept: usize = 0
     i = 0
     while i < pCount && kept < 6 {
       let pf = peaks[i].freq
       let pbw = peaks[i].bw
-      let bwLim = if pf < 1200.0 { 460.0 } else if pf < 2600.0 { 600.0 } else { 740.0 }
+      let bwLim = if pf < 1200.0 { 650.0 } else if pf < 2600.0 { 780.0 } else { 900.0 }
       if pbw <= bwLim {
         frame.candFreqs[kept] = pf
         frame.candBws[kept] = pbw
@@ -614,22 +614,143 @@ impl FormantTrack {
       i = i + 1
     }
     frame.candCount = kept
-    frame.count = kept
-    if kept >= 1 {
-      frame.f1 = frame.candFreqs[0]
-      frame.bw1 = frame.candBws[0]
-    }
-    if kept >= 2 {
-      frame.f2 = frame.candFreqs[1]
-      frame.bw2 = frame.candBws[1]
-    }
+
+    // Assign live formants using physiological band priors so live recording never shifts
+    // F3->F2 or F4->F3 when a lower formant is missed (keeps live Size aligned with post-stop Neural).
+    let scale = f64.max(0.75, f64.min(1.25, nyq / 5500.0))
+    let refF1 = 550.0 * scale
+    let refF2 = 1650.0 * scale
+    let refF3 = 2750.0 * scale
+    let refF4 = 3850.0 * scale
+
+    let mut bestScore: f64 = 1.0e18
+    let mut bestF1: f64 = 0.0
+    let mut bestB1: f64 = 0.0
+    let mut bestF2: f64 = 0.0
+    let mut bestB2: f64 = 0.0
+    let mut bestF3: f64 = 0.0
+    let mut bestB3: f64 = 0.0
+    let mut bestF4: f64 = 0.0
+    let mut bestB4: f64 = 0.0
+    let mut foundTriple = false
+
     if kept >= 3 {
-      frame.f3 = frame.candFreqs[2]
-      frame.bw3 = frame.candBws[2]
+      let mut a: usize = 0
+      while a < kept {
+        let fa = frame.candFreqs[a]
+        let ba = frame.candBws[a]
+        if fa >= 220.0 && fa <= 1180.0 {
+          let mut b = a + 1
+          while b < kept {
+            let fb = frame.candFreqs[b]
+            let bb = frame.candBws[b]
+            if fb >= 650.0 && fb <= 3200.0 && fb >= fa + 150.0 {
+              let mut c = b + 1
+              while c < kept {
+                let fc = frame.candFreqs[c]
+                let bc = frame.candBws[c]
+                if fc >= 1650.0 && fc <= 3600.0 && fc >= fb + 180.0 {
+                  let d1 = f64.log2(fa / refF1)
+                  let d2 = f64.log2(fb / refF2)
+                  let d3 = f64.log2(fc / refF3)
+                  let sc = 0.85 * d1 * d1 + 0.65 * d2 * d2 + 1.25 * d3 * d3
+                    + 0.40 * (ba / fa) + 0.35 * (bb / fb) + 0.30 * (bc / fc)
+                  if sc < bestScore {
+                    bestScore = sc
+                    bestF1 = fa
+                    bestB1 = ba
+                    bestF2 = fb
+                    bestB2 = bb
+                    bestF3 = fc
+                    bestB3 = bc
+                    bestF4 = 0.0
+                    bestB4 = 0.0
+                    let mut d = c + 1
+                    let mut bestDSc: f64 = 1.0e9
+                    while d < kept {
+                      let fd = frame.candFreqs[d]
+                      let bd = frame.candBws[d]
+                      if fd >= 2800.0 && fd >= fc + 200.0 && fd <= nyq - 80.0 {
+                        let ds = f64.abs(f64.log2(fd / refF4)) + 0.35 * (bd / fd)
+                        if ds < bestDSc {
+                          bestDSc = ds
+                          bestF4 = fd
+                          bestB4 = bd
+                        }
+                      }
+                      d = d + 1
+                    }
+                    foundTriple = true
+                  }
+                }
+                c = c + 1
+              }
+            }
+            b = b + 1
+          }
+        }
+        a = a + 1
+      }
     }
-    if kept >= 4 {
-      frame.f4 = frame.candFreqs[3]
-      frame.bw4 = frame.candBws[3]
+
+    if foundTriple {
+      frame.f1 = bestF1
+      frame.bw1 = bestB1
+      frame.f2 = bestF2
+      frame.bw2 = bestB2
+      frame.f3 = bestF3
+      frame.bw3 = bestB3
+      frame.f4 = bestF4
+      frame.bw4 = bestB4
+      frame.count = if bestF4 > 0.0 { 4 } else { 3 }
+    } else if kept >= 2 {
+      // Fallback: pick best F1 and F2 in physiological bands without shifting F3/F4 down into them
+      let mut b1Sc: f64 = 1.0e9
+      let mut b2Sc: f64 = 1.0e9
+      let mut b3Sc: f64 = 1.0e9
+      i = 0
+      while i < kept {
+        let f = frame.candFreqs[i]
+        let bw = frame.candBws[i]
+        if f >= 220.0 && f <= 1150.0 {
+          let s = f64.abs(f64.log2(f / refF1)) + 0.30 * (bw / f)
+          if s < b1Sc {
+            b1Sc = s
+            bestF1 = f
+            bestB1 = bw
+          }
+        } else if f >= 800.0 && f <= 2900.0 {
+          let s = f64.abs(f64.log2(f / refF2)) + 0.30 * (bw / f)
+          if s < b2Sc {
+            b2Sc = s
+            bestF2 = f
+            bestB2 = bw
+          }
+        } else if f >= 1900.0 && f <= 3900.0 {
+          let s = f64.abs(f64.log2(f / refF3)) + 0.30 * (bw / f)
+          if s < b3Sc {
+            b3Sc = s
+            bestF3 = f
+            bestB3 = bw
+          }
+        }
+        i = i + 1
+      }
+      if bestF1 > 0.0 && bestF2 > bestF1 + 120.0 {
+        frame.f1 = bestF1
+        frame.bw1 = bestB1
+        frame.f2 = bestF2
+        frame.bw2 = bestB2
+        if bestF3 > bestF2 + 150.0 {
+          frame.f3 = bestF3
+          frame.bw3 = bestB3
+          frame.count = 3
+        } else {
+          frame.count = 2
+        }
+      } else {
+        frame.count = 0
+      }
     }
     return frame
   }
@@ -850,7 +971,7 @@ impl FormantTrack {
                   while c < cc && sc < maxStates {
                     let fc = fr.candFreqs[c]
                     let bc = fr.candBws[c]
-                    if fc >= 1450.0 && fc <= 4300.0 && fc >= fb + 180.0 {
+                    if fc >= 1650.0 && fc <= 3600.0 && fc >= fb + 180.0 {
                       // Pick best optional F4 > F3
                       let mut fd: f64 = 0.0
                       let mut bd: f64 = 0.0
@@ -859,7 +980,7 @@ impl FormantTrack {
                       while d < cc {
                         let candD = fr.candFreqs[d]
                         let candBd = fr.candBws[d]
-                        if candD >= 2500.0 && candD >= fc + 200.0 && candD <= ceiling - 80.0 {
+                        if candD >= 2800.0 && candD >= fc + 200.0 && candD <= ceiling - 80.0 {
                           let ds = f64.abs(f64.log2(candD / refF4)) + 0.35 * (candBd / candD)
                           if ds < bestDScore {
                             bestDScore = ds
@@ -874,7 +995,7 @@ impl FormantTrack {
                       let d2 = f64.log2(fb / refF2)
                       let d3 = f64.log2(fc / refF3)
                       let f0ProxPen = if curF0 > 50.0 && fa < curF0 * 1.28 { 1.4 } else { 0.0 }
-                      let priorCost = 0.85 * d1 * d1 + 0.65 * d2 * d2 + 1.15 * d3 * d3 + f0ProxPen
+                      let priorCost = 0.85 * d1 * d1 + 0.65 * d2 * d2 + 1.35 * d3 * d3 + f0ProxPen
                       let bwCost = 0.45 * (ba / fa) + 0.40 * (bb / fb) + 0.35 * (bc / fc)
                       f1Sl[base + sc] = fa
                       f2Sl[base + sc] = fb
@@ -897,19 +1018,20 @@ impl FormantTrack {
           }
         }
 
-        // Fallback if fewer than 3 valid physiological roots exist in this frame
-        if sc == 0 && cc >= 2 {
-          f1Sl[base] = fr.candFreqs[0]
-          b1Sl[base] = fr.candBws[0]
-          f2Sl[base] = fr.candFreqs[1]
-          b2Sl[base] = fr.candBws[1]
-          if cc >= 3 {
-            f3Sl[base] = fr.candFreqs[2]
-            b3Sl[base] = fr.candBws[2]
+        // Fallback if fewer than 3 valid physiological roots exist in this frame:
+        // use the physiologically assigned live formants (never blindly slot-shift F2->F1 / F3->F2).
+        if sc == 0 && fr.count >= 2 && fr.f1 >= 200.0 && fr.f2 > fr.f1 + 120.0 {
+          f1Sl[base] = fr.f1
+          b1Sl[base] = fr.bw1
+          f2Sl[base] = fr.f2
+          b2Sl[base] = fr.bw2
+          if fr.count >= 3 && fr.f3 > fr.f2 + 150.0 {
+            f3Sl[base] = fr.f3
+            b3Sl[base] = fr.bw3
           }
-          if cc >= 4 {
-            f4Sl[base] = fr.candFreqs[3]
-            b4Sl[base] = fr.candBws[3]
+          if fr.count >= 4 && fr.f4 > fr.f3 + 200.0 {
+            f4Sl[base] = fr.f4
+            b4Sl[base] = fr.bw4
           }
           emSl[base] = 2.0
           sc = 1

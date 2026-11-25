@@ -924,7 +924,7 @@ pub const SORT_PITCH: i32 = 2
 pub const SORT_SIZE: i32 = 3
 pub const SORT_WEIGHT: i32 = 4
 pub const SORT_VOWEL: i32 = 5
-pub const SCORE_VERSION: i32 = 3
+pub const SCORE_VERSION: i32 = 4
 
 pub struct LibTreeNode {
   pub idx: usize,

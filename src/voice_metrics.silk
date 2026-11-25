@@ -318,8 +318,9 @@ fn measureHarmonicWeight(samples: &[f32], sampleRate: f64, centreSec: f64, f0: f
   return HarmonicWeightRaw { rawH1H2: rawH1H2, rawTilt: rawTilt, valid: true }
 }
 
-/// Estimates apparent Vocal Tract Length (cm) from Praat Burg F1..F4 using quarter-wave
-/// tube scaling, weighted heavily toward F2..F4 so vowel articulation on F1 doesn't dominate.
+/// Estimates apparent Vocal Tract Length (cm) from F1..F3 using quarter-wave tube scaling,
+/// weighted heavily toward F2..F3 so vowel articulation on F1 doesn't dominate and live LPC
+/// agrees cleanly with post-record Neural FormantsTracker (which predicts F1..F3).
 pub fn estimateVtlCm(ff: FormantFrame) -> f64 {
   let mut wSum: f64 = 0.0
   let mut lSum: f64 = 0.0
@@ -327,29 +328,22 @@ pub fn estimateVtlCm(ff: FormantFrame) -> f64 {
   if ff.count >= 1 && ff.f1 > 180.0 && ff.f1 < 1250.0 {
     let l1 = (1.0 * SPEED_OF_SOUND_CM_S) / (4.0 * ff.f1)
     if l1 >= 10.0 && l1 <= 24.0 {
-      lSum = lSum + l1 * 0.12
-      wSum = wSum + 0.12
+      lSum = lSum + l1 * 0.14
+      wSum = wSum + 0.14
     }
   }
   if ff.count >= 2 && ff.f2 > 600.0 && ff.f2 < 3400.0 {
     let l2 = (3.0 * SPEED_OF_SOUND_CM_S) / (4.0 * ff.f2)
     if l2 >= 10.0 && l2 <= 24.0 {
-      lSum = lSum + l2 * 0.24
-      wSum = wSum + 0.24
+      lSum = lSum + l2 * 0.36
+      wSum = wSum + 0.36
     }
   }
-  if ff.count >= 3 && ff.f3 > 1600.0 && ff.f3 < 4400.0 {
+  if ff.count >= 3 && ff.f3 > 1600.0 && ff.f3 < 4200.0 {
     let l3 = (5.0 * SPEED_OF_SOUND_CM_S) / (4.0 * ff.f3)
     if l3 >= 10.0 && l3 <= 24.0 {
-      lSum = lSum + l3 * 0.32
-      wSum = wSum + 0.32
-    }
-  }
-  if ff.count >= 4 && ff.f4 > 2400.0 && ff.f4 < 5600.0 {
-    let l4 = (7.0 * SPEED_OF_SOUND_CM_S) / (4.0 * ff.f4)
-    if l4 >= 10.0 && l4 <= 24.0 {
-      lSum = lSum + l4 * 0.32
-      wSum = wSum + 0.32
+      lSum = lSum + l3 * 0.50
+      wSum = wSum + 0.50
     }
   }
   if wSum <= 0.0 {
@@ -462,7 +456,7 @@ impl VoiceMetricsTrack {
         if i < formantFrames.length {
           let ff = formantFrames[i]
           vtlCm = estimateVtlCm(ff)
-          if ff.tracked && ff.count >= 2 && ff.f1 > 160.0 && ff.f2 > ff.f1 {
+          if ff.count >= 2 && ff.f1 > 160.0 && ff.f2 > ff.f1 + 100.0 {
             f1 = ff.f1
             f2 = ff.f2
             if ff.count >= 3 && ff.f3 > ff.f2 { f3 = ff.f3 }
