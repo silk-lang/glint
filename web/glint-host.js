@@ -322,10 +322,36 @@ function scanLibraryTree(expandedLines, notesDir, activeRefPath, sortMode) {
 // ============================================================================
 
 let audioCtx = null;
+let micWorkletLoaded = false;
+let micWorkletFailed = false;
+
+const MIC_WORKLET_SRC = `
+class PrismMicProcessor extends AudioWorkletProcessor {
+  process(inputs, outputs) {
+    const input = inputs[0];
+    if (input && input[0] && input[0].length > 0) {
+      const ch = input[0];
+      const copy = new Float32Array(ch.length);
+      copy.set(ch);
+      this.port.postMessage(copy, [copy.buffer]);
+    }
+    const out = outputs[0];
+    if (out && out[0]) out[0].fill(0);
+    return true;
+  }
+}
+registerProcessor("prism-mic-processor", PrismMicProcessor);
+`;
+
 function ensureAudioCtx() {
   if (!audioCtx) {
     const AC = window.AudioContext || window.webkitAudioContext;
-    audioCtx = new AC();
+    // Explicitly request 48 kHz so a Bluetooth HFP headset (16 kHz) never locks Web Audio to phone quality!
+    try {
+      audioCtx = new AC({ latencyHint: "interactive", sampleRate: 48000 });
+    } catch {
+      audioCtx = new AC();
+    }
   }
   if (audioCtx.state === "suspended") {
     audioCtx.resume().catch(() => {});
@@ -333,10 +359,28 @@ function ensureAudioCtx() {
   return audioCtx;
 }
 
+async function ensureMicWorklet(ctx) {
+  if (micWorkletLoaded) return true;
+  if (micWorkletFailed || !ctx.audioWorklet) return false;
+  try {
+    const blob = new Blob([MIC_WORKLET_SRC], { type: "application/javascript" });
+    const url = URL.createObjectURL(blob);
+    await ctx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+    micWorkletLoaded = true;
+    return true;
+  } catch (err) {
+    console.warn("[Prism Audio] AudioWorklet init failed, falling back to ScriptProcessor:", err);
+    micWorkletFailed = true;
+    return false;
+  }
+}
+
 const audioState = {
   inputs: [{ id: 1, deviceId: "", name: "Browser Microphone" }],
   outputs: [{ id: 1, deviceId: "", name: "System Output" }],
   selectedInputId: 1,
+  userPickedInput: false,
   selectedOutputId: 1,
 
   // Mic capture ring (hardware stream kept warm once opened to avoid CoreAudio/Bluetooth pops on repeat!)
@@ -346,6 +390,7 @@ const audioState = {
   micStreamInputId: 0,
   micSource: null,
   micProc: null,
+  micWorklet: null,
   micSilentGain: null,
   micRate: 48000,
   micLevelDb: -120,
@@ -400,13 +445,22 @@ async function enumerateBrowserDevices(promptPermission = false) {
         outs.push({ id: idxOut++, deviceId: d.deviceId, name: d.label || `Output ${outs.length + 1}` });
       }
     }
-    if (ins.length) audioState.inputs = ins;
+    if (ins.length) {
+      audioState.inputs = ins;
+      // Avoid Bluetooth HFP (16 kHz phone-quality) default mic when a clean Built-in Mac mic is present!
+      if (!audioState.userPickedInput) {
+        const builtIn = ins.find((d) => /built-?in|macbook|internal|studio/i.test(d.name) && d.deviceId !== "default");
+        if (builtIn) {
+          audioState.selectedInputId = builtIn.id;
+        }
+      }
+    }
     if (outs.length) audioState.outputs = outs;
   } catch {}
 }
 
 function isMicHardwareLive() {
-  if (!audioState.micStream || !audioState.micProc) return false;
+  if (!audioState.micStream || (!audioState.micProc && !audioState.micWorklet)) return false;
   if (audioState.micStream.active === false) return false;
   const tracks = audioState.micStream.getAudioTracks();
   return tracks.length > 0 && tracks.every((t) => t.readyState === "live");
@@ -418,15 +472,31 @@ function releaseMicHardware() {
   audioState.micLevelDb = -120;
   audioState.micQueue = [];
   audioState.micQueuedSamples = 0;
+  try { audioState.micWorklet?.port && (audioState.micWorklet.port.onmessage = null); } catch {}
+  try { audioState.micWorklet?.disconnect(); } catch {}
   try { audioState.micProc?.disconnect(); } catch {}
   try { audioState.micSource?.disconnect(); } catch {}
   try { audioState.micSilentGain?.disconnect(); } catch {}
   try { audioState.micStream?.getTracks().forEach((t) => t.stop()); } catch {}
+  audioState.micWorklet = null;
   audioState.micProc = null;
   audioState.micSource = null;
   audioState.micSilentGain = null;
   audioState.micStream = null;
   audioState.micStreamInputId = 0;
+}
+
+function pushMicChunk(copy) {
+  if (!audioState.micRunning || !copy || copy.length === 0) return;
+  let sumSq = 0;
+  for (let i = 0; i < copy.length; i++) {
+    const v = copy[i];
+    sumSq += v * v;
+  }
+  const rms = Math.sqrt(sumSq / Math.max(1, copy.length));
+  audioState.micLevelDb = rms > 1e-6 ? 20 * Math.log10(rms) : -120;
+  audioState.micQueue.push(copy);
+  audioState.micQueuedSamples += copy.length;
 }
 
 function startMicAsync(preferredRate) {
@@ -460,52 +530,76 @@ function startMicAsync(preferredRate) {
   const chosen = audioState.inputs.find((d) => d.id === audioState.selectedInputId);
   const desiredDevId = chosen?.deviceId || "";
   const openedInputId = audioState.selectedInputId;
-  const constraints = {
-    audio: {
-      deviceId: desiredDevId ? { ideal: desiredDevId } : undefined,
-      echoCancellation: false,
-      noiseSuppression: false,
-      autoGainControl: false,
-    },
+  const baseAudio = {
+    echoCancellation: false,
+    noiseSuppression: false,
+    autoGainControl: false,
+    channelCount: { ideal: 1 },
+    sampleRate: { ideal: 48000 },
+  };
+  const exactConstraints = {
+    audio: desiredDevId ? { ...baseAudio, deviceId: { exact: desiredDevId } } : baseAudio,
+  };
+  const fallbackConstraints = {
+    audio: desiredDevId ? { ...baseAudio, deviceId: { ideal: desiredDevId } } : baseAudio,
   };
 
   navigator.mediaDevices
-    .getUserMedia(constraints)
-    .then((stream) => {
+    .getUserMedia(exactConstraints)
+    .catch(() => navigator.mediaDevices.getUserMedia(fallbackConstraints))
+    .then(async (stream) => {
       audioState.micOpening = false;
       audioState.micStream = stream;
       audioState.micStreamInputId = openedInputId;
       audioState.micRate = ctx.sampleRate;
       const src = ctx.createMediaStreamSource(stream);
-      const proc = ctx.createScriptProcessor(2048, 1, 1);
       const silentGain = ctx.createGain();
       silentGain.gain.value = 0.0;
-      proc.onaudioprocess = (ev) => {
-        // Keep output strictly silent
-        const outCh = ev.outputBuffer.getChannelData(0);
-        outCh.fill(0.0);
-        // When logically stopped, simply ignore incoming frames without tearing down hardware!
-        if (!audioState.micRunning) return;
-        const ch = ev.inputBuffer.getChannelData(0);
-        const copy = new Float32Array(ch.length);
-        let sumSq = 0;
-        for (let i = 0; i < ch.length; i++) {
-          const v = ch[i];
-          copy[i] = v;
-          sumSq += v * v;
-        }
-        const rms = Math.sqrt(sumSq / Math.max(1, ch.length));
-        audioState.micLevelDb = rms > 1e-6 ? 20 * Math.log10(rms) : -120;
-        audioState.micQueue.push(copy);
-        audioState.micQueuedSamples += copy.length;
-      };
-      src.connect(proc);
-      proc.connect(silentGain);
-      silentGain.connect(ctx.destination);
+
+      // Prefer real-time AudioWorklet thread (zero dropped chunks during UI/spectrogram renders!)
+      const hasWorklet = await ensureMicWorklet(ctx);
+      if (hasWorklet && audioState.micStream === stream) {
+        const node = new AudioWorkletNode(ctx, "prism-mic-processor", {
+          numberOfInputs: 1,
+          numberOfOutputs: 1,
+          channelCount: 1,
+        });
+        node.port.onmessage = (ev) => {
+          if (ev.data instanceof Float32Array) {
+            pushMicChunk(ev.data);
+          }
+        };
+        src.connect(node);
+        node.connect(silentGain);
+        silentGain.connect(ctx.destination);
+        audioState.micWorklet = node;
+      } else if (audioState.micStream === stream) {
+        const proc = ctx.createScriptProcessor(2048, 1, 1);
+        proc.onaudioprocess = (ev) => {
+          ev.outputBuffer.getChannelData(0).fill(0.0);
+          if (!audioState.micRunning) return;
+          const ch = ev.inputBuffer.getChannelData(0);
+          const copy = new Float32Array(ch.length);
+          copy.set(ch);
+          pushMicChunk(copy);
+        };
+        src.connect(proc);
+        proc.connect(silentGain);
+        silentGain.connect(ctx.destination);
+        audioState.micProc = proc;
+      }
+
       audioState.micSource = src;
-      audioState.micProc = proc;
       audioState.micSilentGain = silentGain;
+      const prevBuiltInCheck = !audioState.userPickedInput;
       enumerateBrowserDevices().then(() => {
+        // If we opened generic pre-permission default (which may be 16 kHz Bluetooth HFP!)
+        // and enumeration just revealed a Built-in Mac mic, automatically switch to the Mac mic!
+        if (prevBuiltInCheck && audioState.selectedInputId !== audioState.micStreamInputId) {
+          const wasRec = audioState.micRunning;
+          releaseMicHardware();
+          if (wasRec) startMicAsync(audioState.micRate);
+        }
         if (mountedPage) mountedPage.post("refresh_devices", "");
       });
     })
@@ -922,6 +1016,7 @@ const glintImports = {
   ov_audio_get_output_device: () => audioState.selectedOutputId,
   ov_audio_set_input_device: (devId) => {
     const nextId = devId >>> 0;
+    audioState.userPickedInput = true;
     if (nextId !== audioState.selectedInputId) {
       const wasRunning = audioState.micRunning;
       audioState.selectedInputId = nextId;

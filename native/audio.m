@@ -195,9 +195,14 @@ uint32_t ov_audio_get_output_device(void) { return (uint32_t)gSelectedOutputDevi
 int ov_mic_start_rate(double preferredRate);
 int ov_mic_start(void);
 void ov_mic_stop(void);
+static void releaseNativeMicHardware(void);
 
 int ov_audio_set_input_device(uint32_t devId) {
-  gSelectedInputDeviceId = (AudioDeviceID)devId;
+  AudioDeviceID nextId = (AudioDeviceID)devId;
+  if (nextId != gSelectedInputDeviceId) {
+    gSelectedInputDeviceId = nextId;
+    releaseNativeMicHardware();
+  }
   return 1;
 }
 
@@ -235,6 +240,50 @@ static void setMicError(NSString *msg) {
   os_unfair_lock_unlock(&gMicLock);
 }
 
+static AudioDeviceID gMicActiveDeviceId = kAudioObjectUnknown;
+static BOOL gMicHwRunning = NO;
+
+static uint32_t caDeviceTransportType(AudioDeviceID devId) {
+  if (devId == kAudioObjectUnknown) return 0;
+  AudioObjectPropertyAddress addr = {
+    kAudioDevicePropertyTransportType,
+    kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyElementMain
+  };
+  UInt32 transport = 0;
+  UInt32 sz = sizeof(transport);
+  if (AudioObjectGetPropertyData(devId, &addr, 0, NULL, &sz, &transport) == noErr) {
+    return (uint32_t)transport;
+  }
+  return 0;
+}
+
+static AudioDeviceID caFindBuiltInInputDevice(void) {
+  AudioObjectPropertyAddress addr = {
+    kAudioHardwarePropertyDevices,
+    kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyElementMain
+  };
+  UInt32 dataSize = 0;
+  if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, NULL, &dataSize) != noErr || dataSize == 0) {
+    return kAudioObjectUnknown;
+  }
+  UInt32 count = dataSize / sizeof(AudioDeviceID);
+  AudioDeviceID *ids = (AudioDeviceID *)malloc(dataSize);
+  AudioDeviceID found = kAudioObjectUnknown;
+  if (ids && AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &dataSize, ids) == noErr) {
+    for (UInt32 i = 0; i < count; i++) {
+      if (caDeviceChannels(ids[i], kAudioDevicePropertyScopeInput) > 0 &&
+          caDeviceTransportType(ids[i]) == kAudioDeviceTransportTypeBuiltIn) {
+        found = ids[i];
+        break;
+      }
+    }
+  }
+  if (ids) free(ids);
+  return found;
+}
+
 static AudioDeviceID caDefaultInputDevice(void) {
   AudioObjectPropertyAddress addr = {
     kAudioHardwarePropertyDefaultInputDevice,
@@ -245,6 +294,15 @@ static AudioDeviceID caDefaultInputDevice(void) {
   UInt32 sz = sizeof(devId);
   if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &sz, &devId) != noErr) {
     return kAudioObjectUnknown;
+  }
+  // If macOS default input is a Bluetooth headset (which drops BOTH mic & headphones to 16 kHz mono HFP!),
+  // automatically prefer the Mac's Built-in Microphone unless the user explicitly chose Bluetooth.
+  uint32_t tr = caDeviceTransportType(devId);
+  if (tr == kAudioDeviceTransportTypeBluetooth || tr == kAudioDeviceTransportTypeBluetoothLE) {
+    AudioDeviceID builtIn = caFindBuiltInInputDevice();
+    if (builtIn != kAudioObjectUnknown) {
+      return builtIn;
+    }
   }
   return devId;
 }
@@ -292,31 +350,47 @@ static void ovMicAQCallback(
   (void)inNumberPacketDescriptions;
   (void)inPacketDescs;
   if (!inBuffer || !inBuffer->mAudioData || inBuffer->mAudioDataByteSize == 0) {
-    if (gMicRunning && inAQ) AudioQueueEnqueueBuffer(inAQ, inBuffer, 0, NULL);
+    if (gMicHwRunning && inAQ) AudioQueueEnqueueBuffer(inAQ, inBuffer, 0, NULL);
     return;
   }
 
-  const float *samples = (const float *)inBuffer->mAudioData;
-  UInt32 frames = inBuffer->mAudioDataByteSize / sizeof(float);
-  if (frames > 0) {
-    double sumSq = 0.0;
-    os_unfair_lock_lock(&gMicLock);
-    for (UInt32 i = 0; i < frames; i++) {
-      float s = samples[i];
-      if (!isfinite(s)) s = 0.0f;
-      sumSq += (double)s * (double)s;
-      if (gMicWrite - gMicRead < MIC_QUEUE_CAP) {
-        gMicQueue[gMicWrite % MIC_QUEUE_CAP] = s;
-        gMicWrite++;
+  if (gMicRunning) {
+    const float *samples = (const float *)inBuffer->mAudioData;
+    UInt32 frames = inBuffer->mAudioDataByteSize / sizeof(float);
+    if (frames > 0) {
+      double sumSq = 0.0;
+      os_unfair_lock_lock(&gMicLock);
+      for (UInt32 i = 0; i < frames; i++) {
+        float s = samples[i];
+        if (!isfinite(s)) s = 0.0f;
+        sumSq += (double)s * (double)s;
+        if (gMicWrite - gMicRead < MIC_QUEUE_CAP) {
+          gMicQueue[gMicWrite % MIC_QUEUE_CAP] = s;
+          gMicWrite++;
+        }
       }
+      double rms = sqrt(sumSq / (double)frames);
+      gMicLevelDb = rms > 1e-6 ? (float)(20.0 * log10(rms)) : -120.0f;
+      os_unfair_lock_unlock(&gMicLock);
     }
-    double rms = sqrt(sumSq / (double)frames);
-    gMicLevelDb = rms > 1e-6 ? (float)(20.0 * log10(rms)) : -120.0f;
-    os_unfair_lock_unlock(&gMicLock);
   }
 
-  if (gMicRunning && inAQ) {
+  if (gMicHwRunning && inAQ) {
     AudioQueueEnqueueBuffer(inAQ, inBuffer, 0, NULL);
+  }
+}
+
+static void releaseNativeMicHardware(void) {
+  gMicRunning = NO;
+  gMicHwRunning = NO;
+  gMicActiveDeviceId = kAudioObjectUnknown;
+  if (gRecQueue) {
+    AudioQueueStop(gRecQueue, true);
+    AudioQueueDispose(gRecQueue, true);
+    gRecQueue = NULL;
+    for (int i = 0; i < MIC_AQ_BUFFERS; i++) {
+      gRecBuffers[i] = NULL;
+    }
   }
 }
 
@@ -344,17 +418,24 @@ int ov_mic_start_rate(double preferredRate) {
       }
     }
 
-    if (gRecQueue) {
-      AudioQueueStop(gRecQueue, true);
-      AudioQueueDispose(gRecQueue, true);
-      gRecQueue = NULL;
-    }
-
     AudioDeviceID devId = (gSelectedInputDeviceId != 0) ? gSelectedInputDeviceId : caDefaultInputDevice();
     double targetRate = (preferredRate >= 8000.0 && preferredRate <= 192000.0)
       ? preferredRate
       : caDeviceNominalRate(devId);
     if (targetRate < 8000.0 || targetRate > 192000.0) targetRate = 48000.0;
+
+    // Fast path: keep CoreAudio input queue warm between rounds (zero pops/hardware resets!)
+    if (gRecQueue && gMicHwRunning && gMicActiveDeviceId == devId && fabs(gMicRate - targetRate) < 1.0) {
+      os_unfair_lock_lock(&gMicLock);
+      gMicWrite = 0;
+      gMicRead = 0;
+      gMicLevelDb = -120.0f;
+      os_unfair_lock_unlock(&gMicLock);
+      gMicRunning = YES;
+      return 1;
+    }
+
+    releaseNativeMicHardware();
 
     AudioStreamBasicDescription fmt;
     memset(&fmt, 0, sizeof(fmt));
@@ -374,13 +455,13 @@ int ov_mic_start_rate(double preferredRate) {
       return 0;
     }
 
-    // Bind explicit selected microphone device if user chose a specific input
-    if (gSelectedInputDeviceId != 0) {
-      CFStringRef uid = caCopyDeviceUID(gSelectedInputDeviceId);
+    // Bind explicit device (including Built-in Mac mic when avoiding Bluetooth HFP!)
+    if (devId != kAudioObjectUnknown) {
+      CFStringRef uid = caCopyDeviceUID(devId);
       if (uid) {
         OSStatus devSt = AudioQueueSetProperty(gRecQueue, kAudioQueueProperty_CurrentDevice, &uid, sizeof(uid));
         CFRelease(uid);
-        if (devSt != noErr) {
+        if (devSt != noErr && gSelectedInputDeviceId != 0) {
           gSelectedInputDeviceId = 0;
         }
       }
@@ -406,13 +487,12 @@ int ov_mic_start_rate(double preferredRate) {
       AudioQueueEnqueueBuffer(gRecQueue, gRecBuffers[i], 0, NULL);
     }
 
+    gMicActiveDeviceId = devId;
+    gMicHwRunning = YES;
     gMicRunning = YES;
     st = AudioQueueStart(gRecQueue, NULL);
     if (st != noErr) {
-      gMicRunning = NO;
-      AudioQueueStop(gRecQueue, true);
-      AudioQueueDispose(gRecQueue, true);
-      gRecQueue = NULL;
+      releaseNativeMicHardware();
       setMicError([NSString stringWithFormat:@"Failed to start microphone capture (OSStatus %d).", (int)st]);
       return 0;
     }
@@ -426,16 +506,11 @@ int ov_mic_start(void) {
 
 void ov_mic_stop(void) {
   @autoreleasepool {
+    // Soft-gate: keep CoreAudio input queue warm so Repeat Drill never pops or restarts hardware
     gMicRunning = NO;
-    if (gRecQueue) {
-      AudioQueueStop(gRecQueue, true);
-      AudioQueueDispose(gRecQueue, true);
-      gRecQueue = NULL;
-      for (int i = 0; i < MIC_AQ_BUFFERS; i++) {
-        gRecBuffers[i] = NULL;
-      }
-    }
     os_unfair_lock_lock(&gMicLock);
+    gMicWrite = 0;
+    gMicRead = 0;
     gMicLevelDb = -120.0f;
     os_unfair_lock_unlock(&gMicLock);
   }
