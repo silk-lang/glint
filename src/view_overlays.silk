@@ -34,6 +34,10 @@ import studio {
   SLIDER_PLAY_SPEED,
   SLIDER_SILENCE_HOLD,
   SLIDER_SPEC_OPACITY,
+  SLIDER_SYNTH_MORPH,
+  SLIDER_SYNTH_PITCH,
+  SLIDER_SYNTH_SIZE,
+  SLIDER_SYNTH_WEIGHT,
   SLIDER_VAD_THRESH,
   SLIDER_VOLUME,
   SLIDER_W_PITCH,
@@ -58,8 +62,8 @@ import view_components {
   txtA
 }
 import loom.css
-import loom.css { px }
-import loom.lib { Cursor, Document, Node }
+import loom.css { percent, px }
+import loom.lib { Cursor, Document, Node, Reply }
 import silk.num.f32
 import silk.num.f64
 import silk.num.i32
@@ -74,6 +78,297 @@ fn clampMenuX(x: f32, menuW: f32) -> f32 {
 fn clampMenuY(y: f32, menuH: f32) -> f32 {
   let maxY = f32.max(48.0, 840.0 - menuH)
   return f32.max(44.0, f32.min(maxY, y))
+}
+
+fn popoverSliderRow(
+  m: &Overtone,
+  h: &Document<Message>,
+  id: u32,
+  label: string,
+  valText: string,
+  normVal: f32,
+) -> Node {
+  let clamped = f32.max(0.0, f32.min(1.0, normVal))
+  let fillPct = clamped * 100.0
+  let sLeft = m.sliderLeft[u32.toUsize(id)]
+  let sWidth = m.sliderWidth[u32.toUsize(id)]
+  return h.column(
+    &[h.class("w-full gap-[4px]")],
+    &[
+      h.row(
+        &[h.class("w-full items-center justify-between")],
+        &[
+          txt(h, label, "text-[11px] leading-[14px] text-[#6B6B70]"),
+          txt(h, valText, "glint-mono text-[11px] leading-[14px] font-semibold text-[#0B0B0C]"),
+        ],
+      ),
+      h.box(
+        &[
+          h.class("w-full h-[18px] relative flex items-center"),
+          h.cursor(Cursor.Pointer),
+          h.onLayout(|r| Message.SliderLayout { id: id, rect: r }),
+          if m.drag == 5 && m.dragSlider == id { h.capturePointer() } else { h.none() },
+          h.onPointerDown(|e| Reply<Message>.EmitAndStop {
+            message: Message.SliderDown { id: id, x: e.x, left: sLeft, width: sWidth },
+          }),
+          h.onPointerMove(|e| Reply<Message>.EmitAndStop { message: Message.SliderMove { x: e.x } }),
+          h.onPointerUp(|_| Reply<Message>.EmitAndStop { message: Message.SliderUp }),
+        ],
+        &[
+          h.box(&[h.class("w-full h-[3px] rounded-[2px] bg-[#E6E6E8]")], &[]),
+          h.box(
+            &[
+              h.class("absolute left-0 h-[3px] rounded-[2px] bg-[#0B0B0C] pointer-events-none"),
+              h.style(&[css.width(percent(fillPct))]),
+            ],
+            &[],
+          ),
+          h.box(
+            &[
+              h.class("absolute w-[12px] h-[12px] rounded-[6px] bg-white border-[2px] border-[#0B0B0C] -ml-[6px] pointer-events-none"),
+              h.style(&[css.left(percent(fillPct))]),
+            ],
+            &[],
+          ),
+        ],
+      ),
+    ],
+  )
+}
+
+/// Floating "Hear in your voice" resynthesis preview card (Pitch · Size · Weight).
+pub fn renderVoicePreviewPopover(m: &Overtone, h: &Document<Message>) -> Node {
+  if !m.showVoicePreview {
+    return h.empty()
+  }
+  let pitchNorm = f64.toF32((m.synthPitchSemi + 12.0) / 24.0)
+  let sizeNorm = f64.toF32((m.synthSizePct + 25.0) / 50.0)
+  let weightNorm = f64.toF32((m.synthWeightDb + 8.0) / 16.0)
+  let morphNorm = m.synthMorph
+
+  return h.box(
+    &[h.class("fixed inset-0 z-40")],
+    &[
+      h.box(
+        &[
+          h.class("absolute inset-0"),
+          h.onClick(Message.ToggleVoicePreview),
+        ],
+        &[],
+      ),
+      h.column(
+        &[
+          h.class("absolute z-10 top-[86px] right-[18px] w-[356px] glint-menu p-[14px] gap-[12px]"),
+        ],
+        &[
+          // Header
+          h.row(
+            &[h.class("items-center justify-between")],
+            &[
+              h.column(
+                &[h.class("gap-[2px]")],
+                &[
+                  txt(h, "Hear in your voice", "text-[13px] leading-[16px] font-bold text-[#0B0B0C]"),
+                  txt(h, "Resynthesize your take locally (Pitch · Size · Weight)", "text-[11px] leading-[14px] text-[#6B6B70]"),
+                ],
+              ),
+              txtA(
+                h,
+                "×",
+                &[
+                  h.class("text-[16px] leading-[16px] text-[#8A8A90] hover:text-[#0B0B0C] px-[4px]"),
+                  h.cursor(Cursor.Pointer),
+                  h.onClick(Message.ToggleVoicePreview),
+                ],
+              ),
+            ],
+          ),
+
+          // Primary A/B playback controls
+          h.row(
+            &[h.class("items-center gap-[6px]")],
+            &[
+              h.box(
+                &[
+                  h.class("flex-1 flex items-center justify-center gap-[6px] h-[32px] px-[12px] rounded-[6px] bg-[#0E0E10] text-white"),
+                  h.cursor(Cursor.Pointer),
+                  h.onClick(Message.PlaySynthAdjusted),
+                ],
+                &[
+                  txt(h, "▶", "text-[10px] text-white"),
+                  txt(h, "Play adjusted", "text-[12px] leading-[16px] font-semibold text-white"),
+                ],
+              ),
+              h.box(
+                &[
+                  h.class("flex items-center justify-center gap-[5px] h-[32px] px-[11px] rounded-[6px] border border-[#DCDCDF] bg-white glint-btn-hover"),
+                  h.cursor(Cursor.Pointer),
+                  h.onClick(Message.PlayOriginalPreview),
+                ],
+                &[
+                  txt(h, "▷", "text-[10px] text-[#0B0B0C]"),
+                  txt(h, "Original", "text-[12px] leading-[16px] font-medium text-[#0B0B0C]"),
+                ],
+              ),
+              h.box(
+                &[
+                  h.class("flex items-center justify-center h-[32px] px-[9px] rounded-[6px] border border-[#E6E6E8] bg-white glint-btn-hover"),
+                  h.cursor(Cursor.Pointer),
+                  h.onClick(Message.StopSynthPreview),
+                ],
+                &[txt(h, "■", "text-[10px] text-[#6B6B70]")],
+              ),
+            ],
+          ),
+
+          // Quick preset / Match Ref chips
+          h.row(
+            &[h.class("flex-wrap gap-[5px]")],
+            &[
+              if m.refClip.active && m.compare.valid {
+                guideQuickChip(h, "Match Ref", Message.SynthMatchRef)
+              } else {
+                h.empty()
+              },
+              if m.refClip.active && m.compare.valid {
+                guideQuickChip(h, "50% step", Message.SetSynthMorph { morph: 0.5 })
+              } else {
+                h.empty()
+              },
+              guideQuickChip(h, "+2st · Light/small", Message.SynthPreset { pitch: 2.0, size: 10.0, weight: 2.5 }),
+              guideQuickChip(h, "−2st · Full/big", Message.SynthPreset { pitch: -2.0, size: -10.0, weight: -2.5 }),
+              guideQuickChip(h, "Reset", Message.SynthReset),
+            ],
+          ),
+
+          h.box(&[h.class("h-[1px] bg-[#ECECEE]")], &[]),
+
+          // Morph amount slider
+          popoverSliderRow(m, h, SLIDER_SYNTH_MORPH, "Amount (morph)", String.view(&m.synthMorphStr), morphNorm),
+
+          // Pitch toggle + slider + optional contour follow
+          h.column(
+            &[h.class("gap-[4px]")],
+            &[
+              h.row(
+                &[h.class("items-center justify-between")],
+                &[
+                  h.row(
+                    &[
+                      h.class("items-center gap-[6px]"),
+                      h.cursor(Cursor.Pointer),
+                      h.onClick(Message.ToggleSynthPitch),
+                    ],
+                    &[
+                      toggleSwitch(h, m.synthPitchOn, false, Message.ToggleSynthPitch),
+                      txt(h, "Pitch", "text-[12px] leading-[16px] font-medium text-[#0B0B0C]"),
+                    ],
+                  ),
+                  if m.refClip.active && m.compare.valid {
+                    h.row(
+                      &[
+                        h.class("items-center gap-[5px]"),
+                        h.cursor(Cursor.Pointer),
+                        h.onClick(Message.ToggleSynthContour),
+                      ],
+                      &[
+                        txt(h, if m.synthFollowContour { "☑" } else { "☐" }, "text-[12px] text-[#2E7D96]"),
+                        txt(h, "Follow ref contour", "text-[11px] leading-[14px] text-[#2E7D96] font-medium"),
+                      ],
+                    )
+                  } else {
+                    h.empty()
+                  },
+                ],
+              ),
+              popoverSliderRow(
+                m,
+                h,
+                SLIDER_SYNTH_PITCH,
+                if m.synthFollowContour { "Contour blend" } else { "Semitone shift" },
+                if m.synthPitchOn {
+                  if m.synthFollowContour { String.view(&m.synthMorphStr) } else { String.view(&m.synthPitchStr) }
+                } else {
+                  "off"
+                },
+                pitchNorm,
+              ),
+            ],
+          ),
+
+          // Size (Resonance) toggle + slider
+          h.column(
+            &[h.class("gap-[4px]")],
+            &[
+              h.row(
+                &[
+                  h.class("items-center gap-[6px]"),
+                  h.cursor(Cursor.Pointer),
+                  h.onClick(Message.ToggleSynthSize),
+                ],
+                &[
+                  toggleSwitch(h, m.synthSizeOn, false, Message.ToggleSynthSize),
+                  txt(h, "Size (resonance)", "text-[12px] leading-[16px] font-medium text-[#0B0B0C]"),
+                ],
+              ),
+              popoverSliderRow(
+                m,
+                h,
+                SLIDER_SYNTH_SIZE,
+                "Vocal-tract warp",
+                if m.synthSizeOn { String.view(&m.synthSizeStr) } else { "off" },
+                sizeNorm,
+              ),
+            ],
+          ),
+
+          // Weight toggle + slider
+          h.column(
+            &[h.class("gap-[4px]")],
+            &[
+              h.row(
+                &[
+                  h.class("items-center gap-[6px]"),
+                  h.cursor(Cursor.Pointer),
+                  h.onClick(Message.ToggleSynthWeight),
+                ],
+                &[
+                  toggleSwitch(h, m.synthWeightOn, false, Message.ToggleSynthWeight),
+                  txt(h, "Weight (H1–H2)", "text-[12px] leading-[16px] font-medium text-[#0B0B0C]"),
+                ],
+              ),
+              popoverSliderRow(
+                m,
+                h,
+                SLIDER_SYNTH_WEIGHT,
+                "Glottal tilt",
+                if m.synthWeightOn { String.view(&m.synthWeightStr) } else { "off" },
+                weightNorm,
+              ),
+            ],
+          ),
+
+          h.box(&[h.class("h-[1px] bg-[#ECECEE]")], &[]),
+
+          // Pin adjusted voice directly as Reference
+          h.row(
+            &[h.class("items-center justify-between gap-[10px]")],
+            &[
+              txt(h, "Practice against your own adjusted voice", "text-[11px] leading-[14px] text-[#6B6B70] flex-1"),
+              h.box(
+                &[
+                  h.class("px-[10px] py-[6px] rounded-[5px] bg-[#2E7D96] text-white shrink-0"),
+                  h.cursor(Cursor.Pointer),
+                  h.onClick(Message.PinSynthAsRef),
+                ],
+                &[txt(h, "Pin preview as Ref", "text-[11px] leading-[14px] font-semibold text-white")],
+              ),
+            ],
+          ),
+        ],
+      ),
+    ],
+  )
 }
 
 /// Anchored floating Guides Popover (320px white card under Toolbar -> Guides).

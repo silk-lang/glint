@@ -147,6 +147,10 @@ pub const SLIDER_W_WEIGHT: u32 = 14
 pub const SLIDER_W_VOWEL: u32 = 15
 pub const SLIDER_PITCH_FLOOR: u32 = 16
 pub const SLIDER_PITCH_CEIL: u32 = 17
+pub const SLIDER_SYNTH_PITCH: u32 = 18
+pub const SLIDER_SYNTH_SIZE: u32 = 19
+pub const SLIDER_SYNTH_WEIGHT: u32 = 20
+pub const SLIDER_SYNTH_MORPH: u32 = 21
 
 // Pointer drag modes
 pub const DRAG_NONE: u32 = 0
@@ -374,6 +378,20 @@ pub union Message {
   ToggleNeural,
   NeuralReady { pub jobId: i32, pub isRef: bool, pub hasPitch: bool, pub hasFormants: bool },
   NeuralStatus { pub flags: i32 },
+  // Hear in your voice (source-filter preview resynthesis)
+  ToggleVoicePreview,
+  PlaySynthAdjusted,
+  PlayOriginalPreview,
+  StopSynthPreview,
+  PinSynthAsRef,
+  ToggleSynthPitch,
+  ToggleSynthSize,
+  ToggleSynthWeight,
+  ToggleSynthContour,
+  SynthMatchRef,
+  SynthReset,
+  SynthPreset { pub pitch: f64, pub size: f64, pub weight: f64 },
+  SetSynthMorph { pub morph: f32 },
   // Hillenbrand (1995) Gendered Vowel Space mode + click vowel -> F1/F2/F3 guides
   SetVowelMode { pub mode: u32 },
   ApplyVowelGuides { pub idx: usize, pub useMasc: bool },
@@ -656,8 +674,8 @@ pub struct Overtone {
   pub specRect: Rect<f32>,
   pub overviewRect: Rect<f32>,
   pub sliceHeight: f32,
-  pub sliderLeft: [f32; 18],
-  pub sliderWidth: [f32; 18],
+  pub sliderLeft: [f32; 22],
+  pub sliderWidth: [f32; 22],
 
   // Pointer & drag state
   pub drag: u32,
@@ -699,6 +717,21 @@ pub struct Overtone {
   pub takeNeuralGen: i32,
   pub refNeuralGen: i32,
   pub neuralStatusFlags: i32,
+
+  // Hear in your voice (Pitch / Size / Weight preview resynthesis)
+  pub showVoicePreview: bool,
+  pub synthPitchOn: bool,
+  pub synthSizeOn: bool,
+  pub synthWeightOn: bool,
+  pub synthFollowContour: bool,
+  pub synthPitchSemi: f64,
+  pub synthSizePct: f64,
+  pub synthWeightDb: f64,
+  pub synthMorph: f32,
+  pub synthPitchStr: String,
+  pub synthSizeStr: String,
+  pub synthWeightStr: String,
+  pub synthMorphStr: String,
 }
 
 effect fn copyF32List(src: &[f32]) -> List<f32>
@@ -988,8 +1021,8 @@ impl Overtone {
       specRect: Rect<f32>.new(0.0, 0.0, INIT_SPEC_W, INIT_SPEC_H),
       overviewRect: Rect<f32>.new(0.0, 0.0, INIT_SPEC_W, OVERVIEW_H),
       sliceHeight: 96.0,
-      sliderLeft: [0.0; 18],
-      sliderWidth: [70.0; 18],
+      sliderLeft: [0.0; 22],
+      sliderWidth: [70.0; 22],
 
       drag: DRAG_NONE,
       dragSlider: 0,
@@ -1027,6 +1060,20 @@ impl Overtone {
       takeNeuralGen: 0,
       refNeuralGen: 0,
       neuralStatusFlags: 0,
+
+      showVoicePreview: false,
+      synthPitchOn: true,
+      synthSizeOn: true,
+      synthWeightOn: true,
+      synthFollowContour: false,
+      synthPitchSemi: 0.0,
+      synthSizePct: 0.0,
+      synthWeightDb: 0.0,
+      synthMorph: 1.0,
+      synthPitchStr: run String.copy("0.0 st"),
+      synthSizeStr: run String.copy("0%"),
+      synthWeightStr: run String.copy("0.0 dB"),
+      synthMorphStr: run String.copy("100%"),
     }
 
     audio_native.setVolume(model.volume)
@@ -2560,6 +2607,182 @@ impl Overtone {
     run self.rebuildDrawings(true)
   }
 
+  effect fn syncSynthReadouts(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mScale = f32.toF64(self.synthMorph)
+    let effPitch = if self.synthPitchOn { self.synthPitchSemi * mScale } else { 0.0 }
+    let effSize = if self.synthSizeOn { self.synthSizePct * mScale } else { 0.0 }
+    let effWeight = if self.synthWeightOn { self.synthWeightDb * mScale } else { 0.0 }
+
+    self.synthPitchStr = run formatSignedFixed(effPitch, 1, " st")
+
+    let mut ss = String.make()
+    let szRound = f64.toI32(f64.round(effSize))
+    if szRound > 0 {
+      run ss.append("+")
+      run appendFixed(&mut ss, i32.toF64(szRound), 0)
+      run ss.append("% smaller")
+    } else if szRound < 0 {
+      run ss.append("−")
+      run appendFixed(&mut ss, i32.toF64(-szRound), 0)
+      run ss.append("% bigger")
+    } else {
+      run ss.append("0%")
+    }
+    self.synthSizeStr = move ss
+
+    let wSuffix = if effWeight > 0.15 {
+      " dB lighter"
+    } else if effWeight < -0.15 {
+      " dB heavier"
+    } else {
+      " dB"
+    }
+    self.synthWeightStr = run formatSignedFixed(effWeight, 1, wSuffix)
+
+    let mut ms = String.make()
+    run appendFixed(&mut ms, f64.round(mScale * 100.0), 0)
+    run ms.append("%")
+    self.synthMorphStr = move ms
+  }
+
+  effect fn fillSynthFromRef(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.refClip.active || !self.compare.valid {
+      return ()
+    }
+    // Positive deltaSemi means take is higher than ref -> shift by -deltaSemi to match ref
+    let targetPitch = f64.max(-12.0, f64.min(12.0, f64.round(-self.compare.deltaSemi * 10.0) / 10.0))
+    // Formant frequency ratio scales inversely with vocal tract length: VTL_take / VTL_ref
+    let takeVtl = self.voiceMetrics.summary.medianVtlCm
+    let refVtl = self.refClip.summary.medianVtlCm
+    let rawSizePct = if takeVtl > 5.0 && refVtl > 5.0 {
+      ((takeVtl / refVtl) - 1.0) * 100.0
+    } else {
+      0.0
+    }
+    let targetSize = f64.max(-25.0, f64.min(25.0, f64.round(rawSizePct)))
+    // Positive deltaH1H2Db means take is lighter than ref -> shift by -deltaH1H2Db
+    let targetWeight = f64.max(-8.0, f64.min(8.0, f64.round(-self.compare.deltaH1H2Db * 10.0) / 10.0))
+
+    self.synthPitchSemi = targetPitch
+    self.synthSizePct = targetSize
+    self.synthWeightDb = targetWeight
+    self.synthMorph = 1.0
+    self.synthPitchOn = true
+    self.synthSizeOn = true
+    self.synthWeightOn = true
+    run self.syncSynthReadouts()
+  }
+
+  effect fn renderCurrentSynth(self: &mut Self) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.samples.length() < 64 {
+      return 0
+    }
+    let pFrames = self.pitchTrack.frames.asSlice()
+    let pn = pFrames.length
+    let mut f0Times = List<f64>.make()
+    let mut f0Hz = List<f64>.make()
+    let mut refF0 = List<f64>.make()
+    run f0Times.appendRepeated(0.0, pn)
+    run f0Hz.appendRepeated(0.0, pn)
+    let tSl = f0Times.asMutSlice()
+    let hSl = f0Hz.asMutSlice()
+    let mut i: usize = 0
+    while i < pn {
+      tSl[i] = pFrames[i].time
+      hSl[i] = if pFrames[i].voiced && pFrames[i].clarity >= self.displayClarity { pFrames[i].frequency } else { 0.0 }
+      i = i + 1
+    }
+
+    let aligned = self.compare.points.asSlice()
+    let hasRefF0 = self.synthFollowContour && self.refClip.active && aligned.length >= 2 && pn > 0
+    if hasRefF0 {
+      run refF0.appendRepeated(0.0, pn)
+      let rSl = refF0.asMutSlice()
+      let mut ai: usize = 0
+      i = 0
+      while i < pn {
+        let t = pFrames[i].time
+        while ai + 1 < aligned.length && aligned[ai + 1].time < t {
+          ai = ai + 1
+        }
+        let mut best = ai
+        if ai + 1 < aligned.length && f64.abs(aligned[ai + 1].time - t) < f64.abs(aligned[ai].time - t) {
+          best = ai + 1
+        }
+        if f64.abs(aligned[best].time - t) <= 0.08 && aligned[best].voiced && aligned[best].f0 > 45.0 {
+          rSl[i] = aligned[best].f0
+        }
+        i = i + 1
+      }
+    }
+
+    let mScale = f32.toF64(self.synthMorph)
+    let effPitch = if self.synthPitchOn {
+      if hasRefF0 { 0.0 } else { self.synthPitchSemi * mScale }
+    } else {
+      0.0
+    }
+    let effContour = self.synthPitchOn && hasRefF0
+    let effSize = if self.synthSizeOn { self.synthSizePct * mScale } else { 0.0 }
+    let effWeight = if self.synthWeightOn { self.synthWeightDb * mScale } else { 0.0 }
+
+    return audio_native.synthRender(
+      self.samples.asSlice(),
+      self.sampleRate,
+      f0Times.asSlice(),
+      f0Hz.asSlice(),
+      refF0.asSlice(),
+      effContour,
+      effPitch,
+      effContour,
+      mScale,
+      effSize,
+      effWeight,
+    )
+  }
+
+  effect fn playSynthAdjusted(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    audio_native.playStop()
+    let rendered = run self.renderCurrentSynth()
+    if rendered < 64 {
+      return ()
+    }
+    let dur = self.clipDuration()
+    let startS = if self.hasSelection { f64.min(self.selStart, self.selEnd) } else { 0.0 }
+    let endS = if self.hasSelection { f64.max(self.selStart, self.selEnd) } else { dur }
+    drop audio_native.synthPlay(startS, endS, false)
+  }
+
+  effect fn pinSynthPreviewAsRef(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let rendered = run self.renderCurrentSynth()
+    if rendered < 64 {
+      return ()
+    }
+    let mut pcm = List<f32>.make()
+    run pcm.appendRepeated(0.0, rendered)
+    let got = audio_native.synthCopy(pcm.asMutSlice())
+    if got < 64 {
+      return ()
+    }
+    let sr = self.sampleRate
+    let mut refName = run String.copy(String.view(&self.clipName))
+    run refName.append(" (target)")
+    let refPath = run String.copy("synth://target-preview")
+    run self.analyzeAndPinBufferAsRef(move refName, move pcm, sr, move refPath)
+    self.showVoicePreview = false
+    run self.rebuildDrawings(true)
+  }
+
   /// Re-analyzes the currently pinned Reference clip using the active pitch range, clarity,
   /// and formant ceiling so Take and Reference always share identical analysis parameters!
   effect fn reanalyzeRefClip(self: &mut Self) -> ()
@@ -4036,7 +4259,7 @@ impl Overtone {
     ! OutOfMemoryError
     ? &mut Allocator {
     let idx = u32.toUsize(id)
-    if idx >= 18 {
+    if idx >= 22 {
       return ()
     }
     let w = f32.max(1.0, self.sliderWidth[idx])
@@ -4132,6 +4355,21 @@ impl Overtone {
         run self.analyzeAll()
         run self.rebuildDrawings(false)
       }
+    } else if id == SLIDER_SYNTH_PITCH {
+      self.synthPitchSemi = f64.round((-12.0 + f32.toF64(t) * 24.0) * 10.0) / 10.0
+      self.synthPitchOn = true
+      run self.syncSynthReadouts()
+    } else if id == SLIDER_SYNTH_SIZE {
+      self.synthSizePct = f64.round(-25.0 + f32.toF64(t) * 50.0)
+      self.synthSizeOn = true
+      run self.syncSynthReadouts()
+    } else if id == SLIDER_SYNTH_WEIGHT {
+      self.synthWeightDb = f64.round((-8.0 + f32.toF64(t) * 16.0) * 10.0) / 10.0
+      self.synthWeightOn = true
+      run self.syncSynthReadouts()
+    } else if id == SLIDER_SYNTH_MORPH {
+      self.synthMorph = f32.round(t * 20.0) / 20.0
+      run self.syncSynthReadouts()
     }
   }
 
@@ -5588,6 +5826,94 @@ impl Overtone {
         self.neuralStatusFlags = flags
       }
 
+      Message.ToggleVoicePreview => {
+        self.showVoicePreview = !self.showVoicePreview
+        if self.showVoicePreview {
+          self.showGuidesPanel = false
+          self.ctxMenuKind = CTX_NONE
+          if self.refClip.active && self.compare.valid {
+            run self.fillSynthFromRef()
+          } else {
+            run self.syncSynthReadouts()
+          }
+        }
+      }
+
+      Message.PlaySynthAdjusted => {
+        run self.playSynthAdjusted()
+      }
+
+      Message.PlayOriginalPreview => {
+        if self.samples.length() > 64 {
+          audio_native.playStop()
+          let dur = self.clipDuration()
+          let startS = if self.hasSelection { f64.min(self.selStart, self.selEnd) } else { 0.0 }
+          let endS = if self.hasSelection { f64.max(self.selStart, self.selEnd) } else { dur }
+          drop audio_native.playRange(self.samples.asSlice(), self.sampleRate, startS, endS, false)
+        }
+      }
+
+      Message.StopSynthPreview => {
+        audio_native.playStop()
+      }
+
+      Message.PinSynthAsRef => {
+        run self.pinSynthPreviewAsRef()
+      }
+
+      Message.ToggleSynthPitch => {
+        self.synthPitchOn = !self.synthPitchOn
+        run self.syncSynthReadouts()
+      }
+
+      Message.ToggleSynthSize => {
+        self.synthSizeOn = !self.synthSizeOn
+        run self.syncSynthReadouts()
+      }
+
+      Message.ToggleSynthWeight => {
+        self.synthWeightOn = !self.synthWeightOn
+        run self.syncSynthReadouts()
+      }
+
+      Message.ToggleSynthContour => {
+        self.synthFollowContour = !self.synthFollowContour
+        run self.syncSynthReadouts()
+      }
+
+      Message.SynthMatchRef => {
+        run self.fillSynthFromRef()
+      }
+
+      Message.SynthReset => {
+        self.synthPitchSemi = 0.0
+        self.synthSizePct = 0.0
+        self.synthWeightDb = 0.0
+        self.synthMorph = 1.0
+        self.synthPitchOn = true
+        self.synthSizeOn = true
+        self.synthWeightOn = true
+        self.synthFollowContour = false
+        run self.syncSynthReadouts()
+      }
+
+      Message.SynthPreset { pitch, size, weight } => {
+        self.synthPitchSemi = pitch
+        self.synthSizePct = size
+        self.synthWeightDb = weight
+        self.synthMorph = 1.0
+        self.synthPitchOn = true
+        self.synthSizeOn = true
+        self.synthWeightOn = true
+        self.synthFollowContour = false
+        run self.syncSynthReadouts()
+      }
+
+      Message.SetSynthMorph { morph } => {
+        self.synthMorph = f32.max(0.0, f32.min(1.0, morph))
+        run self.syncSynthReadouts()
+      }
+
       Message.SetHeatmapMetric { metric } => {
         if self.heatmapMetric == metric && metric != HEATMAP_OVERALL {
           self.heatmapMetric = HEATMAP_OVERALL
@@ -5983,7 +6309,7 @@ impl Overtone {
 
       Message.SliderLayout { id, rect } => {
         let idx = u32.toUsize(id)
-        if idx < 18 {
+        if idx < 22 {
           self.sliderLeft[idx] = rect.xMin
           self.sliderWidth[idx] = rect.width()
         }
@@ -5991,7 +6317,7 @@ impl Overtone {
 
       Message.SliderDown { id, x, left, width } => {
         let idx = u32.toUsize(id)
-        if idx < 18 && width > 1.0 {
+        if idx < 22 && width > 1.0 {
           self.sliderLeft[idx] = left
           self.sliderWidth[idx] = width
         }

@@ -4,6 +4,7 @@
 //   - Web Audio API (microphone capture, device listing, range/loop/speed playback, grain scrubbing, WAV download)
 //   - WebGL2 3-tier spectrogram renderer (exact 1:1 port of Glint's WGSL shader)
 import { mount } from "./silk-ui-dom.js";
+import { resynthesizeVoice } from "./voice-synth.js";
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
@@ -1278,7 +1279,57 @@ const glintImports = {
     return n;
   },
   ov_neural_status: () => neuralStatusFlags,
+
+  // Browser-local Source-Filter Voice Preview Resynthesizer (Pitch / Size / Weight)
+  ov_synth_render: (
+    samplesPtr,
+    count,
+    sampleRate,
+    f0TimesPtr,
+    f0HzPtr,
+    f0Count,
+    refF0Ptr,
+    hasRefF0,
+    pitchSemi,
+    followContour,
+    contourBlend,
+    sizePct,
+    weightDb,
+  ) => {
+    if (count < 64 || sampleRate <= 0) return 0;
+    const pcm = new Float32Array(count);
+    pcm.set(new Float32Array(memBuf(), samplesPtr, count));
+    const f0Times = f0Count > 0 ? new Float64Array(memBuf(), f0TimesPtr, f0Count).slice() : new Float64Array(0);
+    const f0Hz = f0Count > 0 ? new Float64Array(memBuf(), f0HzPtr, f0Count).slice() : new Float64Array(0);
+    const refF0 = hasRefF0 && f0Count > 0 ? new Float64Array(memBuf(), refF0Ptr, f0Count).slice() : null;
+    try {
+      const rendered = resynthesizeVoice(pcm, sampleRate, f0Times, f0Hz, refF0, {
+        pitchSemi,
+        followContour: followContour !== 0,
+        contourBlend,
+        sizePct,
+        weightDb,
+      });
+      synthAudio = { samples: rendered, sampleRate };
+      return rendered.length;
+    } catch (err) {
+      console.warn("[Glint Synth] Resynthesis failed:", err);
+      return 0;
+    }
+  },
+  ov_synth_play: (startSec, endSec, loop) => {
+    if (!synthAudio || !synthAudio.samples || synthAudio.samples.length === 0) return 0;
+    return startPlayback(synthAudio.samples, synthAudio.sampleRate, startSec, endSec, loop !== 0);
+  },
+  ov_synth_copy: (outPtr, maxCount) => {
+    if (!synthAudio || !synthAudio.samples) return 0;
+    const n = Math.min(maxCount, synthAudio.samples.length);
+    new Float32Array(memBuf(), outPtr, n).set(synthAudio.samples.subarray(0, n));
+    return n;
+  },
 };
+
+let synthAudio = null;
 
 let neuralWorker = null;
 let neuralResult = null;

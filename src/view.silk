@@ -60,7 +60,8 @@ import view_overlays {
   renderContextMenu,
   renderDragGhost,
   renderGuidesPopover,
-  renderSettingsModal
+  renderSettingsModal,
+  renderVoicePreviewPopover
 }
 import loom.css
 import loom.css { percent, px }
@@ -136,6 +137,7 @@ pub fn render(m: &Overtone, h: &Document<Message>) -> Node {
       ),
       renderStatusBar(m, h),
       renderGuidesPopover(m, h),
+      renderVoicePreviewPopover(m, h),
       renderSettingsModal(m, h),
       renderContextMenu(m, h),
       renderDragGhost(m, h),
@@ -350,6 +352,18 @@ fn renderToolbar(m: &Overtone, h: &Document<Message>) -> Node {
             &[
               txt(h, "▷", "text-[10px] text-[#0B0B0C]"),
               txt(h, "Ref", "text-[12px] leading-[16px] text-[#0B0B0C]"),
+            ],
+          ),
+          h.box(
+            &[
+              h.class("flex items-center gap-[5px] h-[28px] px-[9px] rounded-[6px]"),
+              h.classSelect(m.showVoicePreview, "bg-[#0E0E10] text-white", "text-[#2E7D96] hover:bg-[#2E7D96]/10"),
+              h.cursor(Cursor.Pointer),
+              h.onClick(Message.ToggleVoicePreview),
+            ],
+            &[
+              txt(h, "✦", if m.showVoicePreview { "text-[10px] text-white" } else { "text-[10px] text-[#2E7D96]" }),
+              txt(h, "Hear target", if m.showVoicePreview { "text-[12px] leading-[16px] font-medium text-white" } else { "text-[12px] leading-[16px] font-medium text-[#2E7D96]" }),
             ],
           ),
           h.box(

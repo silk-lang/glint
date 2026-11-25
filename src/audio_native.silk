@@ -219,6 +219,24 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
     maxCount: i32,
   ) -> i32 as "glint#ov_neural_copy_formants"
   unsafe extern "C" fn ov_neural_status() -> i32 as "glint#ov_neural_status"
+
+  unsafe extern "C" fn ov_synth_render(
+    samples: ?[*]const f32,
+    count: i32,
+    sampleRate: f64,
+    f0Times: ?[*]const f64,
+    f0Hz: ?[*]const f64,
+    f0Count: i32,
+    refF0: ?[*]const f64,
+    hasRefF0: i32,
+    pitchSemi: f64,
+    followContour: i32,
+    contourBlend: f64,
+    sizePct: f64,
+    weightDb: f64,
+  ) -> i32 as "glint#ov_synth_render"
+  unsafe extern "C" fn ov_synth_play(startSec: f64, endSec: f64, loop: i32) -> i32 as "glint#ov_synth_play"
+  unsafe extern "C" fn ov_synth_copy(out: ?[*]mut f32, maxCount: i32) -> i32 as "glint#ov_synth_copy"
 } else {
   unsafe extern "C" fn ov_audio_refresh_devices() -> i32
   unsafe extern "C" fn ov_audio_input_count() -> i32
@@ -1377,6 +1395,82 @@ pub fn neuralStatus() -> i32 {
   static if Intrinsic.targetArchitecture() == "wasm32" {
     return unsafe ov_neural_status()
   } else {
+    return 0
+  }
+}
+
+pub fn synthRender(
+  samples: &[f32],
+  sampleRate: f64,
+  f0Times: &[f64],
+  f0Hz: &[f64],
+  refF0: &[f64],
+  hasRefF0: bool,
+  pitchSemi: f64,
+  followContour: bool,
+  contourBlend: f64,
+  sizePct: f64,
+  weightDb: f64,
+) -> usize {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    if samples.length < 64 {
+      return 0
+    }
+    let f0N = if f0Times.length < f0Hz.length { f0Times.length } else { f0Hz.length }
+    let useRef = hasRefF0 && refF0.length >= f0N && f0N > 0
+    let n = unsafe ov_synth_render(
+      Pointer.fromSlice(samples),
+      usize.toI32(samples.length),
+      sampleRate,
+      Pointer.fromSlice(f0Times),
+      Pointer.fromSlice(f0Hz),
+      usize.toI32(f0N),
+      Pointer.fromSlice(refF0),
+      if useRef { 1 } else { 0 },
+      pitchSemi,
+      if followContour { 1 } else { 0 },
+      contourBlend,
+      sizePct,
+      weightDb,
+    )
+    return if n > 0 { i32.toUsize(n) } else { 0 }
+  } else {
+    drop samples
+    drop sampleRate
+    drop f0Times
+    drop f0Hz
+    drop refF0
+    drop hasRefF0
+    drop pitchSemi
+    drop followContour
+    drop contourBlend
+    drop sizePct
+    drop weightDb
+    return 0
+  }
+}
+
+pub fn synthPlay(startSec: f64, endSec: f64, loop: bool) -> bool {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    return unsafe ov_synth_play(startSec, endSec, if loop { 1 } else { 0 }) != 0
+  } else {
+    drop startSec
+    drop endSec
+    drop loop
+    return false
+  }
+}
+
+pub fn synthCopy(out: &mut [f32]) -> usize {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    if out.length == 0 {
+      return 0
+    }
+    let cap = usize.toI32(out.length)
+    let n = unsafe ov_synth_copy(Pointer.fromMutSlice(move out), cap)
+    return if n > 0 { i32.toUsize(n) } else { 0 }
+  } else {
+    drop out
     return 0
   }
 }
