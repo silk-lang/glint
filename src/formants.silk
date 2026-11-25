@@ -781,6 +781,171 @@ impl FormantTrack {
     return added
   }
 
+  /// Incrementally voice-gates and continuity-tracks newly added frames (`fromIdx..len`)
+  /// during live recording so F1–F3 ribbons, VOWELS live dot, and F1/F2/F3 Hz readouts
+  /// update in real time while speaking.
+  pub fn updateLiveTracked(
+    self: &mut Self,
+    pitchFrames: &[PitchFrame],
+    displayClarity: f64,
+    fromIdx: usize,
+  ) -> () {
+    let n = self.frames.length()
+    if fromIdx >= n {
+      return ()
+    }
+    let ceiling = self.workingRate * 0.5
+    let scale = f64.max(0.75, f64.min(1.25, ceiling / 5500.0))
+    let refF1 = 550.0 * scale
+    let refF2 = 1650.0 * scale
+    let refF3 = 2750.0 * scale
+    let frMut = self.frames.asMutSlice()
+
+    let mut i = fromIdx
+    while i < n {
+      let ft = frMut[i].time
+      let fDb = frMut[i].intensityDb
+      let mut isVoiced = false
+      let mut curF0: f64 = 0.0
+      if pitchFrames.length > 0 {
+        let mut lo: usize = 0
+        let mut hi: usize = pitchFrames.length - 1
+        while lo < hi {
+          let mid = lo + (hi - lo) / 2
+          if pitchFrames[mid].time < ft {
+            lo = mid + 1
+          } else {
+            hi = mid
+          }
+        }
+        let mut bestP = lo
+        if lo > 0 && f64.abs(pitchFrames[lo - 1].time - ft) < f64.abs(pitchFrames[lo].time - ft) {
+          bestP = lo - 1
+        }
+        let pf = pitchFrames[bestP]
+        if f64.abs(pf.time - ft) <= 0.045 && pf.voiced && pf.clarity >= displayClarity && fDb >= -58.0 {
+          isVoiced = true
+          curF0 = pf.frequency
+        }
+      }
+
+      if !isVoiced || frMut[i].candCount < 2 {
+        frMut[i].tracked = false
+        i = i + 1
+        continue
+      }
+
+      let hasPrev = i > 0 && frMut[i - 1].tracked && (ft - frMut[i - 1].time) <= 0.06
+      let prevF1 = if hasPrev { frMut[i - 1].f1 } else { 0.0 }
+      let prevF2 = if hasPrev { frMut[i - 1].f2 } else { 0.0 }
+      let prevF3 = if hasPrev { frMut[i - 1].f3 } else { 0.0 }
+
+      let f1Floor = f64.max(200.0, curF0 * 1.10)
+      let cc = frMut[i].candCount
+      let mut bestSc: f64 = 1.0e18
+      let mut bestF1: f64 = 0.0
+      let mut bestB1: f64 = 0.0
+      let mut bestF2: f64 = 0.0
+      let mut bestB2: f64 = 0.0
+      let mut bestF3: f64 = 0.0
+      let mut bestB3: f64 = 0.0
+      let mut found = false
+
+      if cc >= 3 {
+        let mut a: usize = 0
+        while a < cc {
+          let fa = frMut[i].candFreqs[a]
+          let ba = frMut[i].candBws[a]
+          if fa >= f1Floor && fa <= 1180.0 {
+            let mut b = a + 1
+            while b < cc {
+              let fb = frMut[i].candFreqs[b]
+              let bb = frMut[i].candBws[b]
+              if fb >= 650.0 && fb <= 3200.0 && fb >= fa + 150.0 {
+                let mut c = b + 1
+                while c < cc {
+                  let fc = frMut[i].candFreqs[c]
+                  let bc = frMut[i].candBws[c]
+                  if fc >= 1650.0 && fc <= 3600.0 && fc >= fb + 180.0 {
+                    let d1 = f64.log2(fa / refF1)
+                    let d2 = f64.log2(fb / refF2)
+                    let d3 = f64.log2(fc / refF3)
+                    let f0Pen = if curF0 > 50.0 && fa < curF0 * 1.28 { 1.4 } else { 0.0 }
+                    let mut sc = 0.75 * d1 * d1 + 0.55 * d2 * d2 + 1.15 * d3 * d3 + f0Pen
+                      + 0.35 * (ba / fa) + 0.30 * (bb / fb) + 0.25 * (bc / fc)
+                    if hasPrev && prevF1 > 150.0 && prevF2 > 400.0 {
+                      let j1 = f64.log2(fa / prevF1)
+                      let j2 = f64.log2(fb / prevF2)
+                      sc = sc + 2.4 * (j1 * j1 + j2 * j2)
+                      if prevF3 > 1200.0 {
+                        let j3 = f64.log2(fc / prevF3)
+                        sc = sc + 2.8 * j3 * j3
+                      }
+                    }
+                    if sc < bestSc {
+                      bestSc = sc
+                      bestF1 = fa
+                      bestB1 = ba
+                      bestF2 = fb
+                      bestB2 = bb
+                      bestF3 = fc
+                      bestB3 = bc
+                      found = true
+                    }
+                  }
+                  c = c + 1
+                }
+              }
+              b = b + 1
+            }
+          }
+          a = a + 1
+        }
+      }
+
+      if found {
+        let mut f1Out = bestF1
+        let mut f2Out = bestF2
+        let mut f3Out = bestF3
+        if hasPrev {
+          if prevF1 > 150.0 && f64.abs(f64.log2(f1Out / prevF1)) < 0.45 {
+            f1Out = prevF1 * 0.52 + f1Out * 0.48
+          }
+          if prevF2 > 400.0 && f64.abs(f64.log2(f2Out / prevF2)) < 0.45 {
+            f2Out = prevF2 * 0.52 + f2Out * 0.48
+          }
+          if prevF3 > 1200.0 && f64.abs(f64.log2(f3Out / prevF3)) < 0.40 {
+            f3Out = prevF3 * 0.58 + f3Out * 0.42
+          }
+        }
+        frMut[i].f1 = f1Out
+        frMut[i].bw1 = bestB1
+        frMut[i].f2 = f2Out
+        frMut[i].bw2 = bestB2
+        frMut[i].f3 = f3Out
+        frMut[i].bw3 = bestB3
+        frMut[i].count = 3
+        frMut[i].tracked = true
+      } else if frMut[i].count >= 2 && frMut[i].f1 >= f1Floor && frMut[i].f1 <= 1180.0 && frMut[i].f2 > frMut[i].f1 + 120.0 {
+        if hasPrev {
+          if prevF1 > 150.0 && f64.abs(f64.log2(frMut[i].f1 / prevF1)) < 0.45 {
+            frMut[i].f1 = prevF1 * 0.52 + frMut[i].f1 * 0.48
+          }
+          if prevF2 > 400.0 && f64.abs(f64.log2(frMut[i].f2 / prevF2)) < 0.45 {
+            frMut[i].f2 = prevF2 * 0.52 + frMut[i].f2 * 0.48
+          }
+          if frMut[i].count >= 3 && prevF3 > 1200.0 && f64.abs(f64.log2(frMut[i].f3 / prevF3)) < 0.40 {
+            frMut[i].f3 = prevF3 * 0.58 + frMut[i].f3 * 0.42
+          }
+        }
+        frMut[i].tracked = true
+      } else {
+        frMut[i].tracked = false
+      }
+      i = i + 1
+    }
+  }
+
   pub fn nearest(self: &Self, timeSec: f64) -> Option<FormantFrame> {
     let n = self.frames.length()
     if n == 0 {

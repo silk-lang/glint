@@ -4433,6 +4433,7 @@ impl Overtone {
       drop run self.pitchTrack.update(self.samples.asSlice())
       run self.formantTrack.reset(self.sampleRate, self.formantCeilingHz, self.pitchConfig.hopSeconds)
       drop run self.formantTrack.update(self.samples.asSlice())
+      self.formantTrack.updateLiveTracked(self.pitchTrack.frames.asSlice(), self.displayClarity, 0)
       self.voiceMetrics.reset()
       drop run self.voiceMetrics.update(
         self.samples.asSlice(),
@@ -4710,7 +4711,9 @@ impl Overtone {
         self.vp.setTimeRange(dur - span, dur)
       }
       drop run self.pitchTrack.update(self.samples.asSlice())
+      let prevFmtLen = self.formantTrack.frames.length()
       drop run self.formantTrack.update(self.samples.asSlice())
+      self.formantTrack.updateLiveTracked(self.pitchTrack.frames.asSlice(), self.displayClarity, prevFmtLen)
       drop run self.voiceMetrics.update(
         self.samples.asSlice(),
         self.sampleRate,
@@ -5015,11 +5018,11 @@ impl Overtone {
 
     let ffOpt = self.formantTrack.nearest(inspectSec)
     if let Option<FormantFrame>.Some { value: ff } = ffOpt {
-      self.readoutF1 = if ff.count >= 1 { run formatHz(ff.f1) } else { run String.copy("—") }
-      self.readoutF2 = if ff.count >= 2 { run formatHz(ff.f2) } else { run String.copy("—") }
-      self.readoutF3 = if ff.count >= 3 { run formatHz(ff.f3) } else { run String.copy("—") }
-      self.readoutF4 = if ff.count >= 4 { run formatHz(ff.f4) } else { run String.copy("—") }
-      self.readoutVowel = if ff.count >= 2 { estimateVowelForResonance(ff.f1, ff.f2, f32.toF64(self.vowelResonance)) } else { "—" }
+      self.readoutF1 = if ff.tracked && ff.count >= 1 { run formatHz(ff.f1) } else { run String.copy("—") }
+      self.readoutF2 = if ff.tracked && ff.count >= 2 { run formatHz(ff.f2) } else { run String.copy("—") }
+      self.readoutF3 = if ff.tracked && ff.count >= 3 { run formatHz(ff.f3) } else { run String.copy("—") }
+      self.readoutF4 = if ff.tracked && ff.count >= 4 { run formatHz(ff.f4) } else { run String.copy("—") }
+      self.readoutVowel = if ff.tracked && ff.count >= 2 { estimateVowelForResonance(ff.f1, ff.f2, f32.toF64(self.vowelResonance)) } else { "—" }
     } else {
       self.readoutF1 = run String.copy("—")
       self.readoutF2 = run String.copy("—")
@@ -5791,7 +5794,9 @@ impl Overtone {
               self.vp.setTimeRange(dur - span, dur)
             }
             drop run self.pitchTrack.update(self.samples.asSlice())
+            let prevFmtLen = self.formantTrack.frames.length()
             drop run self.formantTrack.update(self.samples.asSlice())
+            self.formantTrack.updateLiveTracked(self.pitchTrack.frames.asSlice(), self.displayClarity, prevFmtLen)
             drop run self.voiceMetrics.update(
               self.samples.asSlice(),
               self.sampleRate,
