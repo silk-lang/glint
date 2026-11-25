@@ -33,7 +33,8 @@ import colormap {
   DEFAULT_DISPLAY_FLOOR_DB,
   Palette,
   nextPalette,
-  paletteFromIndex
+  paletteFromIndex,
+  paletteIndex
 }
 import compare {
   CompareAlignment,
@@ -77,6 +78,7 @@ import overlays {
   VowelChartDot,
   VowelSpan,
   appendFixed,
+  appendInt,
   buildLtasDrawing,
   buildMetricsLaneDrawing,
   buildPianoDrawing,
@@ -247,6 +249,10 @@ pub const FILTER_ALL: u32 = 0
 pub const FILTER_STARRED: u32 = 1
 
 // Default canvas dimensions before first Layout event (Glint Muted layout)
+pub const LISTEN_YOU: u32 = 0
+pub const LISTEN_REF: u32 = 1
+pub const LISTEN_BOTH: u32 = 2
+
 pub const LIB_W: f32 = 216.0
 pub const INIT_SPEC_W: f32 = 844.0
 pub const INIT_SPEC_H: f32 = 460.0
@@ -337,10 +343,26 @@ pub union Message {
   ExplorerScrollMove { pub y: f32 },
   ExplorerScrollUp,
   ExplorerRowLayout { pub idx: usize, pub rect: Rect<f32> },
-  ExplorerRowDown { pub idx: usize, pub x: f32, pub y: f32, pub button: u32 },
+  ExplorerRowDown { pub idx: usize, pub x: f32, pub y: f32, pub button: u32, pub modifiers: u32 },
   ExplorerEmptyDown { pub x: f32, pub y: f32, pub button: u32 },
   ExplorerPointerMove { pub x: f32, pub y: f32 },
   ExplorerPointerUp,
+  // Reference-grouped library, multi-selection, safe ref recording, split view, mix, norm, trim & favorites
+  ToggleRefGroupExpand { pub idx: usize },
+  ToggleSelectLibClip { pub idx: usize },
+  SelectAllLibClips,
+  ClearLibSelection,
+  DeleteSelectedLibClips,
+  CreateEmptyRef,
+  SelectGeneralMode,
+  RecordOntoRef,
+  ToggleSplitRefSpec,
+  SetListenMode { pub mode: u32 },
+  ToggleNormToRef,
+  BakeNormToRef,
+  TrimSilence,
+  ToggleFavInput { pub id: u32 },
+  ToggleFavOutput { pub id: u32 },
   ClearGuides,
   AddGuideAtHover,
   ToggleGuidesPanel,
@@ -506,12 +528,14 @@ pub struct Overtone {
   pub showSpectrogram: bool,
   pub specOpacity: f32,
 
-  // Audio I/O device picker
+  // Audio I/O device picker + persisted favorites
   pub showAudioPanel: bool,
   pub inputDevices: List<AudioDeviceInfo>,
   pub outputDevices: List<AudioDeviceInfo>,
   pub selectedInputId: u32,
   pub selectedOutputId: u32,
+  pub favInputName: String,
+  pub favOutputName: String,
 
   // Editing clipboard & undo snapshot
   pub clipboardSamples: List<f32>,
@@ -535,6 +559,18 @@ pub struct Overtone {
   /// When true (and Ref is active), the WebGPU spectrogram shows the Reference and plots YOUR
   /// DTW-aligned pitch, formants, size, and weight directly on top of it!
   pub plotOnRef: bool,
+  /// Vertical split spectrogram: Reference on top, Your take on bottom!
+  pub splitRefSpec: bool,
+  /// Listening mix when Ref is active: 0=You, 1=Ref, 2=Both simultaneously
+  pub listenMode: u32,
+  /// Auto-normalize your take's loudness (spectrogram dB + playback gain) to match the Reference!
+  pub normToRef: bool,
+  pub normRefGainDb: f32,
+  pub readoutNormGain: String,
+  pub refOverlayDrawing: Drawing,
+  pub refPianoDrawing: Drawing,
+  pub refFreqTicks: List<AxisTick>,
+  pub recordOntoRefOnce: bool,
   pub useDtwAlign: bool,
   pub showNoteGrid: bool,
   pub showLtasTab: bool,
@@ -617,6 +653,9 @@ pub struct Overtone {
   pub activeCommentDraft: String,
   pub activeItemRating: i32,
   pub activeItemStarred: bool,
+  // Library multi-selection (Cmd/Ctrl+Click, Shift+Click, bulk delete)
+  pub selectedClipPaths: List<String>,
+  pub lastSelectedLibIdx: i32,
   // Virtualized Explorer viewport & Drag-Drop state (real file & folder moving)
   pub explorerPanelRect: Rect<f32>,
   pub explorerTreeRect: Rect<f32>,
@@ -745,6 +784,7 @@ pub struct Overtone {
   pub surface: Surface,
   pub gpuNeedClear: bool,
   pub gpuNeedFullReload: bool,
+  pub gpuNeedRefReload: bool,
   pub gpuNeedBeginRec: bool,
   pub gpuNeedRecAppend: bool,
   pub gpuNeedSharp: bool,
@@ -892,6 +932,8 @@ impl Overtone {
       outputDevices: move outputDevices,
       selectedInputId: selectedInputId,
       selectedOutputId: selectedOutputId,
+      favInputName: String.make(),
+      favOutputName: String.make(),
 
       clipboardSamples: List<f32>.make(),
       clipboardRate: SYNTH_SAMPLE_RATE,
@@ -910,6 +952,15 @@ impl Overtone {
       showRefOverlay: true,
       showRefWave: true,
       plotOnRef: false,
+      splitRefSpec: false,
+      listenMode: LISTEN_YOU,
+      normToRef: false,
+      normRefGainDb: 0.0,
+      readoutNormGain: String.make(),
+      refOverlayDrawing: emptyDraw.clone(),
+      refPianoDrawing: emptyDraw.clone(),
+      refFreqTicks: List<AxisTick>.make(),
+      recordOntoRefOnce: false,
       useDtwAlign: true,
       showNoteGrid: true,
       showLtasTab: false,
@@ -986,6 +1037,8 @@ impl Overtone {
       activeCommentDraft: String.make(),
       activeItemRating: 0,
       activeItemStarred: false,
+      selectedClipPaths: List<String>.make(),
+      lastSelectedLibIdx: -1,
       explorerPanelRect: Rect<f32>.new(0.0, 0.0, LIB_W, 500.0),
       explorerTreeRect: Rect<f32>.new(0.0, 150.0, LIB_W, 700.0),
       explorerScrollY: 0.0,
@@ -1107,6 +1160,7 @@ impl Overtone {
       surface: Surface.none(),
       gpuNeedClear: false,
       gpuNeedFullReload: true,
+      gpuNeedRefReload: false,
       gpuNeedBeginRec: false,
       gpuNeedRecAppend: false,
       gpuNeedSharp: true,
@@ -1158,25 +1212,7 @@ impl Overtone {
 
     audio_native.setVolume(model.volume)
     run model.syncDeviceNames()
-    run model.reloadTree(false)
-    let mut firstClipIdx: usize = 0
-    let mut hasFirstClip = false
-    let treeNodes = model.libTree.asSlice()
-    let mut ti: usize = 0
-    while ti < treeNodes.length {
-      if !treeNodes[ti].isDir {
-        firstClipIdx = ti
-        hasFirstClip = true
-        break
-      }
-      ti = ti + 1
-    }
-    if hasFirstClip {
-      run model.loadLibraryClip(firstClipIdx, false)
-    } else {
-      run model.analyzeAll()
-      run model.rebuildDrawings(true)
-    }
+    run model.restoreSessionPrefs()
     return move model
   }
 
@@ -1191,12 +1227,531 @@ impl Overtone {
       || k == "ArrowLeft" || k == "ArrowRight" || k == "=" || k == "+" || k == "-" {
       return true
     }
-    if (k == "Backspace" || k == "Delete") && self.hasSelection {
+    if (k == "Backspace" || k == "Delete") && (self.hasSelection || self.selectedClipPaths.length() > 0) {
       return true
     }
     return k == "r" || k == "R" || k == "d" || k == "D" || k == "e" || k == "E"
       || k == "p" || k == "P" || k == "b" || k == "B" || k == "l" || k == "L"
       || k == "g" || k == "G" || k == "h" || k == "H" || k == "n" || k == "N"
+  }
+
+  pub fn isSplitRefSpec(self: &Self) -> bool {
+    return self.splitRefSpec && self.refClip.active && !self.plotOnRef
+  }
+
+  pub fn isEditingActiveRef(self: &Self) -> bool {
+    return self.refClip.active
+      && String.byteLength(String.view(&self.refClip.fullPath)) > 0
+      && String.view(&self.activeClipPath) == String.view(&self.refClip.fullPath)
+  }
+
+  pub fn activeTakeGainDb(self: &Self) -> f32 {
+    if self.normToRef && self.refClip.active && !self.isPlottingOnRef() && !self.isEditingActiveRef() {
+      return self.normRefGainDb
+    }
+    return 0.0
+  }
+
+  fn yToFreqNorm(self: &Self, ly: f32, h: f32) -> f64 {
+    let safeH = f32.max(1.0, h)
+    if self.isSplitRefSpec() {
+      let halfH = safeH * 0.497
+      if ly <= halfH {
+        return f64.max(0.0, f64.min(1.0, 1.0 - f32.toF64(ly / halfH)))
+      }
+      let botTop = safeH * 0.503
+      let botY = f32.max(0.0, ly - botTop)
+      return f64.max(0.0, f64.min(1.0, 1.0 - f32.toF64(botY / halfH)))
+    }
+    return f64.max(0.0, f64.min(1.0, 1.0 - f32.toF64(ly / safeH)))
+  }
+
+  fn computeSpeechRmsDb(samples: &[f32], sampleRate: f64) -> f64 {
+    if samples.length < 64 || sampleRate <= 0.0 {
+      return -60.0
+    }
+    let frameLen = f64.toUsize(f64.max(64.0, sampleRate * 0.02))
+    let mut peakSq: f64 = 0.0
+    let mut pos: usize = 0
+    while pos + frameLen <= samples.length {
+      let mut sq: f64 = 0.0
+      let mut j: usize = 0
+      while j < frameLen {
+        let v = f32.toF64(samples[pos + j])
+        sq = sq + v * v
+        j = j + 1
+      }
+      let meanSq = sq / usize.toF64(frameLen)
+      if meanSq > peakSq {
+        peakSq = meanSq
+      }
+      pos = pos + frameLen
+    }
+    if peakSq <= 1e-10 {
+      return -60.0
+    }
+    // Average active speech frames within 24 dB of peak (ignores leading/trailing silence!)
+    let threshSq = f64.max(1e-5, peakSq * 0.004)
+    let mut activeSum: f64 = 0.0
+    let mut activeCount: usize = 0
+    pos = 0
+    while pos + frameLen <= samples.length {
+      let mut sq: f64 = 0.0
+      let mut j: usize = 0
+      while j < frameLen {
+        let v = f32.toF64(samples[pos + j])
+        sq = sq + v * v
+        j = j + 1
+      }
+      let meanSq = sq / usize.toF64(frameLen)
+      if meanSq >= threshSq {
+        activeSum = activeSum + meanSq
+        activeCount = activeCount + 1
+      }
+      pos = pos + frameLen
+    }
+    let rmsSq = if activeCount > 0 { activeSum / usize.toF64(activeCount) } else { peakSq }
+    return 4.342944819032518 * f64.log(f64.max(1e-12, rmsSq))
+  }
+
+  effect fn recomputeNormGain(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.refClip.active || self.refClip.samples.length() < 64 || self.samples.length() < 64 || self.isEditingActiveRef() {
+      self.normRefGainDb = 0.0
+      self.readoutNormGain.clear()
+      audio_native.playSetGainDb(0.0)
+      return ()
+    }
+    let refDb = Overtone.computeSpeechRmsDb(self.refClip.samples.asSlice(), self.refClip.sampleRate)
+    let takeDb = Overtone.computeSpeechRmsDb(self.samples.asSlice(), self.sampleRate)
+    let diff = f64.max(-24.0, f64.min(36.0, refDb - takeDb))
+    self.normRefGainDb = f64.toF32(diff)
+    let mut s = String.make()
+    if diff >= 0.0 {
+      run s.append("+")
+    }
+    run appendFixed(&mut s, diff, 1)
+    run s.append(" dB")
+    self.readoutNormGain = move s
+    audio_native.playSetGainDb(self.activeTakeGainDb())
+  }
+
+  effect fn saveSessionPrefs(self: &Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    audio_native.prefSet("last_clip", String.view(&self.activeClipPath))
+    audio_native.prefSet("last_ref", if self.refClip.active { String.view(&self.refClip.fullPath) } else { "" })
+    let exp = run self.expandedDirsString()
+    audio_native.prefSet("expanded_dirs", String.view(&exp))
+    audio_native.prefSet("split_ref", if self.splitRefSpec { "1" } else { "0" })
+    audio_native.prefSet("listen_mode", if self.listenMode == LISTEN_REF { "1" } else if self.listenMode == LISTEN_BOTH { "2" } else { "0" })
+    audio_native.prefSet("norm_ref", if self.normToRef { "1" } else { "0" })
+    audio_native.prefSet("show_pitch", if self.showPitch { "1" } else { "0" })
+    audio_native.prefSet("show_formants", if self.showFormants { "1" } else { "0" })
+    audio_native.prefSet("show_harmonics", if self.showHarmonics { "1" } else { "0" })
+    audio_native.prefSet("show_metrics", if self.showMetricsLane { "1" } else { "0" })
+    audio_native.prefSet("show_grid", if self.showNoteGrid { "1" } else { "0" })
+    audio_native.prefSet("show_lib", if self.showLibrary { "1" } else { "0" })
+    audio_native.prefSet("show_readouts", if self.showReadouts { "1" } else { "0" })
+    let mut palStr = String.make()
+    run appendInt(&mut palStr, u32.toI32(paletteIndex(self.palette)))
+    audio_native.prefSet("palette", String.view(&palStr))
+    audio_native.prefSet("fav_input", String.view(&self.favInputName))
+    audio_native.prefSet("fav_output", String.view(&self.favOutputName))
+  }
+
+  effect fn applyFavoriteAudioDevices(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let favIn = String.view(&self.favInputName)
+    if String.byteLength(favIn) > 0 {
+      let ins = self.inputDevices.asSlice()
+      let mut i: usize = 0
+      while i < ins.length {
+        if String.view(&ins[i].name) == favIn {
+          if self.selectedInputId != ins[i].id {
+            drop audio_native.setInputDevice(ins[i].id)
+            self.selectedInputId = ins[i].id
+          }
+          break
+        }
+        i = i + 1
+      }
+    }
+    let favOut = String.view(&self.favOutputName)
+    if String.byteLength(favOut) > 0 {
+      let outs = self.outputDevices.asSlice()
+      let mut i: usize = 0
+      while i < outs.length {
+        if String.view(&outs[i].name) == favOut {
+          if self.selectedOutputId != outs[i].id {
+            drop audio_native.setOutputDevice(outs[i].id)
+            self.selectedOutputId = outs[i].id
+          }
+          break
+        }
+        i = i + 1
+      }
+    }
+    run self.syncDeviceNames()
+  }
+
+  effect fn restoreSessionPrefs(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.favInputName = run audio_native.prefGet("fav_input")
+    self.favOutputName = run audio_native.prefGet("fav_output")
+    run self.applyFavoriteAudioDevices()
+
+    let sp = run audio_native.prefGet("split_ref")
+    if String.view(&sp) == "1" { self.splitRefSpec = true }
+    let lm = run audio_native.prefGet("listen_mode")
+    if String.view(&lm) == "1" { self.listenMode = LISTEN_REF }
+    else if String.view(&lm) == "2" { self.listenMode = LISTEN_BOTH }
+    let nr = run audio_native.prefGet("norm_ref")
+    if String.view(&nr) == "1" { self.normToRef = true }
+    let spitch = run audio_native.prefGet("show_pitch")
+    if String.view(&spitch) == "0" { self.showPitch = false }
+    let sfmt = run audio_native.prefGet("show_formants")
+    if String.view(&sfmt) == "0" { self.showFormants = false }
+    let sharm = run audio_native.prefGet("show_harmonics")
+    if String.view(&sharm) == "1" { self.showHarmonics = true }
+    let smet = run audio_native.prefGet("show_metrics")
+    if String.view(&smet) == "0" { self.showMetricsLane = false }
+    let sgrid = run audio_native.prefGet("show_grid")
+    if String.view(&sgrid) == "0" { self.showNoteGrid = false }
+    let slib = run audio_native.prefGet("show_lib")
+    if String.view(&slib) == "0" { self.showLibrary = false }
+    let sread = run audio_native.prefGet("show_readouts")
+    if String.view(&sread) == "0" { self.showReadouts = false }
+    let pal = run audio_native.prefGet("palette")
+    if String.byteLength(String.view(&pal)) > 0 {
+      let pv = String.view(&pal)
+      if pv == "0" { self.palette = Palette.Muted }
+      else if pv == "1" { self.palette = Palette.VoceVista }
+      else if pv == "2" { self.palette = Palette.Inferno }
+      else if pv == "3" { self.palette = Palette.Magma }
+      else if pv == "4" { self.palette = Palette.Viridis }
+      else if pv == "5" { self.palette = Palette.Ocean }
+      else if pv == "6" { self.palette = Palette.Grayscale }
+      else if pv == "7" { self.palette = Palette.InvertGray }
+      self.gpuNeedPalette = true
+    }
+
+    // Restore expanded folders & ref groups
+    let expSaved = run audio_native.prefGet("expanded_dirs")
+    let expBytes = String.utf8Bytes(String.view(&expSaved))
+    if expBytes.length > 0 {
+      self.expandedDirs.clear()
+      let mut start: usize = 0
+      let mut k: usize = 0
+      while k <= expBytes.length {
+        if k == expBytes.length || expBytes[k] == 10 {
+          if k > start {
+            let seg = run String.copy(String.slice(String.view(&expSaved), start, k - start))
+            run self.expandedDirs.append(move seg)
+          }
+          start = k + 1
+        }
+        k = k + 1
+      }
+    }
+
+    run self.reloadTree(false)
+
+    // Read BOTH savedRef and savedClip BEFORE loading either, since loadLibraryClip saves prefs!
+    let savedRef = run audio_native.prefGet("last_ref")
+    let savedClip = run audio_native.prefGet("last_clip")
+
+    // Restore last active Reference first (so match scores & split view hydrate cleanly!)
+    if String.byteLength(String.view(&savedRef)) > 0 {
+      let refIdx = self.findLibIdxByFullPath(String.view(&savedRef))
+      if refIdx < self.libTree.length() {
+        run self.loadLibraryClip(refIdx, true)
+      }
+    }
+
+    // Restore last open clip (falling back to first library clip)
+    let mut opened = false
+    if String.byteLength(String.view(&savedClip)) > 0 {
+      let clipIdx = self.findLibIdxByFullPath(String.view(&savedClip))
+      if clipIdx < self.libTree.length() {
+        run self.loadLibraryClip(clipIdx, false)
+        opened = true
+      }
+    }
+    if !opened {
+      let mut firstClipIdx: usize = 0
+      let mut hasFirstClip = false
+      let treeNodes = self.libTree.asSlice()
+      let mut ti: usize = 0
+      while ti < treeNodes.length {
+        if !treeNodes[ti].isDir {
+          firstClipIdx = ti
+          hasFirstClip = true
+          break
+        }
+        ti = ti + 1
+      }
+      if hasFirstClip {
+        run self.loadLibraryClip(firstClipIdx, false)
+      } else {
+        run self.analyzeAll()
+        run self.rebuildDrawings(true)
+      }
+    }
+  }
+
+  fn findLibIdxByFullPath(self: &Self, fullPath: string) -> usize {
+    let nodes = self.libTree.asSlice()
+    let mut i: usize = 0
+    while i < nodes.length {
+      if !nodes[i].isDir && String.view(&nodes[i].fullPath) == fullPath {
+        return i
+      }
+      i = i + 1
+    }
+    return nodes.length
+  }
+
+  pub fn isClipMultiSelected(self: &Self, fullPath: string) -> bool {
+    let sl = self.selectedClipPaths.asSlice()
+    let mut i: usize = 0
+    while i < sl.length {
+      if String.view(&sl[i]) == fullPath {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  effect fn toggleMultiSelectPath(self: &mut Self, fullPath: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut kept = List<String>.make()
+    let mut found = false
+    let sl = self.selectedClipPaths.asSlice()
+    let mut i: usize = 0
+    while i < sl.length {
+      if String.view(&sl[i]) == fullPath {
+        found = true
+      } else {
+        run kept.append(run String.copy(String.view(&sl[i])))
+      }
+      i = i + 1
+    }
+    if !found {
+      run kept.append(run String.copy(fullPath))
+    }
+    self.selectedClipPaths = move kept
+  }
+
+  effect fn selectLibRange(self: &mut Self, fromIdx: usize, toIdx: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let nodes = self.libTree.asSlice()
+    if nodes.length == 0 {
+      return ()
+    }
+    let lo = if fromIdx < toIdx { fromIdx } else { toIdx }
+    let hi = if fromIdx > toIdx { fromIdx } else { toIdx }
+    self.selectedClipPaths.clear()
+    let mut i = lo
+    while i <= hi && i < nodes.length {
+      if !nodes[i].isDir {
+        run self.selectedClipPaths.append(run String.copy(String.view(&nodes[i].fullPath)))
+      }
+      i = i + 1
+    }
+  }
+
+  effect fn deleteSelectedLibClips(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.selectedClipPaths.length() == 0 {
+      return ()
+    }
+    let mut deletedCount: i32 = 0
+    let mut toDelParents = List<String>.make()
+    let mut toDelNames = List<String>.make()
+    let mut toDelFulls = List<String>.make()
+    let nodes = self.libTree.asSlice()
+    let mut i: usize = 0
+    while i < nodes.length {
+      if !nodes[i].isDir && self.isClipMultiSelected(String.view(&nodes[i].fullPath)) {
+        run toDelParents.append(run String.copy(String.view(&nodes[i].parentRel)))
+        run toDelNames.append(run String.copy(String.view(&nodes[i].name)))
+        run toDelFulls.append(run String.copy(String.view(&nodes[i].fullPath)))
+      }
+      i = i + 1
+    }
+    let parents = toDelParents.asSlice()
+    let names = toDelNames.asSlice()
+    let fulls = toDelFulls.asSlice()
+    i = 0
+    while i < names.length {
+      if audio_native.libDeleteEntry(String.view(&parents[i]), String.view(&names[i]), false) {
+        deletedCount = deletedCount + 1
+        if String.view(&self.activeClipPath) == String.view(&fulls[i]) {
+          self.activeClipPath.clear()
+          self.activeClipFilename.clear()
+          self.activeClipDir.clear()
+          self.activeClipInLib = false
+        }
+        if self.refClip.active && String.view(&self.refClip.fullPath) == String.view(&fulls[i]) {
+          self.refClip.clear()
+          self.gpuNeedRefReload = true
+        }
+      }
+      i = i + 1
+    }
+    self.selectedClipPaths.clear()
+    self.lastSelectedLibIdx = -1
+    run self.reloadTree(false)
+    run self.saveSessionPrefs()
+    let mut msg = String.make()
+    run msg.append("Deleted ")
+    run appendInt(&mut msg, deletedCount)
+    run msg.append(if deletedCount == 1 { " take" } else { " takes" })
+    self.statusMsg = move msg
+  }
+
+  effect fn trimSilence(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.recording || self.practiceMode != PRACTICE_OFF || self.samples.length() < 128 || self.sampleRate <= 0.0 {
+      return ()
+    }
+    let sr = self.sampleRate
+    let src = self.samples.asSlice()
+    let frameLen = f64.toUsize(f64.max(64.0, sr * 0.010))
+    let mut peakSq: f64 = 0.0
+    let mut pos: usize = 0
+    while pos + frameLen <= src.length {
+      let mut sq: f64 = 0.0
+      let mut j: usize = 0
+      while j < frameLen {
+        let v = f32.toF64(src[pos + j])
+        sq = sq + v * v
+        j = j + 1
+      }
+      let msq = sq / usize.toF64(frameLen)
+      if msq > peakSq { peakSq = msq }
+      pos = pos + frameLen
+    }
+    if peakSq <= 1e-10 {
+      self.statusMsg = run String.copy("Audio is completely silent — nothing to trim.")
+      return ()
+    }
+    let peakDb = 4.342944819032518 * f64.log(peakSq)
+    // Adaptive threshold: 34 dB below speech peak, clamped to [-50, -32] dB so soft plosives stay safe!
+    let threshDb = f64.max(-50.0, f64.min(-32.0, peakDb - 34.0))
+    let threshSq = f64.pow(10.0, threshDb / 10.0)
+
+    let mut firstIdx: usize = src.length
+    let mut lastIdx: usize = 0
+    pos = 0
+    while pos + frameLen <= src.length {
+      let mut sq: f64 = 0.0
+      let mut j: usize = 0
+      while j < frameLen {
+        let v = f32.toF64(src[pos + j])
+        sq = sq + v * v
+        j = j + 1
+      }
+      if (sq / usize.toF64(frameLen)) >= threshSq {
+        if firstIdx == src.length {
+          firstIdx = pos
+        }
+        lastIdx = pos + frameLen
+      }
+      pos = pos + frameLen
+    }
+    if firstIdx >= lastIdx {
+      self.statusMsg = run String.copy("No silence found to trim.")
+      return ()
+    }
+    let leadPad = f64.toUsize(sr * 0.045)
+    let tailPad = f64.toUsize(sr * 0.060)
+    let startIdx = if firstIdx > leadPad { firstIdx - leadPad } else { 0 }
+    let endRaw = lastIdx + tailPad
+    let endIdx = if endRaw < src.length { endRaw } else { src.length }
+    let trimmedN = startIdx + (src.length - endIdx)
+    if trimmedN < f64.toUsize(sr * 0.03) || endIdx <= startIdx + 128 {
+      self.statusMsg = run String.copy("Already tight — less than 30 ms of edge silence.")
+      return ()
+    }
+    run self.saveUndoSnapshot()
+    let srcAfter = self.samples.asSlice()
+    let mut next = List<f32>.make()
+    let mut i = startIdx
+    while i < endIdx && i < srcAfter.length {
+      run next.append(srcAfter[i])
+      i = i + 1
+    }
+    // Smooth 6 ms edge fade so trimmed ends never click
+    let fadeN = f64.toUsize(f64.max(16.0, f64.min(320.0, sr * 0.006)))
+    let out = next.asMutSlice()
+    if out.length > fadeN * 2 {
+      let mut k: usize = 0
+      while k < fadeN {
+        let g = usize.toF32(k) / usize.toF32(fadeN)
+        out[k] = out[k] * g
+        out[out.length - 1 - k] = out[out.length - 1 - k] * g
+        k = k + 1
+      }
+    }
+    let cutSec = usize.toF64(trimmedN) / sr
+    self.samples = move next
+    let mut msg = String.make()
+    run msg.append("Trimmed ")
+    let cs = run formatSecShort(cutSec)
+    run msg.append(String.view(&cs))
+    run msg.append(" silence (⌘Z to undo)")
+    run self.finishAudioEdit(0.0, true, String.view(&msg))
+  }
+
+  effect fn bakeNormToRef(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.recording || self.practiceMode != PRACTICE_OFF || !self.refClip.active || self.samples.length() < 64 {
+      return ()
+    }
+    run self.recomputeNormGain()
+    let db = f32.toF64(self.normRefGainDb)
+    if f64.abs(db) < 0.25 {
+      self.statusMsg = run String.copy("Level already matches Reference within 0.2 dB.")
+      return ()
+    }
+    run self.saveUndoSnapshot()
+    let gain = f64.toF32(f64.pow(10.0, db / 20.0))
+    let mut next = List<f32>.make()
+    let src = self.samples.asSlice()
+    let mut i: usize = 0
+    while i < src.length {
+      let x = src[i] * gain
+      // Smooth soft-limiter above 0.88 so peaks never hard-clip
+      let ax = f32.abs(x)
+      let y = if ax <= 0.88 {
+        x
+      } else {
+        let sign: f32 = if x < 0.0 { -1.0 } else { 1.0 }
+        let over = (ax - 0.88) / 0.12
+        sign * (0.88 + 0.11 * (over / (1.0 + over)))
+      }
+      run next.append(y)
+      i = i + 1
+    }
+    self.samples = move next
+    let mut msg = String.make()
+    run msg.append("Normalized level to Ref (")
+    if db >= 0.0 { run msg.append("+") }
+    run appendFixed(&mut msg, db, 1)
+    run msg.append(" dB · ⌘Z to undo)")
+    let keepCur = self.cursorSec
+    run self.finishAudioEdit(keepCur, false, String.view(&msg))
   }
 
   effect fn syncDeviceNames(self: &mut Self) -> ()
@@ -1720,7 +2275,11 @@ impl Overtone {
     let mut need: usize = 0
     let mut i: usize = 0
     while i < nodes.length {
-      if !nodes[i].isDir && String.view(&nodes[i].fullPath) != refPath {
+      // Only score takes attached to this Reference (never recompute unrelated audios!)
+      if !nodes[i].isDir
+        && String.view(&nodes[i].fullPath) != refPath
+        && String.view(&nodes[i].parentRef) == refPath
+      {
         if force || nodes[i].scoreVer < SCORE_VERSION {
           need = need + 1
         }
@@ -1762,7 +2321,10 @@ impl Overtone {
     while self.bgScoreCursor < nodes.length {
       let i = self.bgScoreCursor
       self.bgScoreCursor = self.bgScoreCursor + 1
-      if !nodes[i].isDir && String.view(&nodes[i].fullPath) != refPathView {
+      if !nodes[i].isDir
+        && String.view(&nodes[i].fullPath) != refPathView
+        && String.view(&nodes[i].parentRef) == refPathView
+      {
         if self.bgScoreForce || nodes[i].scoreVer < SCORE_VERSION {
           targetIdx = i
           break
@@ -2133,8 +2695,25 @@ impl Overtone {
       self.readoutSelPitchSub.clear()
     }
     self.errorMsg.clear()
-    self.statusMsg = run String.copy(msg)
     run self.analyzeAll()
+    // Auto-persist audio edits immediately if this clip is in the library so edits are never lost!
+    if self.activeClipInLib && self.samples.length() >= 64 {
+      run self.saveCurrentClipToFolder(false)
+    }
+    // Keep active Reference synced if user intentionally edited the Reference clip itself!
+    if self.isEditingActiveRef() && self.samples.length() >= 64 {
+      self.refClip.samples = run copyF32List(self.samples.asSlice())
+      self.refClip.sampleRate = self.sampleRate
+      self.refClip.durationSec = self.clipDuration()
+      run self.reanalyzeRefClip()
+      self.gpuNeedRefReload = true
+    }
+    run self.recomputeNormGain()
+    let mut savedMsg = run String.copy(msg)
+    if self.activeClipInLib {
+      run savedMsg.append(" · Auto-saved")
+    }
+    self.statusMsg = move savedMsg
     self.gpuNeedFullReload = true
     self.gpuNeedSharp = true
     self.sharpDueTime = 0.0
@@ -3134,11 +3713,18 @@ impl Overtone {
       hasLtas: vm.hasLtas,
     }
     self.showRefOverlay = true
+    self.gpuNeedRefReload = true
+    let refExpCopy = run String.copy(String.view(&self.refClip.fullPath))
+    if String.byteLength(String.view(&refExpCopy)) > 0 {
+      run self.ensureDirExpanded(String.view(&refExpCopy))
+    }
+    run self.recomputeNormGain()
     run self.recomputeCompare()
     run self.reloadTree(false)
     run self.startBgScoring(false)
     self.requestNeuralForRef()
     run self.refreshVowelAnalysis(true)
+    run self.saveSessionPrefs()
   }
 
   effect fn pinCurrentAsReference(self: &mut Self) -> ()
@@ -3170,10 +3756,17 @@ impl Overtone {
       hasLtas: self.voiceMetrics.hasLtas,
     }
     self.showRefOverlay = true
+    self.gpuNeedRefReload = true
+    let refExpCopy = run String.copy(String.view(&self.refClip.fullPath))
+    if String.byteLength(String.view(&refExpCopy)) > 0 {
+      run self.ensureDirExpanded(String.view(&refExpCopy))
+    }
+    run self.recomputeNormGain()
     run self.recomputeCompare()
     run self.reloadTree(false)
     run self.startBgScoring(false)
-    self.statusMsg = run String.copy("Set current clip as Reference · Open or record another clip to compare")
+    run self.saveSessionPrefs()
+    self.statusMsg = run String.copy("Set current clip as Reference · Press R to record a new take attached to it")
     run self.rebuildDrawings(false)
   }
 
@@ -3196,10 +3789,27 @@ impl Overtone {
       && self.activeClipInLib
       && String.byteLength(String.view(&self.activeClipFilename)) > 0
 
+    let attachToRef = !updateInPlace
+      && self.refClip.active
+      && String.byteLength(String.view(&self.refClip.fullPath)) > 0
+
+    let mut refDir = String.make()
+    if attachToRef {
+      let rIdx = self.findLibIdxByFullPath(String.view(&self.refClip.fullPath))
+      if rIdx < self.libTree.length() {
+        refDir = run String.copy(String.view(&self.libTree.asSlice()[rIdx].parentRel))
+      }
+    }
+
     let saveDir = if updateInPlace {
       run String.copy(String.view(&self.activeClipDir))
-    } else {
+    } else if attachToRef && String.byteLength(String.view(&refDir)) > 0 {
+      move refDir
+    } else if String.byteLength(String.view(&self.selectedFolderRel)) > 0 {
       run String.copy(String.view(&self.selectedFolderRel))
+    } else {
+      // Loose recording with no reference -> default to "General" folder!
+      run String.copy("General")
     }
     let desired = if updateInPlace {
       run String.copy(String.view(&self.activeClipFilename))
@@ -3209,6 +3819,10 @@ impl Overtone {
       && String.view(&self.clipName) != "Untitled Recording"
     {
       run String.copy(String.view(&self.clipName))
+    } else if attachToRef && String.byteLength(String.view(&self.refClip.name)) > 0 {
+      let mut tn = run String.copy(String.view(&self.refClip.name))
+      run tn.append(" take")
+      move tn
     } else {
       run String.copy("recording")
     }
@@ -3230,6 +3844,15 @@ impl Overtone {
       self.activeClipDir = move saveDir
       self.activeClipInLib = true
       self.isDemoClip = false
+      if attachToRef {
+        drop audio_native.libSetParentRef(
+          String.view(&self.activeClipDir),
+          String.view(&self.activeClipFilename),
+          String.view(&self.refClip.fullPath),
+        )
+        let refExp = run String.copy(String.view(&self.refClip.fullPath))
+        run self.ensureDirExpanded(String.view(&refExp))
+      }
       if sc >= 0 && self.refClip.active {
         drop audio_native.libUpdateMeta(
           String.view(&self.activeClipDir),
@@ -3243,6 +3866,7 @@ impl Overtone {
       }
       run self.ensureDirExpanded(String.view(&dirCopy))
       run self.reloadTree(false)
+      run self.saveSessionPrefs()
       let mut msg = String.make()
       run msg.append("Saved ")
       run msg.append(String.view(&self.clipName))
@@ -3321,6 +3945,19 @@ impl Overtone {
     let fname = run String.copy(String.view(&nodes[idx].name))
     let dispName = run String.copy(String.view(&nodes[idx].displayName))
     let parentDir = run String.copy(String.view(&nodes[idx].parentRel))
+    let parentRef = run String.copy(String.view(&nodes[idx].parentRef))
+    let childCount = nodes[idx].childCount
+
+    // If clicking a take attached to a Reference, automatically activate that Reference!
+    if !setAsRef && String.byteLength(String.view(&parentRef)) > 0 {
+      let alreadyActiveRef = self.refClip.active && String.view(&self.refClip.fullPath) == String.view(&parentRef)
+      if !alreadyActiveRef {
+        let pIdx = self.findLibIdxByFullPath(String.view(&parentRef))
+        if pIdx < self.libTree.length() {
+          run self.loadLibraryClip(pIdx, true)
+        }
+      }
+    }
 
     match move run audio_native.loadAudioFile(String.view(&path)) {
       Option<audio_native.LoadedAudio>.Some { value } => {
@@ -3341,6 +3978,13 @@ impl Overtone {
           self.statusMsg = move msg
           run self.rebuildDrawings(true)
         } else {
+          // If clicking a clip that already has takes nested under it, also activate it as Ref!
+          if childCount > 0 && (!self.refClip.active || String.view(&self.refClip.fullPath) != String.view(&path)) {
+            let refSamples = run copyF32List(value.samples.asSlice())
+            let refName = run String.copy(String.view(&dispName))
+            let refPath = run String.copy(String.view(&path))
+            run self.analyzeAndPinBufferAsRef(move refName, move refSamples, value.sampleRate, move refPath)
+          }
           self.activeClipPath = move path
           self.activeClipFilename = move fname
           self.activeClipDir = run String.copy(String.view(&parentDir))
@@ -3348,7 +3992,9 @@ impl Overtone {
           self.activeClipInLib = true
           self.plotOnRef = false
           run self.loadSamples(move dispName, move value.samples, value.sampleRate)
+          run self.recomputeNormGain()
           run self.refreshActiveLibMeta()
+          run self.saveSessionPrefs()
         }
       }
       Option<audio_native.LoadedAudio>.None => {
@@ -3493,13 +4139,16 @@ impl Overtone {
     self.gpuNeedRedraw = true
   }
 
-  /// VoceVista-style recording effect triggered by the `silk.machine` transport statechart:
-  /// appends to the end of the current document (inserting a short silence gap if audio already
-  /// exists), or starts clean if the document is empty / untouched Demo.
+  /// Recording effect triggered by the `silk.machine` transport statechart:
+  /// SAFE REFERENCE PROTECTION: if the currently open clip IS the active Reference (and user
+  /// didn't explicitly choose "Record onto ref"), ALWAYS starts a brand-new take attached to
+  /// that Reference instead of overwriting/appending to the Reference!
   effect fn doStartRecording(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    let appending = !self.isDemoClip && self.samples.length() > 0 && self.sampleRate > 0.0
+    let protectRef = self.isEditingActiveRef() && !self.recordOntoRefOnce
+    self.recordOntoRefOnce = false
+    let appending = !protectRef && !self.isDemoClip && self.samples.length() > 0 && self.sampleRate > 0.0
     let wantRate = if appending { self.sampleRate } else { 0.0 }
     if !audio_native.micStartAt(wantRate) {
       self.errorMsg = run audio_native.micError()
@@ -3893,21 +4542,60 @@ impl Overtone {
     }
     let sr = self.gpuSampleRate()
     let onRef = self.isPlottingOnRef()
-    let started = if self.isolateMode != ISOLATE_FULL || self.voiceLabMode != LAB_OFF {
-      audio_native.playFiltered(
-        onRef,
-        self.gpuSamples(),
-        sr,
+    let wantMix = self.refClip.active && self.listenMode == LISTEN_BOTH && !self.isEditingActiveRef()
+    let wantRef = self.refClip.active && self.listenMode == LISTEN_REF
+    let started = if wantMix {
+      let maxDur = f64.max(self.clipDuration(), self.refClip.durationSec)
+      let mixEnd = if self.hasSelection { endSec } else { maxDur }
+      audio_native.playMix(
+        self.samples.asSlice(),
+        self.sampleRate,
+        self.refClip.samples.asSlice(),
+        self.refClip.sampleRate,
         startSec,
-        endSec,
+        mixEnd,
         self.loopSelection,
-        self.isolateMode,
-        self.isolateTiming,
-        self.voiceLabMode,
-        self.monoTargetHz(),
+        self.activeTakeGainDb(),
+        0.0,
       )
+    } else if wantRef {
+      audio_native.playSetGainDb(0.0)
+      let refEnd = f64.min(self.refClip.durationSec, if self.hasSelection { endSec } else { self.refClip.durationSec })
+      let refStart = f64.min(startSec, f64.max(0.0, refEnd - 0.02))
+      if self.isolateMode != ISOLATE_FULL || self.voiceLabMode != LAB_OFF {
+        audio_native.playFiltered(
+          true,
+          self.refClip.samples.asSlice(),
+          self.refClip.sampleRate,
+          refStart,
+          refEnd,
+          self.loopSelection,
+          self.isolateMode,
+          self.isolateTiming,
+          self.voiceLabMode,
+          self.monoTargetHz(),
+        )
+      } else {
+        audio_native.playRange(self.refClip.samples.asSlice(), self.refClip.sampleRate, refStart, refEnd, self.loopSelection)
+      }
     } else {
-      audio_native.playRange(self.gpuSamples(), sr, startSec, endSec, self.loopSelection)
+      audio_native.playSetGainDb(self.activeTakeGainDb())
+      if self.isolateMode != ISOLATE_FULL || self.voiceLabMode != LAB_OFF {
+        audio_native.playFiltered(
+          onRef,
+          self.gpuSamples(),
+          sr,
+          startSec,
+          endSec,
+          self.loopSelection,
+          self.isolateMode,
+          self.isolateTiming,
+          self.voiceLabMode,
+          self.monoTargetHz(),
+        )
+      } else {
+        audio_native.playRange(self.gpuSamples(), sr, startSec, endSec, self.loopSelection)
+      }
     }
     if started {
       self.cursorSec = startSec
@@ -4152,7 +4840,7 @@ impl Overtone {
 
     if self.hoverValid && self.specRect.width() > 2.0 && self.specRect.height() > 2.0 {
       let tNorm = f32.toF64(self.hoverX / self.specRect.width())
-      let fNorm = 1.0 - f32.toF64(self.hoverY / self.specRect.height())
+      let fNorm = self.yToFreqNorm(self.hoverY, self.specRect.height())
       let ht = self.vp.normToTimeAt(tNorm)
       let hf = self.vp.normToFreqAt(fNorm)
       let mut hs = String.make()
@@ -4214,7 +4902,7 @@ impl Overtone {
     ? &mut Allocator {
     if self.hoverValid && self.specRect.width() > 2.0 && self.specRect.height() > 2.0 {
       let tNorm = f32.toF64(self.hoverX / self.specRect.width())
-      let fNorm = 1.0 - f32.toF64(self.hoverY / self.specRect.height())
+      let fNorm = self.yToFreqNorm(self.hoverY, self.specRect.height())
       let ht = self.vp.normToTimeAt(tNorm)
       let hf = self.vp.normToFreqAt(fNorm)
       let mut hs = String.make()
@@ -4362,16 +5050,18 @@ impl Overtone {
     ? &mut Allocator {
     run self.updateHoverOnly()
     let onRef = self.isPlottingOnRef()
+    let split = self.isSplitRefSpec()
     let sw = self.specRect.width()
     let sh = self.specRect.height()
+    let paneH = if split { sh * 0.497 } else { sh }
     let opts = OverlayOptions {
       showPitch: self.showPitch,
       showHarmonics: self.showHarmonics,
       showFormants: self.showFormants,
       formantMask: self.formantMask,
       showNoteGrid: self.showNoteGrid,
-      showRefOverlay: self.showRefOverlay,
-      showRefWave: self.showRefWave && self.refClip.active,
+      showRefOverlay: self.showRefOverlay && !split,
+      showRefWave: self.showRefWave && self.refClip.active && !split,
       showHeatmap: self.showHeatmap && self.refClip.active,
       heatmapMetric: self.heatmapMetric,
       useDtwAlign: self.useDtwAlign,
@@ -4394,7 +5084,7 @@ impl Overtone {
     self.overlayDrawing = run buildSpectrogramOverlay(
       &self.vp,
       sw,
-      sh,
+      paneH,
       if onRef { self.refClip.pitchFrames.asSlice() } else { self.pitchTrack.frames.asSlice() },
       if onRef { self.refClip.formantFrames.asSlice() } else { self.formantTrack.frames.asSlice() },
       if onRef { self.compare.takeOnRef.asSlice() } else { self.compare.points.asSlice() },
@@ -4404,6 +5094,49 @@ impl Overtone {
       activeVowels,
       opts,
     )
+    if split {
+      let refOpts = OverlayOptions {
+        showPitch: self.showPitch,
+        showHarmonics: self.showHarmonics,
+        showFormants: self.showFormants,
+        formantMask: self.formantMask,
+        showNoteGrid: self.showNoteGrid,
+        showRefOverlay: false,
+        showRefWave: false,
+        showHeatmap: false,
+        heatmapMetric: self.heatmapMetric,
+        useDtwAlign: self.useDtwAlign,
+        plotOnRef: false,
+        showVowelRegions: self.showVowelRegions,
+        isolateMode: self.isolateMode,
+        displayClarity: self.displayClarity,
+        cursorSec: self.cursorSec,
+        hasSelection: self.hasSelection,
+        selStart: self.selStart,
+        selEnd: self.selEnd,
+        hasRefSel: false,
+        refSelStart: 0.0,
+        refSelEnd: 0.0,
+        hoverValid: false,
+        hoverX: 0.0,
+        hoverY: 0.0,
+      }
+      self.refOverlayDrawing = run buildSpectrogramOverlay(
+        &self.vp,
+        sw,
+        paneH,
+        self.refClip.pitchFrames.asSlice(),
+        self.refClip.formantFrames.asSlice(),
+        &[],
+        &[],
+        self.refClip.sampleRate,
+        self.guides.asSlice(),
+        self.refVowelSpans.asSlice(),
+        refOpts,
+      )
+      self.refPianoDrawing = run buildPianoDrawing(&self.vp, PIANO_W, paneH, 0, false)
+      self.refFreqTicks = run computeFreqTicks(&self.vp, paneH)
+    }
     self.vowelBadges = run computeVowelBadges(activeVowels, &self.vp, sw)
     self.metricsLaneDrawing = run buildMetricsLaneDrawing(
       &self.vp,
@@ -4425,10 +5158,10 @@ impl Overtone {
       onRef,
       self.displayClarity,
     )
-    self.pianoDrawing = run buildPianoDrawing(&self.vp, PIANO_W, sh, self.lastPianoMidi, self.lastPianoActive)
-    self.freqTicks = run computeFreqTicks(&self.vp, sh)
+    self.pianoDrawing = run buildPianoDrawing(&self.vp, PIANO_W, paneH, self.lastPianoMidi, self.lastPianoActive)
+    self.freqTicks = run computeFreqTicks(&self.vp, paneH)
     self.timeTicks = run computeTimeTicks(&self.vp, sw)
-    self.guideLabels = run computeGuideBadges(self.guides.asSlice(), &self.vp, sh)
+    self.guideLabels = run computeGuideBadges(self.guides.asSlice(), &self.vp, paneH)
   }
 
   pub effect fn rebuildDrawings(self: &mut Self, recomputeSlice: bool) -> ()
@@ -4454,16 +5187,18 @@ impl Overtone {
     }
 
     let onRef = self.isPlottingOnRef()
+    let split = self.isSplitRefSpec()
     let sw = self.specRect.width()
     let sh = self.specRect.height()
+    let paneH = if split { sh * 0.497 } else { sh }
     let opts = OverlayOptions {
       showPitch: self.showPitch,
       showHarmonics: self.showHarmonics,
       showFormants: self.showFormants,
       formantMask: self.formantMask,
       showNoteGrid: self.showNoteGrid,
-      showRefOverlay: self.showRefOverlay,
-      showRefWave: self.showRefWave && self.refClip.active,
+      showRefOverlay: self.showRefOverlay && !split,
+      showRefWave: self.showRefWave && self.refClip.active && !split,
       showHeatmap: self.showHeatmap && self.refClip.active,
       heatmapMetric: self.heatmapMetric,
       useDtwAlign: self.useDtwAlign,
@@ -4487,7 +5222,7 @@ impl Overtone {
     self.overlayDrawing = run buildSpectrogramOverlay(
       &self.vp,
       sw,
-      sh,
+      paneH,
       if onRef { self.refClip.pitchFrames.asSlice() } else { self.pitchTrack.frames.asSlice() },
       if onRef { self.refClip.formantFrames.asSlice() } else { self.formantTrack.frames.asSlice() },
       if onRef { self.compare.takeOnRef.asSlice() } else { self.compare.points.asSlice() },
@@ -4497,6 +5232,49 @@ impl Overtone {
       activeVowels,
       opts,
     )
+    if split {
+      let refOpts = OverlayOptions {
+        showPitch: self.showPitch,
+        showHarmonics: self.showHarmonics,
+        showFormants: self.showFormants,
+        formantMask: self.formantMask,
+        showNoteGrid: self.showNoteGrid,
+        showRefOverlay: false,
+        showRefWave: false,
+        showHeatmap: false,
+        heatmapMetric: self.heatmapMetric,
+        useDtwAlign: self.useDtwAlign,
+        plotOnRef: false,
+        showVowelRegions: self.showVowelRegions,
+        isolateMode: self.isolateMode,
+        displayClarity: self.displayClarity,
+        cursorSec: self.cursorSec,
+        hasSelection: self.hasSelection,
+        selStart: self.selStart,
+        selEnd: self.selEnd,
+        hasRefSel: false,
+        refSelStart: 0.0,
+        refSelEnd: 0.0,
+        hoverValid: false,
+        hoverX: 0.0,
+        hoverY: 0.0,
+      }
+      self.refOverlayDrawing = run buildSpectrogramOverlay(
+        &self.vp,
+        sw,
+        paneH,
+        self.refClip.pitchFrames.asSlice(),
+        self.refClip.formantFrames.asSlice(),
+        &[],
+        &[],
+        self.refClip.sampleRate,
+        self.guides.asSlice(),
+        self.refVowelSpans.asSlice(),
+        refOpts,
+      )
+      self.refPianoDrawing = run buildPianoDrawing(&self.vp, PIANO_W, paneH, 0, false)
+      self.refFreqTicks = run computeFreqTicks(&self.vp, paneH)
+    }
     self.vowelBadges = run computeVowelBadges(activeVowels, &self.vp, sw)
     self.metricsLaneDrawing = run buildMetricsLaneDrawing(
       &self.vp,
@@ -4519,7 +5297,7 @@ impl Overtone {
       self.displayClarity,
     )
     let rightPlotW = f32.max(180.0, self.readoutsWidth - 32.0)
-    self.pianoDrawing = run buildPianoDrawing(&self.vp, PIANO_W, sh, activeMidi, hasActivePitch)
+    self.pianoDrawing = run buildPianoDrawing(&self.vp, PIANO_W, paneH, activeMidi, hasActivePitch)
     self.sizeWeightDrawing = run buildSizeWeightPadDrawing(
       rightPlotW,
       PAD_H,
@@ -4585,9 +5363,9 @@ impl Overtone {
       self.selStart,
       self.selEnd,
     )
-    self.freqTicks = run computeFreqTicks(&self.vp, sh)
+    self.freqTicks = run computeFreqTicks(&self.vp, paneH)
     self.timeTicks = run computeTimeTicks(&self.vp, sw)
-    self.guideLabels = run computeGuideBadges(self.guides.asSlice(), &self.vp, sh)
+    self.guideLabels = run computeGuideBadges(self.guides.asSlice(), &self.vp, paneH)
   }
 
   effect fn applySliderAt(self: &mut Self, id: u32, x: f32) -> ()
@@ -4971,6 +5749,9 @@ impl Overtone {
         let wasOnRef = self.plotOnRef
         self.plotOnRef = false
         self.refClip.clear()
+        self.gpuNeedRefReload = true
+        self.listenMode = LISTEN_YOU
+        run self.recomputeNormGain()
         run self.recomputeCompare()
         run self.reloadTree(false)
         if wasOnRef {
@@ -4981,6 +5762,8 @@ impl Overtone {
           self.gpuNeedSharp = true
           self.sharpDueTime = 0.0
         }
+        self.gpuNeedRedraw = true
+        run self.saveSessionPrefs()
         self.statusMsg = run String.copy("Cleared pinned Reference.")
         run self.rebuildDrawings(false)
       }
@@ -5071,6 +5854,7 @@ impl Overtone {
           self.selectedFolderRel = run String.copy(String.view(&rel))
           run self.toggleDirExpanded(String.view(&rel))
           run self.reloadTree(true)
+          run self.saveSessionPrefs()
           if self.refClip.active {
             run self.startBgScoring(false)
           }
@@ -5590,7 +6374,7 @@ impl Overtone {
         rs[idx] = rect
       }
 
-      Message.ExplorerRowDown { idx, x, y, button } => {
+      Message.ExplorerRowDown { idx, x, y, button, modifiers } => {
         let nodes = self.libTree.asSlice()
         if idx >= nodes.length {
           return ()
@@ -5602,6 +6386,22 @@ impl Overtone {
         }
         self.ctxMenuKind = CTX_NONE
         if button == 0 {
+          let cmd = (modifiers & (MOD_META | MOD_CONTROL)) != 0
+          let shift = (modifiers & MOD_SHIFT) != 0
+          if !nodes[idx].isDir && cmd {
+            let fp = run String.copy(String.view(&nodes[idx].fullPath))
+            run self.toggleMultiSelectPath(String.view(&fp))
+            self.lastSelectedLibIdx = usize.toI32(idx)
+            return ()
+          }
+          if !nodes[idx].isDir && shift && self.lastSelectedLibIdx >= 0 {
+            let anchor = i32.toUsize(self.lastSelectedLibIdx)
+            run self.selectLibRange(anchor, idx)
+            return ()
+          }
+          if !nodes[idx].isDir {
+            self.lastSelectedLibIdx = usize.toI32(idx)
+          }
           self.explorerDragPending = true
           self.explorerDragActive = false
           self.explorerDragIdx = idx
@@ -5612,6 +6412,211 @@ impl Overtone {
           self.explorerDragY = y
           self.explorerDropTargetRel.clear()
           self.explorerDropValid = false
+        }
+      }
+
+      Message.ToggleRefGroupExpand { idx } => {
+        let nodes = self.libTree.asSlice()
+        if idx < nodes.length && !nodes[idx].isDir {
+          let fp = run String.copy(String.view(&nodes[idx].fullPath))
+          let fpView = String.view(&fp)
+          let mut found = false
+          let mut kept = List<String>.make()
+          let sl = self.expandedDirs.asSlice()
+          let mut i: usize = 0
+          while i < sl.length {
+            if String.view(&sl[i]) == fpView {
+              found = true
+            } else {
+              run kept.append(run String.copy(String.view(&sl[i])))
+            }
+            i = i + 1
+          }
+          if !found {
+            run kept.append(move fp)
+          }
+          self.expandedDirs = move kept
+          run self.reloadTree(false)
+          run self.saveSessionPrefs()
+        }
+      }
+
+      Message.ToggleSelectLibClip { idx } => {
+        let nodes = self.libTree.asSlice()
+        if idx < nodes.length && !nodes[idx].isDir {
+          let fp = run String.copy(String.view(&nodes[idx].fullPath))
+          run self.toggleMultiSelectPath(String.view(&fp))
+          self.lastSelectedLibIdx = usize.toI32(idx)
+        }
+      }
+
+      Message.SelectAllLibClips => {
+        self.selectedClipPaths.clear()
+        let nodes = self.libTree.asSlice()
+        let mut i: usize = 0
+        while i < nodes.length {
+          if !nodes[i].isDir {
+            run self.selectedClipPaths.append(run String.copy(String.view(&nodes[i].fullPath)))
+          }
+          i = i + 1
+        }
+      }
+
+      Message.ClearLibSelection => {
+        self.selectedClipPaths.clear()
+        self.lastSelectedLibIdx = -1
+      }
+
+      Message.DeleteSelectedLibClips => {
+        self.ctxMenuKind = CTX_NONE
+        run self.deleteSelectedLibClips()
+      }
+
+      Message.CreateEmptyRef => {
+        self.ctxMenuKind = CTX_NONE
+        if isPractice(self.transport.value) {
+          run self.sendTransport(TransportEvent.StopAll)
+        }
+        // Create a fresh folder / empty reference slot ready for loose or new-ref recordings
+        let mut folderName = String.make()
+        run folderName.append("Reference ")
+        let mut n: i32 = 1
+        let nodes = self.libTree.asSlice()
+        let mut ni: usize = 0
+        while ni < nodes.length {
+          if nodes[ni].isDir { n = n + 1 }
+          ni = ni + 1
+        }
+        run appendInt(&mut folderName, n)
+        let created = run audio_native.libCreateFolder("", String.view(&folderName))
+        if String.byteLength(String.view(&created)) > 0 {
+          let cCopy = run String.copy(String.view(&created))
+          self.selectedFolderRel = move created
+          run self.ensureDirExpanded(String.view(&cCopy))
+        }
+        self.refClip.clear()
+        self.gpuNeedRefReload = true
+        self.listenMode = LISTEN_YOU
+        run self.newDocument()
+        run self.reloadTree(true)
+        run self.saveSessionPrefs()
+        self.statusMsg = run String.copy("Created empty Reference slot · Press R to record or drop an audio file")
+      }
+
+      Message.SelectGeneralMode => {
+        self.ctxMenuKind = CTX_NONE
+        self.refClip.clear()
+        self.gpuNeedRefReload = true
+        self.plotOnRef = false
+        self.listenMode = LISTEN_YOU
+        self.selectedFolderRel = run String.copy("General")
+        run self.ensureDirExpanded("General")
+        run self.recomputeNormGain()
+        run self.recomputeCompare()
+        run self.reloadTree(false)
+        run self.saveSessionPrefs()
+        self.gpuNeedRedraw = true
+        run self.rebuildDrawings(false)
+        self.statusMsg = run String.copy("General (No Ref) mode · Loose recordings save into General")
+      }
+
+      Message.RecordOntoRef => {
+        self.ctxMenuKind = CTX_NONE
+        self.recordOntoRefOnce = true
+        run self.sendTransport(TransportEvent.ToggleRecord)
+      }
+
+      Message.ToggleSplitRefSpec => {
+        self.splitRefSpec = !self.splitRefSpec
+        if self.splitRefSpec {
+          self.plotOnRef = false
+        }
+        self.gpuNeedRedraw = true
+        run self.rebuildDrawings(false)
+        run self.saveSessionPrefs()
+      }
+
+      Message.SetListenMode { mode } => {
+        self.listenMode = mode
+        run self.saveSessionPrefs()
+        if isPlayingUser(self.transport.value) {
+          self.cursorSec = audio_native.playPosition()
+          run self.sendTransport(TransportEvent.PlayFromCursor)
+        }
+      }
+
+      Message.ToggleNormToRef => {
+        self.normToRef = !self.normToRef
+        run self.recomputeNormGain()
+        self.gpuNeedRedraw = true
+        run self.saveSessionPrefs()
+        if isPlayingUser(self.transport.value) {
+          self.cursorSec = audio_native.playPosition()
+          run self.sendTransport(TransportEvent.PlayFromCursor)
+        }
+      }
+
+      Message.BakeNormToRef => {
+        self.ctxMenuKind = CTX_NONE
+        run self.bakeNormToRef()
+      }
+
+      Message.TrimSilence => {
+        self.ctxMenuKind = CTX_NONE
+        run self.trimSilence()
+      }
+
+      Message.ToggleFavInput { id } => {
+        let mut devName = String.make()
+        let ins = self.inputDevices.asSlice()
+        let mut i: usize = 0
+        while i < ins.length {
+          if ins[i].id == id || (id == 0 && i == 0) {
+            devName = run String.copy(String.view(&ins[i].name))
+            break
+          }
+          i = i + 1
+        }
+        if String.byteLength(String.view(&devName)) > 0 {
+          if String.view(&self.favInputName) == String.view(&devName) {
+            self.favInputName.clear()
+            self.statusMsg = run String.copy("Cleared favorite microphone.")
+          } else {
+            self.favInputName = move devName
+            run self.applyFavoriteAudioDevices()
+            let mut msg = String.make()
+            run msg.append("Favorite microphone ★ ")
+            run msg.append(String.view(&self.favInputName))
+            self.statusMsg = move msg
+          }
+          run self.saveSessionPrefs()
+        }
+      }
+
+      Message.ToggleFavOutput { id } => {
+        let mut devName = String.make()
+        let outs = self.outputDevices.asSlice()
+        let mut i: usize = 0
+        while i < outs.length {
+          if outs[i].id == id || (id == 0 && i == 0) {
+            devName = run String.copy(String.view(&outs[i].name))
+            break
+          }
+          i = i + 1
+        }
+        if String.byteLength(String.view(&devName)) > 0 {
+          if String.view(&self.favOutputName) == String.view(&devName) {
+            self.favOutputName.clear()
+            self.statusMsg = run String.copy("Cleared favorite output device.")
+          } else {
+            self.favOutputName = move devName
+            run self.applyFavoriteAudioDevices()
+            let mut msg = String.make()
+            run msg.append("Favorite output ★ ")
+            run msg.append(String.view(&self.favOutputName))
+            self.statusMsg = move msg
+          }
+          run self.saveSessionPrefs()
         }
       }
 
@@ -5684,6 +6689,7 @@ impl Overtone {
             if nodes[idx].isDir {
               run self.handleMessage(Message.ToggleLibFolder { idx: idx })
             } else {
+              self.selectedClipPaths.clear()
               run self.loadLibraryClip(idx, false)
             }
           }
@@ -5798,7 +6804,7 @@ impl Overtone {
         self.outputDevices = run audio_native.listOutputDevices()
         self.selectedInputId = audio_native.getInputDevice()
         self.selectedOutputId = audio_native.getOutputDevice()
-        run self.syncDeviceNames()
+        run self.applyFavoriteAudioDevices()
         self.statusMsg = run String.copy("Refreshed audio input & output devices.")
       }
 
@@ -6034,6 +7040,8 @@ impl Overtone {
           } else if k == "Backspace" || k == "Delete" {
             if self.hasSelection {
               run self.removeSelectionRange(false)
+            } else if self.selectedClipPaths.length() > 0 {
+              run self.deleteSelectedLibClips()
             }
           } else if k == "0" {
             run self.handleMessage(Message.ResetView)
@@ -6685,7 +7693,7 @@ impl Overtone {
         let w = f32.max(1.0, self.specRect.width())
         let h = f32.max(1.0, self.specRect.height())
         let t = self.vp.normToTimeAt(f32.toF64(lx / w))
-        let fNorm = 1.0 - f32.toF64(ly / h)
+        let fNorm = self.yToFreqNorm(ly, h)
         let freqHz = self.vp.normToFreqAt(fNorm)
         let dur = self.gpuDuration()
         self.dragStartX = lx
@@ -6759,7 +7767,7 @@ impl Overtone {
 
         if self.drag == DRAG_GUIDE {
           if self.dragGuideIdx < self.guides.length() {
-            let fNorm = f64.max(0.0, f64.min(1.0, 1.0 - f32.toF64(ly / h)))
+            let fNorm = self.yToFreqNorm(ly, h)
             let mut hz = f64.max(20.0, f64.min(22000.0, self.vp.normToFreqAt(fNorm)))
             // Snap to nearest musical note if enabled (Alt reverses snapping, like VoceVista!)
             let altHeld = (modifiers & MOD_ALT) != 0

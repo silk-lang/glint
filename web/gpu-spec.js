@@ -100,23 +100,25 @@ void main() {
   }
 }`;
 
-// Display pass: Samples full-clip GPU dB texture (or live recording tier) + live Floor/Ceil dB + LUT
+// Display pass: Samples full-clip GPU dB texture + optional split Reference dB texture + live Floor/Ceil dB + normGainDb + LUT
 const DISPLAY_FS = `#version 300 es
 precision highp float;
 in vec2 vUv;
 out vec4 outColor;
-// Uniform layout (28 floats):
+// Uniform layout (32 floats):
 //  0: vp.t0, 1: vp.t1, 2: vp.f0, 3: vp.f1
 //  4: full.t0, 5: full.t1, 6: live.t0, 7: live.t1
-//  8..9: unused, 10: full.maxHz, 11: live.maxHz, 12: unused
+//  8: ref.t0, 9: ref.t1, 10: full.maxHz, 11: live.maxHz, 12: ref.maxHz
 //  13: isLog, 14: liveValid, 15: fullValid
 //  16: brightness, 17: contrast, 18: minLogHz
 //  19: fullCols, 20: fullBins, 21: live.uScale, 22: live.uOffset
 //  23: floorDb, 24: ceilingDb, 25: fullIsNorm8
-uniform float u[28];
+//  26: splitMode, 27: takeGainDb, 28: refValid, 29: refCols, 30: refBins, 31: refIsNorm8
+uniform float u[32];
 uniform sampler2D fullDbTex;
 uniform sampler2D liveTex;
 uniform sampler2D lutTex;
+uniform sampler2D refDbTex;
 
 float normToFreq(float norm) {
   if (u[13] > 0.5) {
@@ -143,21 +145,18 @@ vec2 sampleLive(float time, float freq) {
   return vec2(v, inside ? 1.0 : 0.0);
 }
 
-vec2 sampleFullDb(float time, float freq) {
-  float t0 = u[4];
-  float t1 = u[5];
-  float maxHz = u[10];
+vec2 sampleDbTex(sampler2D tex, float t0, float t1, float maxHz, float cols, float bins, float isNorm8, float gainDb, float time, float freq) {
   float span = t1 - t0;
   float x = span > 0.0 ? (time - t0) / span : 0.0;
   float y = freq / max(maxHz, 1.0);
   bool inside = span > 0.0 && time >= t0 && time <= t1 && y >= 0.0 && y <= 1.0;
   if (!inside) return vec2(0.0, 0.0);
-  float cols = max(u[19], 1.0);
-  float bins = max(u[20], 1.0);
-  float uTex = (clamp(x, 0.0, 1.0) * (cols - 1.0) + 0.5) / cols;
-  float vTex = (clamp(y * bins, 0.0, bins - 1.0) + 0.5) / bins;
-  float raw = texture(fullDbTex, vec2(uTex, vTex)).r;
-  float db = u[25] > 0.5 ? (raw * 150.0 - 150.0) : raw;
+  float c = max(cols, 1.0);
+  float b = max(bins, 1.0);
+  float uTex = (clamp(x, 0.0, 1.0) * (c - 1.0) + 0.5) / c;
+  float vTex = (clamp(y * b, 0.0, b - 1.0) + 0.5) / b;
+  float raw = texture(tex, vec2(uTex, vTex)).r;
+  float db = (isNorm8 > 0.5 ? (raw * 150.0 - 150.0) : raw) + gainDb;
   float floorDb = u[23];
   float ceilDb = max(floorDb + 1.0, u[24]);
   float norm = clamp((db - floorDb) / (ceilDb - floorDb), 0.0, 1.0);
@@ -166,6 +165,40 @@ vec2 sampleFullDb(float time, float freq) {
 
 void main() {
   float time = u[0] + vUv.x * (u[1] - u[0]);
+  bool split = u[26] > 0.5 && u[28] > 0.5;
+  if (split) {
+    // Crisp 2px divider between top (Ref) and bottom (You)
+    if (vUv.y >= 0.497 && vUv.y <= 0.503) {
+      outColor = vec4(0.18, 0.19, 0.22, 1.0);
+      return;
+    }
+    if (vUv.y > 0.503) {
+      float localY = (vUv.y - 0.503) / 0.497;
+      float freq = normToFreq(localY);
+      vec2 r = sampleDbTex(refDbTex, u[8], u[9], u[12], u[29], u[30], u[31], 0.0, time, freq);
+      float v = clamp((r.x + u[16]) * u[17], 0.0, 1.0);
+      vec3 rgb = texture(lutTex, vec2(v, 0.5)).rgb;
+      outColor = vec4(rgb * step(0.5, r.y), 1.0);
+      return;
+    }
+    float localY = vUv.y / 0.497;
+    float freq = normToFreq(localY);
+    float val = 0.0;
+    float have = 0.0;
+    if (u[14] > 0.5) {
+      vec2 l = sampleLive(time, freq);
+      if (l.y > 0.5) { val = l.x; have = 1.0; }
+    }
+    if (have < 0.5 && u[15] > 0.5) {
+      vec2 f = sampleDbTex(fullDbTex, u[4], u[5], u[10], u[19], u[20], u[25], u[27], time, freq);
+      if (f.y > 0.5) { val = f.x; have = 1.0; }
+    }
+    float v = clamp((val + u[16]) * u[17], 0.0, 1.0);
+    vec3 rgb = texture(lutTex, vec2(v, 0.5)).rgb;
+    outColor = vec4(rgb * step(0.5, have), 1.0);
+    return;
+  }
+
   float freq = normToFreq(vUv.y);
   float val = 0.0;
   float have = 0.0;
@@ -177,7 +210,7 @@ void main() {
     }
   }
   if (have < 0.5 && u[15] > 0.5) {
-    vec2 f = sampleFullDb(time, freq);
+    vec2 f = sampleDbTex(fullDbTex, u[4], u[5], u[10], u[19], u[20], u[25], u[27], time, freq);
     if (f.y > 0.5) {
       val = f.x;
       have = 1.0;
@@ -262,6 +295,13 @@ export class WebGLSpectrogram {
     this.fullMaxHz = 12000.0;
     this.fullValid = false;
     this.fullIsNorm8 = true;
+    this.refDbTex = null;
+    this.refCols = 1;
+    this.refBins = 1;
+    this.refDur = 0.0;
+    this.refMaxHz = 12000.0;
+    this.refValid = false;
+    this.refIsNorm8 = true;
     this.hasGpuFft = false;
     this.pingTex = [null, null];
     this.pingFbo = [null, null];
@@ -301,6 +341,7 @@ export class WebGLSpectrogram {
     this.fullDbLoc = gl.getUniformLocation(this.displayProg, "fullDbTex");
     this.liveLoc = gl.getUniformLocation(this.displayProg, "liveTex");
     this.lutLoc = gl.getUniformLocation(this.displayProg, "lutTex");
+    this.refDbLoc = gl.getUniformLocation(this.displayProg, "refDbTex");
 
     const makeRgbaTex = (filter) => {
       const t = gl.createTexture();
@@ -315,6 +356,7 @@ export class WebGLSpectrogram {
     this.lutTex = makeRgbaTex(gl.LINEAR);
     this.liveTex = makeRgbaTex(gl.LINEAR);
     this.fullDbTex = makeRgbaTex(gl.LINEAR);
+    this.refDbTex = makeRgbaTex(gl.LINEAR);
 
     // Check GPU float FBO capability for zero-CPU Stockham Radix-2 FFT!
     const extFloat = gl.getExtension("EXT_color_buffer_float");
@@ -417,11 +459,10 @@ export class WebGLSpectrogram {
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, bytes.length / 4, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, bytes);
   }
 
-  // Upload raw PCM ONCE to GPU memory and compute the ENTIRE clip's high-res spectrogram on GPU!
-  uploadPcmAndCompute(samples, sampleRate) {
+  // Internal GPU/fallback full-clip spectrogram builder writing into `dstTex`
+  _computeClipIntoTexture(samples, sampleRate, dstTex) {
     if (!this.gl || !samples || samples.length < 64 || sampleRate <= 0) {
-      this.fullValid = false;
-      return;
+      return null;
     }
     const tStart = performance.now();
     const dur = samples.length / sampleRate;
@@ -434,8 +475,6 @@ export class WebGLSpectrogram {
       const fftBins = this.fftBins;
       const tileCols = this.tileCols;
 
-      // With 8192-pt GPU FFT, keep native sample rate (0..24 kHz full spectrum, 5.86 Hz/bin!).
-      // Only decimate 2x on 4K-capped GPUs (4096-pt @ 24 kHz = same 5.86 Hz/bin).
       let pcm = samples;
       let effRate = sampleRate;
       if (fftN === 4096 && sampleRate > 28000) {
@@ -444,12 +483,10 @@ export class WebGLSpectrogram {
       }
 
       const maxCols = Math.min(4096, maxTex);
-      // Dense full-clip time resolution (~800 cols/sec -> 1.25 ms/col, min 2048, max 4096)
       let totalCols = Math.ceil((dur * 800) / tileCols) * tileCols;
       totalCols = Math.max(2048, Math.min(maxCols, totalCols));
       totalCols = Math.max(tileCols, Math.floor(totalCols / tileCols) * tileCols);
 
-      // 1. Pack entire PCM into 2D R32F GPU texture (width = 2048)
       const pcmLen = Math.min(pcm.length, PCM_TEX_W * maxTex);
       const pcmH = Math.max(1, Math.ceil(pcmLen / PCM_TEX_W));
       const padded = new Float32Array(PCM_TEX_W * pcmH);
@@ -458,22 +495,21 @@ export class WebGLSpectrogram {
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, PCM_TEX_W, pcmH, 0, gl.RED, gl.FLOAT, padded);
 
-      // 2. Allocate single full-clip output dB texture (totalCols x fftBins)
-      gl.bindTexture(gl.TEXTURE_2D, this.fullDbTex);
+      gl.bindTexture(gl.TEXTURE_2D, dstTex);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      let isNorm8 = false;
       if (this.useR16F) {
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, totalCols, fftBins, 0, gl.RED, gl.HALF_FLOAT, null);
-        this.fullIsNorm8 = false;
       } else {
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, totalCols, fftBins, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-        this.fullIsNorm8 = true;
+        isNorm8 = true;
       }
 
       gl.bindFramebuffer(gl.FRAMEBUFFER, this.outFbo);
-      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.fullDbTex, 0);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, dstTex, 0);
 
       gl.bindVertexArray(this.vao);
       gl.disable(gl.BLEND);
@@ -483,9 +519,7 @@ export class WebGLSpectrogram {
       const scale = 2.0 / (fftN * COHERENT_GAIN);
       const durSamples = Math.max(1, pcmLen - 1);
 
-      // 3. Process clip in GPU tiles -> Stockham FFT passes -> write directly into fullDbTex!
       for (let tileStart = 0; tileStart < totalCols; tileStart += tileCols) {
-        // Pass 0: Blackman-Nuttall window load from PCM texture -> pingTex[0]
         gl.bindFramebuffer(gl.FRAMEBUFFER, this.pingFbo[0]);
         gl.viewport(0, 0, tileCols, fftN);
         gl.useProgram(this.winProg);
@@ -500,7 +534,6 @@ export class WebGLSpectrogram {
         gl.uniform1f(this.winLocs.uDurSamples, durSamples);
         gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-        // Passes 1..fftStages: Stockham Radix-2 FFT butterflies
         gl.useProgram(this.fftProg);
         let srcIdx = 0;
         for (let s = 0; s < fftStages; s++) {
@@ -516,7 +549,6 @@ export class WebGLSpectrogram {
           srcIdx = dstIdx;
         }
 
-        // Final pass: Magnitude -> dBFS directly into slice [tileStart .. tileStart + tileCols] of fullDbTex!
         gl.bindFramebuffer(gl.FRAMEBUFFER, this.outFbo);
         gl.viewport(tileStart, 0, tileCols, fftBins);
         gl.enable(gl.SCISSOR_TEST);
@@ -527,19 +559,20 @@ export class WebGLSpectrogram {
         gl.uniform1i(this.magLocs.uFft, 0);
         gl.uniform1i(this.magLocs.uTileStartCol, tileStart);
         gl.uniform1f(this.magLocs.uScale, scale);
-        gl.uniform1i(this.magLocs.uEncodeNorm, this.fullIsNorm8 ? 1 : 0);
+        gl.uniform1i(this.magLocs.uEncodeNorm, isNorm8 ? 1 : 0);
         gl.drawArrays(gl.TRIANGLES, 0, 3);
         gl.disable(gl.SCISSOR_TEST);
       }
 
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      this.fullCols = totalCols;
-      this.fullBins = fftBins;
-      this.fullDur = dur;
-      this.fullMaxHz = effRate * 0.5;
-      this.fullValid = true;
-      this.lastGpuBuildMs = performance.now() - tStart;
-      return;
+      return {
+        cols: totalCols,
+        bins: fftBins,
+        dur,
+        maxHz: effRate * 0.5,
+        isNorm8,
+        buildMs: performance.now() - tStart,
+      };
     }
 
     // Fallback for GPUs without EXT_color_buffer_float: compute full clip once on CPU into RGBA8
@@ -600,16 +633,52 @@ export class WebGLSpectrogram {
         rgba[off + 3] = 255;
       }
     }
-    gl.bindTexture(gl.TEXTURE_2D, this.fullDbTex);
+    gl.bindTexture(gl.TEXTURE_2D, dstTex);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, totalCols, FALLBACK_FFT_BINS, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
-    this.fullIsNorm8 = true;
-    this.fullCols = totalCols;
-    this.fullBins = FALLBACK_FFT_BINS;
-    this.fullDur = dur;
-    this.fullMaxHz = effRate * 0.5;
+    return {
+      cols: totalCols,
+      bins: FALLBACK_FFT_BINS,
+      dur,
+      maxHz: effRate * 0.5,
+      isNorm8: true,
+      buildMs: performance.now() - tStart,
+    };
+  }
+
+  // Upload raw PCM ONCE to GPU memory and compute the ENTIRE clip's high-res spectrogram on GPU!
+  uploadPcmAndCompute(samples, sampleRate) {
+    const info = this._computeClipIntoTexture(samples, sampleRate, this.fullDbTex);
+    if (!info) {
+      this.fullValid = false;
+      return;
+    }
+    this.fullCols = info.cols;
+    this.fullBins = info.bins;
+    this.fullDur = info.dur;
+    this.fullMaxHz = info.maxHz;
+    this.fullIsNorm8 = info.isNorm8;
     this.fullValid = true;
-    this.lastGpuBuildMs = performance.now() - tStart;
+    this.lastGpuBuildMs = info.buildMs;
+  }
+
+  // Upload Reference clip PCM ONCE to GPU memory for instant Vertical Split Spectrogram!
+  uploadRefPcmAndCompute(samples, sampleRate) {
+    const info = this._computeClipIntoTexture(samples, sampleRate, this.refDbTex);
+    if (!info) {
+      this.refValid = false;
+      return;
+    }
+    this.refCols = info.cols;
+    this.refBins = info.bins;
+    this.refDur = info.dur;
+    this.refMaxHz = info.maxHz;
+    this.refIsNorm8 = info.isNorm8;
+    this.refValid = true;
+  }
+
+  clearRef() {
+    this.refValid = false;
   }
 
   // Live microphone rolling tier (used ONLY while actively recording)
@@ -641,16 +710,23 @@ export class WebGLSpectrogram {
   }
 
   draw(uniforms) {
-    // Augment uniform array with GPU-resident full-clip metadata!
-    const u = new Float32Array(28);
-    u.set(uniforms.subarray(0, Math.min(28, uniforms.length)));
+    // Augment uniform array with GPU-resident full-clip + Reference split metadata!
+    const u = new Float32Array(32);
+    u.set(uniforms.subarray(0, Math.min(32, uniforms.length)));
     u[4] = 0.0;
     u[5] = this.fullDur;
+    u[8] = 0.0;
+    u[9] = this.refDur;
     u[10] = this.fullMaxHz;
+    u[12] = this.refMaxHz;
     u[15] = this.fullValid ? 1.0 : 0.0;
     u[19] = this.fullCols;
     u[20] = this.fullBins;
     u[25] = this.fullIsNorm8 ? 1.0 : 0.0;
+    u[28] = this.refValid ? 1.0 : 0.0;
+    u[29] = this.refCols;
+    u[30] = this.refBins;
+    u[31] = this.refIsNorm8 ? 1.0 : 0.0;
     this.lastUniforms = u;
     if (!this.gl) return;
     this.attachToHost();
@@ -663,6 +739,7 @@ export class WebGLSpectrogram {
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.fullDbTex); gl.uniform1i(this.fullDbLoc, 0);
     gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.liveTex); gl.uniform1i(this.liveLoc, 1);
     gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, this.lutTex); gl.uniform1i(this.lutLoc, 2);
+    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, this.refDbTex); gl.uniform1i(this.refDbLoc, 3);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 }

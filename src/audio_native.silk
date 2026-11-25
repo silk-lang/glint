@@ -12,6 +12,7 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.pointer { Pointer }
 import silk.num.f64
 import silk.num.i32
+import silk.num.u8
 import silk.num.u32
 import silk.num.usize
 import silk.text.string { InvalidUtf8, String }
@@ -53,6 +54,30 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
     endSec: f64,
     loop: i32,
   ) -> i32 as "glint#ov_play_range"
+  unsafe extern "C" fn ov_play_set_gain_db(gainDb: f32) -> () as "glint#ov_play_set_gain_db"
+  unsafe extern "C" fn ov_play_mix(
+    aSamples: ?[*]const f32,
+    aCount: i32,
+    aRate: f64,
+    bSamples: ?[*]const f32,
+    bCount: i32,
+    bRate: f64,
+    startSec: f64,
+    endSec: f64,
+    loop: i32,
+    aGainDb: f32,
+    bGainDb: f32,
+  ) -> i32 as "glint#ov_play_mix"
+  unsafe extern "C" fn ov_pref_get(key: ?[*]const u8, keyLen: usize, out: ?[*]mut u8, cap: i32) -> i32 as "glint#ov_pref_get"
+  unsafe extern "C" fn ov_pref_set(key: ?[*]const u8, keyLen: usize, val: ?[*]const u8, valLen: usize) -> i32 as "glint#ov_pref_set"
+  unsafe extern "C" fn ov_lib_set_parent_ref(
+    relDir: ?[*]const u8,
+    relDirLen: usize,
+    fileName: ?[*]const u8,
+    fnLen: usize,
+    parentRef: ?[*]const u8,
+    parentRefLen: usize,
+  ) -> i32 as "glint#ov_lib_set_parent_ref"
   unsafe extern "C" fn ov_play_stop() -> () as "glint#ov_play_stop"
   unsafe extern "C" fn ov_play_is_playing() -> i32 as "glint#ov_play_is_playing"
   unsafe extern "C" fn ov_play_take_finished() -> i32 as "glint#ov_play_take_finished"
@@ -922,6 +947,10 @@ pub struct LibTreeNode {
   pub fullPath: String,
   pub modified: String,
   pub comment: String,
+  /// Full path of the parent Reference clip this take is attached to (`""` if top-level / loose)
+  pub parentRef: String,
+  /// Number of attached takes nested directly beneath this Reference clip
+  pub childCount: u32,
 }
 
 pub struct LibTreeListing {
@@ -1037,6 +1066,21 @@ pub effect fn libScanTree(expandedLines: string, notesDir: string, activeRefPath
     let comment = if l5 > 0 { run copyUtf8Lossy(Slice.view<u8>(&buf, 0, i32.toUsize(l5))) } else { String.make() }
     let l6 = unsafe ov_lib_tree_str(i, 6, Pointer.fromMutSlice(&mut buf), 1024)
     let displayName = if l6 > 0 { run copyUtf8Lossy(Slice.view<u8>(&buf, 0, i32.toUsize(l6))) } else { run String.copy(String.view(&name)) }
+    let l7 = unsafe ov_lib_tree_str(i, 7, Pointer.fromMutSlice(&mut buf), 1024)
+    let parentRef = if l7 > 0 { run copyUtf8Lossy(Slice.view<u8>(&buf, 0, i32.toUsize(l7))) } else { String.make() }
+    let l8 = unsafe ov_lib_tree_str(i, 8, Pointer.fromMutSlice(&mut buf), 1024)
+    let mut childCount: u32 = 0
+    if l8 > 0 {
+      let mut ci: usize = 0
+      let cLen = i32.toUsize(l8)
+      while ci < cLen {
+        let ch = buf[ci]
+        if ch >= 48 && ch <= 57 {
+          childCount = childCount * 10 + u8.toU32(ch - 48)
+        }
+        ci = ci + 1
+      }
+    }
 
     let sc = if sortMode == SORT_PITCH {
       piArr[0]
@@ -1072,6 +1116,8 @@ pub effect fn libScanTree(expandedLines: string, notesDir: string, activeRefPath
       fullPath: move fullPath,
       modified: move modified,
       comment: move comment,
+      parentRef: move parentRef,
+      childCount: childCount,
     })
     i = i + 1
   }
@@ -1301,6 +1347,101 @@ pub fn libSetNotes(relDir: string, notes: string) -> bool {
     Pointer.fromSlice(String.utf8Bytes(notes)),
     String.byteLength(notes),
   ) != 0
+}
+
+pub fn libSetParentRef(relDir: string, filename: string, parentRef: string) -> bool {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    return unsafe ov_lib_set_parent_ref(
+      Pointer.fromSlice(String.utf8Bytes(relDir)),
+      String.byteLength(relDir),
+      Pointer.fromSlice(String.utf8Bytes(filename)),
+      String.byteLength(filename),
+      Pointer.fromSlice(String.utf8Bytes(parentRef)),
+      String.byteLength(parentRef),
+    ) != 0
+  } else {
+    drop relDir
+    drop filename
+    drop parentRef
+    return false
+  }
+}
+
+pub fn playSetGainDb(gainDb: f32) -> () {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    unsafe ov_play_set_gain_db(gainDb)
+  } else {
+    drop gainDb
+  }
+}
+
+pub fn playMix(
+  aSamples: &[f32],
+  aRate: f64,
+  bSamples: &[f32],
+  bRate: f64,
+  startSec: f64,
+  endSec: f64,
+  loop: bool,
+  aGainDb: f32,
+  bGainDb: f32,
+) -> bool {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    return unsafe ov_play_mix(
+      Pointer.fromSlice(aSamples),
+      usize.toI32(aSamples.length),
+      aRate,
+      Pointer.fromSlice(bSamples),
+      usize.toI32(bSamples.length),
+      bRate,
+      startSec,
+      endSec,
+      if loop { 1 } else { 0 },
+      aGainDb,
+      bGainDb,
+    ) != 0
+  } else {
+    drop bSamples
+    drop bRate
+    drop aGainDb
+    drop bGainDb
+    return playRange(aSamples, aRate, startSec, endSec, loop)
+  }
+}
+
+pub effect fn prefGet(key: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    let mut buf: [u8; 4096] = [0; 4096]
+    let len = unsafe ov_pref_get(
+      Pointer.fromSlice(String.utf8Bytes(key)),
+      String.byteLength(key),
+      Pointer.fromMutSlice(&mut buf),
+      4096,
+    )
+    if len <= 0 {
+      return String.make()
+    }
+    return run copyUtf8Lossy(Slice.view<u8>(&buf, 0, i32.toUsize(len)))
+  } else {
+    drop key
+    return String.make()
+  }
+}
+
+pub fn prefSet(key: string, val: string) -> () {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    drop unsafe ov_pref_set(
+      Pointer.fromSlice(String.utf8Bytes(key)),
+      String.byteLength(key),
+      Pointer.fromSlice(String.utf8Bytes(val)),
+      String.byteLength(val),
+    )
+  } else {
+    drop key
+    drop val
+  }
 }
 
 pub fn refreshAudioDevices() -> () {

@@ -567,6 +567,12 @@ pub fn renderContextMenu(m: &Overtone, h: &Document<Message>) -> Node {
         menuItem(h, false, "Cut", "⌘X", false, false, Message.CutSelection),
         menuItem(h, false, "Paste here", "⌘V", false, false, Message.PasteAtTime { sec: m.ctxMenuTimeSec }),
         menuItem(h, false, "Delete", "⌫", false, false, Message.DeleteSelection),
+        menuItem(h, false, "Trim silence", "", false, false, Message.TrimSilence),
+        if m.refClip.active && !m.isEditingActiveRef() {
+          menuItem(h, false, "Normalize loudness to Ref", "", false, false, Message.BakeNormToRef)
+        } else {
+          h.empty()
+        },
         menuItem(h, false, "Undo edit", "⌘Z", false, false, Message.UndoEdit),
         if m.hasSelection {
           menuItem(h, false, "Save selection as take", "", false, false, Message.SaveSelectionAsClip)
@@ -596,21 +602,35 @@ pub fn renderContextMenu(m: &Overtone, h: &Document<Message>) -> Node {
         h.style(&[css.left(px(menuX))]),
       ],
       &[
-        menuHeader(h, "Microphone"),
+        menuHeader(h, "Microphone · ★ = default on startup"),
         if ins.length > 0 {
           h.each<AudioDeviceInfo>(
             ins,
-            |d| menuItem(h, d.id == selIn, String.view(&d.name), "", false, false, Message.SelectInputDevice { id: d.id }),
+            |d| audioDeviceMenuRow(
+              h,
+              d.id == selIn,
+              String.view(&d.name),
+              String.view(&m.favInputName) == String.view(&d.name),
+              Message.SelectInputDevice { id: d.id },
+              Message.ToggleFavInput { id: d.id },
+            ),
           )
         } else {
           menuItem(h, true, "Default Microphone", "", false, false, Message.CloseContextMenu)
         },
         menuSep(h),
-        menuHeader(h, "Output"),
+        menuHeader(h, "Output · ★ = default on startup"),
         if outs.length > 0 {
           h.each<AudioDeviceInfo>(
             outs,
-            |d| menuItem(h, d.id == selOut, String.view(&d.name), "", false, false, Message.SelectOutputDevice { id: d.id }),
+            |d| audioDeviceMenuRow(
+              h,
+              d.id == selOut,
+              String.view(&d.name),
+              String.view(&m.favOutputName) == String.view(&d.name),
+              Message.SelectOutputDevice { id: d.id },
+              Message.ToggleFavOutput { id: d.id },
+            ),
           )
         } else {
           menuItem(h, true, "Default Output", "", false, false, Message.CloseContextMenu)
@@ -687,6 +707,11 @@ pub fn renderContextMenu(m: &Overtone, h: &Document<Message>) -> Node {
         menuHeader(h, String.view(&m.ctxExplorerDisplayName)),
         menuItem(h, false, "Open", "", false, false, Message.OpenLibClip { idx: idx }),
         menuItem(h, m.ctxExplorerIsRef, "Set as reference", "P", false, false, Message.SetLibClipAsRef { idx: idx }),
+        if m.ctxExplorerIsRef {
+          menuItem(h, false, "Record onto this ref", "", false, false, Message.RecordOntoRef)
+        } else {
+          h.empty()
+        },
         menuItem(h, false, "Rename", "F2", false, false, Message.StartRenameEntry { idx: idx }),
         menuItem(h, m.ctxExplorerStarred, if m.ctxExplorerStarred { "Unstar" } else { "Star" }, "", false, false, Message.ToggleStarLibClip { idx: idx }),
         if inSub {
@@ -701,7 +726,9 @@ pub fn renderContextMenu(m: &Overtone, h: &Document<Message>) -> Node {
           menuItem(h, false, "Reveal in Finder", "", false, false, Message.RevealEntryInFinder { idx: idx })
         },
         menuItem(h, false, "Share…", "", false, false, Message.ShareLibClip { idx: idx }),
-        if isWebBuild() {
+        if m.selectedClipPaths.length() > 1 {
+          menuItem(h, false, "Delete selected takes", "⌫", true, false, Message.DeleteSelectedLibClips)
+        } else if isWebBuild() {
           menuItem(h, false, "Delete", "", true, false, Message.DeleteLibEntry { idx: idx })
         } else {
           menuItem(h, false, "Move to Trash", "", true, false, Message.DeleteLibEntry { idx: idx })
@@ -753,6 +780,8 @@ pub fn renderContextMenu(m: &Overtone, h: &Document<Message>) -> Node {
       &[
         menuHeader(h, "Prism library"),
         menuItem(h, false, "New folder…", "", false, false, Message.OpenNewFolderAtRoot),
+        menuItem(h, false, "New empty reference", "", false, false, Message.CreateEmptyRef),
+        menuItem(h, false, "General (no reference)", "", false, false, Message.SelectGeneralMode),
         menuItem(h, isRootSelected, "Save new takes here", "", false, false, Message.SelectRootFolder),
         menuSep(h),
         menuHeader(h, "Sort"),
@@ -1059,21 +1088,56 @@ fn settingsNavBtn(h: &Document<Message>, label: string, active: bool, tab: u32) 
   )
 }
 
+fn audioDeviceMenuRow(
+  h: &Document<Message>,
+  checked: bool,
+  label: string,
+  isFav: bool,
+  onPick: Message,
+  onToggleFav: Message,
+) -> Node {
+  return h.row(
+    &[h.class("items-center justify-between gap-[4px] px-[8px] py-[4px] rounded-[4px] glint-btn-hover")],
+    &[
+      h.row(
+        &[
+          h.class("flex-1 min-w-0 items-center gap-[6px]"),
+          h.cursor(Cursor.Pointer),
+          h.onClick(move onPick),
+        ],
+        &[
+          txt(h, if checked { "✓" } else { "" }, "w-[11px] shrink-0 text-[11px] font-semibold text-[#0B0B0C]"),
+          txt(h, label, "flex-1 text-[12px] leading-[16px] text-[#0B0B0C] truncate"),
+        ],
+      ),
+      h.box(
+        &[
+          h.class("px-[4px] py-[1px] rounded-[3px] shrink-0"),
+          h.cursor(Cursor.Pointer),
+          h.onClick(move onToggleFav),
+        ],
+        &[txt(h, if isFav { "★" } else { "☆" }, if isFav { "text-[12px] text-[#D97706]" } else { "text-[12px] text-[#B4B4BC] hover:text-[#0B0B0C]" })],
+      ),
+    ],
+  )
+}
+
 fn renderSettingsAudio(m: &Overtone, h: &Document<Message>) -> Node {
   let silNorm = f64.toF32((m.silenceHoldSec - 0.35) / 1.65)
   let vadNorm = (m.vadThresholdDb + 60.0) / 40.0
   let gap = m.recSilenceGapSec
+  let isMicFav = String.byteLength(String.view(&m.favInputName)) > 0 && String.view(&m.favInputName) == String.view(&m.readoutActiveMic)
   return h.column(
     &[h.class("w-full")],
     &[
       settingsSection(h, "Input"),
       h.row(
-        &[h.class("items-center gap-[16px] py-[9px] border-b border-[#F0F0F2]")],
+        &[h.class("items-center gap-[12px] py-[9px] border-b border-[#F0F0F2]")],
         &[
           txt(h, "Microphone", "w-[180px] shrink-0 text-[13px] leading-[16px] text-[#0B0B0C]"),
           h.row(
             &[
-              h.class("w-[240px] items-center justify-between px-[8px] py-[4px] border border-[#DCDCDF] rounded-[5px] bg-white glint-btn-hover"),
+              h.class("w-[220px] items-center justify-between px-[8px] py-[4px] border border-[#DCDCDF] rounded-[5px] bg-white glint-btn-hover"),
               h.cursor(Cursor.Pointer),
               h.onClick(Message.OpenContextMenu { kind: CTX_AUDIO, x: 520.0, y: 240.0 }),
             ],
@@ -1081,6 +1145,15 @@ fn renderSettingsAudio(m: &Overtone, h: &Document<Message>) -> Node {
               txt(h, String.view(&m.readoutActiveMic), "text-[12px] leading-[16px] text-[#0B0B0C] truncate"),
               txt(h, "▾", "text-[11px] text-[#8A8A90]"),
             ],
+          ),
+          h.box(
+            &[
+              h.class("px-[7px] py-[4px] rounded-[5px] border shrink-0"),
+              h.classSelect(isMicFav, "bg-[#FEF3C7] border-[#F59E0B] text-[#92400E]", "bg-white border-[#DCDCDF] text-[#6B6B70] glint-btn-hover"),
+              h.cursor(Cursor.Pointer),
+              h.onClick(Message.ToggleFavInput { id: m.selectedInputId }),
+            ],
+            &[txt(h, if isMicFav { "★ Default" } else { "☆ Favorite" }, "text-[11px] leading-[14px] font-medium")],
           ),
           txtA(
             h,
@@ -1133,17 +1206,18 @@ fn renderSettingsPlayback(m: &Overtone, h: &Document<Message>) -> Node {
   let sp = m.playSpeed
   let spNorm = (sp - 0.25) / 1.75
   let volNorm = m.volume
+  let isOutFav = String.byteLength(String.view(&m.favOutputName)) > 0 && String.view(&m.favOutputName) == String.view(&m.readoutActiveOut)
   return h.column(
     &[h.class("w-full")],
     &[
       settingsSection(h, "Output"),
       h.row(
-        &[h.class("items-center gap-[16px] py-[9px] border-b border-[#F0F0F2]")],
+        &[h.class("items-center gap-[12px] py-[9px] border-b border-[#F0F0F2]")],
         &[
           txt(h, "Device", "w-[180px] shrink-0 text-[13px] leading-[16px] text-[#0B0B0C]"),
           h.row(
             &[
-              h.class("w-[240px] items-center justify-between px-[8px] py-[4px] border border-[#DCDCDF] rounded-[5px] bg-white glint-btn-hover"),
+              h.class("w-[220px] items-center justify-between px-[8px] py-[4px] border border-[#DCDCDF] rounded-[5px] bg-white glint-btn-hover"),
               h.cursor(Cursor.Pointer),
               h.onClick(Message.OpenContextMenu { kind: CTX_AUDIO, x: 520.0, y: 240.0 }),
             ],
@@ -1151,6 +1225,15 @@ fn renderSettingsPlayback(m: &Overtone, h: &Document<Message>) -> Node {
               txt(h, String.view(&m.readoutActiveOut), "text-[12px] leading-[16px] text-[#0B0B0C] truncate"),
               txt(h, "▾", "text-[11px] text-[#8A8A90]"),
             ],
+          ),
+          h.box(
+            &[
+              h.class("px-[7px] py-[4px] rounded-[5px] border shrink-0"),
+              h.classSelect(isOutFav, "bg-[#FEF3C7] border-[#F59E0B] text-[#92400E]", "bg-white border-[#DCDCDF] text-[#6B6B70] glint-btn-hover"),
+              h.cursor(Cursor.Pointer),
+              h.onClick(Message.ToggleFavOutput { id: m.selectedOutputId }),
+            ],
+            &[txt(h, if isOutFav { "★ Default" } else { "☆ Favorite" }, "text-[11px] leading-[14px] font-medium")],
           ),
           txtA(
             h,

@@ -163,6 +163,7 @@ async function hydrateLibrary() {
         c.samples = new Float32Array(c.samples);
       }
       c.scoresByRef = c.scoresByRef || {};
+      c.parentRef = typeof c.parentRef === "string" ? c.parentRef : "";
       lib.clips.set(c.fullPath, c);
     }
   }
@@ -175,6 +176,12 @@ async function hydrateLibrary() {
     }
   }
   await seedDefaultDemosIfNeeded(demosVersion);
+  // Ensure default "General" folder exists for loose recordings without a reference
+  if (!lib.folders.has("General")) {
+    const gen = { relPath: "General", createdAt: nowStamp(), notes: "Loose recordings without a specific reference." };
+    lib.folders.set("General", gen);
+    idbPut("folders", gen);
+  }
 }
 
 function cleanRel(raw) {
@@ -225,25 +232,87 @@ function sortKeyForMode(clip, activeRefPath, sortMode) {
 }
 
 function scanLibraryTree(expandedLines, notesDir, activeRefPath, sortMode) {
-  const expandedSet = new Set(
-    (expandedLines || "")
-      .split("\n")
-      .map((s) => cleanRel(s))
-      .filter(Boolean),
-  );
+  const rawExpanded = (expandedLines || "").split("\n").map((s) => s.trim()).filter(Boolean);
+  const expandedSet = new Set(rawExpanded.map((s) => (s.startsWith("idb://") ? s : cleanRel(s))));
   const nd = cleanRel(notesDir);
   lib.lastNotes = nd ? (lib.folders.get(nd)?.notes || "") : lib.rootNotes;
 
+  // Group attached takes under their parent Reference clip!
+  const childrenByRef = new Map();
+  const attachedSet = new Set();
+  for (const c of lib.clips.values()) {
+    if (c.parentRef && c.parentRef !== c.fullPath && lib.clips.has(c.parentRef)) {
+      if (!childrenByRef.has(c.parentRef)) childrenByRef.set(c.parentRef, []);
+      childrenByRef.get(c.parentRef).push(c);
+      attachedSet.add(c.fullPath);
+    }
+  }
+
   const rows = [];
+  function sortClipList(arr, refForScore) {
+    if (sortMode === 0) {
+      arr.sort((a, b) => a.name.localeCompare(b.name));
+    } else {
+      arr.sort((a, b) => {
+        const sb = sortKeyForMode(b, refForScore, sortMode);
+        const sa = sortKeyForMode(a, refForScore, sortMode);
+        if (sb !== sa) return sb - sa;
+        return a.name.localeCompare(b.name);
+      });
+    }
+  }
+
+  function pushClipRow(c, depth, refForScore, childList) {
+    const sc = scoreObjForRef(c, refForScore);
+    const hasKids = childList && childList.length > 0;
+    const isExp = hasKids && expandedSet.has(c.fullPath);
+    rows.push({
+      isDir: 0,
+      depth,
+      expanded: isExp ? 1 : 0,
+      rating: c.rating || 0,
+      starred: c.starred ? 1 : 0,
+      score: sortKeyForMode(c, refForScore, sortMode),
+      overall: sc.overall,
+      pitch: sc.pitch,
+      size: sc.size,
+      weight: sc.weight,
+      vowel: sc.vowel,
+      ver: sc.ver,
+      name: c.name,
+      relPath: joinRel(cleanRel(c.relDir), c.name),
+      parentRel: cleanRel(c.relDir),
+      fullPath: c.fullPath,
+      modified: c.modified || "",
+      comment: c.comment || "",
+      displayName: c.displayName || stripExt(c.name),
+      parentRef: c.parentRef || "",
+      childCount: hasKids ? childList.length : 0,
+    });
+    if (isExp) {
+      const sortedKids = [...childList];
+      sortClipList(sortedKids, c.fullPath);
+      for (const kid of sortedKids) {
+        pushClipRow(kid, depth + 1, c.fullPath, null);
+      }
+    }
+  }
+
   function walk(parentRel, depth) {
-    // Direct child folders
+    // Direct child folders (keep "General" after regular folders at root)
     const childDirs = [];
     for (const f of lib.folders.values()) {
       const parts = f.relPath.split("/");
       const p = parts.length > 1 ? parts.slice(0, -1).join("/") : "";
       if (p === parentRel) childDirs.push(f);
     }
-    childDirs.sort((a, b) => a.relPath.localeCompare(b.relPath));
+    childDirs.sort((a, b) => {
+      if (parentRel === "") {
+        if (a.relPath === "General" && b.relPath !== "General") return 1;
+        if (b.relPath === "General" && a.relPath !== "General") return -1;
+      }
+      return a.relPath.localeCompare(b.relPath);
+    });
 
     for (const d of childDirs) {
       const name = d.relPath.split("/").pop();
@@ -268,49 +337,23 @@ function scanLibraryTree(expandedLines, notesDir, activeRefPath, sortMode) {
         modified: d.createdAt || "",
         comment: "",
         displayName: name,
+        parentRef: "",
+        childCount: 0,
       });
       if (isExp) walk(d.relPath, depth + 1);
     }
 
-    // Direct child clips
+    // Direct child clips (excluding takes nested under a parent Ref)
     const childClips = [];
     for (const c of lib.clips.values()) {
-      if (cleanRel(c.relDir) === parentRel) childClips.push(c);
+      if (cleanRel(c.relDir) === parentRel && !attachedSet.has(c.fullPath)) {
+        childClips.push(c);
+      }
     }
-    if (sortMode === 0) {
-      childClips.sort((a, b) => a.name.localeCompare(b.name));
-    } else {
-      childClips.sort((a, b) => {
-        const sb = sortKeyForMode(b, activeRefPath, sortMode);
-        const sa = sortKeyForMode(a, activeRefPath, sortMode);
-        if (sb !== sa) return sb - sa;
-        return a.name.localeCompare(b.name);
-      });
-    }
+    sortClipList(childClips, activeRefPath);
 
     for (const c of childClips) {
-      const sc = scoreObjForRef(c, activeRefPath);
-      rows.push({
-        isDir: 0,
-        depth,
-        expanded: 0,
-        rating: c.rating || 0,
-        starred: c.starred ? 1 : 0,
-        score: sortKeyForMode(c, activeRefPath, sortMode),
-        overall: sc.overall,
-        pitch: sc.pitch,
-        size: sc.size,
-        weight: sc.weight,
-        vowel: sc.vowel,
-        ver: sc.ver,
-        name: c.name,
-        relPath: joinRel(parentRel, c.name),
-        parentRel,
-        fullPath: c.fullPath,
-        modified: c.modified || "",
-        comment: c.comment || "",
-        displayName: c.displayName || stripExt(c.name),
-      });
+      pushClipRow(c, depth, activeRefPath, childrenByRef.get(c.fullPath) || null);
     }
   }
   walk("", 0);
@@ -403,7 +446,9 @@ const audioState = {
   playing: false,
   finishedFlag: false,
   playNode: null,
+  playNodeB: null,
   gainNode: null,
+  playGainDb: 0.0,
   playStartCtxTime: 0,
   playStartSec: 0,
   playEndSec: 0,
@@ -422,6 +467,24 @@ const audioState = {
   decodedFiles: new Map(),
   loaded: null,
 };
+
+function readPref(key) {
+  try {
+    return localStorage.getItem("prism_pref_" + key) || "";
+  } catch {
+    return "";
+  }
+}
+
+function writePref(key, val) {
+  try {
+    if (val === "" || val === null || val === undefined) {
+      localStorage.removeItem("prism_pref_" + key);
+    } else {
+      localStorage.setItem("prism_pref_" + key, String(val));
+    }
+  } catch {}
+}
 
 async function enumerateBrowserDevices(promptPermission = false) {
   if (!navigator.mediaDevices?.enumerateDevices) return;
@@ -446,17 +509,37 @@ async function enumerateBrowserDevices(promptPermission = false) {
         outs.push({ id: idxOut++, deviceId: d.deviceId, name: d.label || `Output ${outs.length + 1}` });
       }
     }
+    const favIn = readPref("fav_input");
+    const favOut = readPref("fav_output");
     if (ins.length) {
       audioState.inputs = ins;
-      // Avoid Bluetooth HFP (16 kHz phone-quality) default mic when a clean Built-in Mac mic is present!
       if (!audioState.userPickedInput) {
-        const builtIn = ins.find((d) => /built-?in|macbook|internal|studio/i.test(d.name) && d.deviceId !== "default");
-        if (builtIn) {
-          audioState.selectedInputId = builtIn.id;
+        const favMatch = favIn
+          ? ins.find((d) => d.name === favIn) || ins.find((d) => d.name.toLowerCase().includes(favIn.toLowerCase()))
+          : null;
+        if (favMatch) {
+          audioState.selectedInputId = favMatch.id;
+        } else {
+          // Avoid Bluetooth HFP (16 kHz phone-quality) default mic when a clean Built-in Mac mic is present!
+          const builtIn = ins.find((d) => /built-?in|macbook|internal|studio/i.test(d.name) && d.deviceId !== "default");
+          if (builtIn) {
+            audioState.selectedInputId = builtIn.id;
+          }
         }
       }
     }
-    if (outs.length) audioState.outputs = outs;
+    if (outs.length) {
+      audioState.outputs = outs;
+      const favOutMatch = favOut
+        ? outs.find((d) => d.name === favOut) || outs.find((d) => d.name.toLowerCase().includes(favOut.toLowerCase()))
+        : null;
+      if (favOutMatch) {
+        audioState.selectedOutputId = favOutMatch.id;
+        if (audioCtx?.setSinkId && favOutMatch.deviceId) {
+          audioCtx.setSinkId(favOutMatch.deviceId).catch(() => {});
+        }
+      }
+    }
   } catch {}
 }
 
@@ -632,19 +715,43 @@ function stopPlayback() {
     } catch {}
     audioState.playNode = null;
   }
+  if (audioState.playNodeB) {
+    try {
+      audioState.playNodeB.onended = null;
+      audioState.playNodeB.stop();
+      audioState.playNodeB.disconnect();
+    } catch {}
+    audioState.playNodeB = null;
+  }
   audioState.playing = false;
 }
 
-function startPlayback(samples, sampleRate, startSec, endSec, loop, timeMap = null) {
+function applyGainSoftLimit(samples, gainDb) {
+  if (!gainDb || Math.abs(gainDb) < 0.05) return samples;
+  const g = Math.pow(10, gainDb / 20);
+  const out = new Float32Array(samples.length);
+  for (let i = 0; i < samples.length; i++) {
+    const x = samples[i] * g;
+    out[i] = Math.abs(x) <= 0.85 ? x : Math.sign(x) * (0.85 + 0.14 * Math.tanh((Math.abs(x) - 0.85) / 0.15));
+  }
+  return out;
+}
+
+function startPlayback(samples, sampleRate, startSec, endSec, loop, timeMap = null, gainDb = 0.0) {
   stopPlayback();
   if (!samples || samples.length === 0 || sampleRate <= 0) return 0;
   const ctx = ensureAudioCtx();
-  const dur = samples.length / sampleRate;
+  const chosenOut = audioState.outputs.find((d) => d.id === audioState.selectedOutputId);
+  if (ctx.setSinkId && chosenOut?.deviceId) {
+    ctx.setSinkId(chosenOut.deviceId).catch(() => {});
+  }
+  const scaled = applyGainSoftLimit(samples, gainDb);
+  const dur = scaled.length / sampleRate;
   const s0 = Math.max(0, Math.min(dur, startSec));
   const s1 = Math.max(s0 + 0.01, Math.min(dur, endSec > s0 ? endSec : dur));
 
-  const buf = ctx.createBuffer(1, samples.length, Math.round(sampleRate));
-  buf.copyToChannel(samples, 0);
+  const buf = ctx.createBuffer(1, scaled.length, Math.round(sampleRate));
+  buf.copyToChannel(scaled, 0);
 
   const src = ctx.createBufferSource();
   src.buffer = buf;
@@ -686,6 +793,53 @@ function startPlayback(samples, sampleRate, startSec, endSec, loop, timeMap = nu
     src.start(0, s0, s1 - s0);
   }
   return 1;
+}
+
+// Simultaneous stereo-blended playback of Your Take (A) + Reference (B) in lockstep!
+function startMixedPlayback(samplesA, rateA, samplesB, rateB, startSec, endSec, loop, gainDbA, gainDbB) {
+  stopPlayback();
+  if ((!samplesA || samplesA.length === 0) && (!samplesB || samplesB.length === 0)) return 0;
+  const ctx = ensureAudioCtx();
+  const chosenOut = audioState.outputs.find((d) => d.id === audioState.selectedOutputId);
+  if (ctx.setSinkId && chosenOut?.deviceId) {
+    ctx.setSinkId(chosenOut.deviceId).catch(() => {});
+  }
+  const durA = samplesA && rateA > 0 ? samplesA.length / rateA : 0;
+  const durB = samplesB && rateB > 0 ? samplesB.length / rateB : 0;
+  const maxDur = Math.max(durA, durB);
+  if (maxDur <= 0.01) return 0;
+  const s0 = Math.max(0, Math.min(maxDur, startSec));
+  const s1 = Math.max(s0 + 0.01, Math.min(maxDur, endSec > s0 ? endSec : maxDur));
+  const outSr = Math.round(rateA > 0 ? rateA : rateB);
+  const totalLen = Math.max(64, Math.ceil(maxDur * outSr));
+  const mixed = new Float32Array(totalLen);
+  const scA = samplesA && samplesA.length > 0 ? applyGainSoftLimit(samplesA, gainDbA) : null;
+  const scB = samplesB && samplesB.length > 0 ? applyGainSoftLimit(samplesB, gainDbB) : null;
+  const ratioA = rateA > 0 ? rateA / outSr : 1;
+  const ratioB = rateB > 0 ? rateB / outSr : 1;
+  for (let i = 0; i < totalLen; i++) {
+    let va = 0;
+    if (scA) {
+      const fa = i * ratioA;
+      const ia = Math.floor(fa);
+      if (ia < scA.length) {
+        const frac = fa - ia;
+        va = ia + 1 < scA.length ? scA[ia] * (1 - frac) + scA[ia + 1] * frac : scA[ia];
+      }
+    }
+    let vb = 0;
+    if (scB) {
+      const fb = i * ratioB;
+      const ib = Math.floor(fb);
+      if (ib < scB.length) {
+        const frac = fb - ib;
+        vb = ib + 1 < scB.length ? scB[ib] * (1 - frac) + scB[ib + 1] * frac : scB[ib];
+      }
+    }
+    const x = (va + vb) * 0.65;
+    mixed[i] = Math.abs(x) <= 0.9 ? x : Math.sign(x) * (0.9 + 0.09 * Math.tanh((Math.abs(x) - 0.9) / 0.1));
+  }
+  return startPlayback(mixed, outSr, s0, s1, loop, null, 0.0);
 }
 
 function currentPlayPosition() {
@@ -924,7 +1078,25 @@ const glintImports = {
   // Playback & Scrubbing
   ov_play_range: (ptr, count, sr, startSec, endSec, loop) => {
     const samples = readF32Copy(ptr, count);
-    return startPlayback(samples, sr, startSec, endSec, loop !== 0);
+    return startPlayback(samples, sr, startSec, endSec, loop !== 0, null, audioState.playGainDb);
+  },
+  ov_play_set_gain_db: (db) => {
+    audioState.playGainDb = Number.isFinite(db) ? Math.max(-24, Math.min(36, db)) : 0.0;
+  },
+  ov_play_mix: (aPtr, aCount, aSr, bPtr, bCount, bSr, startSec, endSec, loop, aGainDb, bGainDb) => {
+    const samplesA = aCount > 0 ? readF32Copy(aPtr, aCount) : null;
+    const samplesB = bCount > 0 ? readF32Copy(bPtr, bCount) : null;
+    return startMixedPlayback(samplesA, aSr, samplesB, bSr, startSec, endSec, loop !== 0, aGainDb, bGainDb);
+  },
+  ov_pref_get: (keyPtr, keyLen, outPtr, cap) => {
+    const k = readStr(keyPtr, keyLen);
+    return writeStr(readPref(k), outPtr, cap);
+  },
+  ov_pref_set: (keyPtr, keyLen, valPtr, valLen) => {
+    const k = readStr(keyPtr, keyLen);
+    const v = readStr(valPtr, valLen);
+    writePref(k, v);
+    return 1;
   },
   ov_play_stop: () => stopPlayback(),
   ov_play_is_playing: () => (audioState.playing ? 1 : 0),
@@ -1005,8 +1177,16 @@ const glintImports = {
   ov_lib_tree_str: (idx, field, out, cap) => {
     const r = lib.scanRows[idx];
     if (!r) return 0;
-    const vals = [r.name, r.relPath, r.parentRel, r.fullPath, r.modified, r.comment, r.displayName];
+    const vals = [r.name, r.relPath, r.parentRel, r.fullPath, r.modified, r.comment, r.displayName, r.parentRef || "", String(r.childCount || 0)];
     return writeStr(vals[field] || "", out, cap);
+  },
+  ov_lib_set_parent_ref: (dirPtr, dirLen, fnPtr, fnLen, refPtr, refLen) => {
+    const fp = `idb://${joinRel(readStr(dirPtr, dirLen), readStr(fnPtr, fnLen))}`;
+    const clip = lib.clips.get(fp);
+    if (!clip) return 0;
+    clip.parentRef = readStr(refPtr, refLen);
+    idbPut("clips", clip);
+    return 1;
   },
   ov_lib_create_folder: (pPtr, pLen, nPtr, nLen, outRel, outCap) => {
     const parentRel = cleanRel(readStr(pPtr, pLen));
@@ -1084,6 +1264,7 @@ const glintImports = {
       starred: existing?.starred || false,
       comment: existing?.comment || "",
       scoresByRef: existing?.scoresByRef || {},
+      parentRef: existing?.parentRef || "",
       modified: nowStamp(),
     };
     lib.clips.set(fullPath, rec);
@@ -1138,6 +1319,13 @@ const glintImports = {
     const updated = { ...clip, name: newName, displayName: stripExt(newName), fullPath: newFp, modified: nowStamp() };
     lib.clips.set(newFp, updated);
     idbPut("clips", updated);
+    // Keep any child takes attached to this Reference linked after rename!
+    for (const c of lib.clips.values()) {
+      if (c.parentRef === oldFp) {
+        c.parentRef = newFp;
+        idbPut("clips", c);
+      }
+    }
     writeStr(newName, outName, nCap);
     writeStr(newRel, outRel, rCap);
     writeStr(newFp, outFp, fpCap);
@@ -1186,6 +1374,12 @@ const glintImports = {
     const updated = { ...clip, relDir: dstFolder, fullPath: newFp };
     lib.clips.set(newFp, updated);
     idbPut("clips", updated);
+    for (const c of lib.clips.values()) {
+      if (c.parentRef === oldFp) {
+        c.parentRef = newFp;
+        idbPut("clips", c);
+      }
+    }
     writeStr(newRel, outRel, rCap);
     writeStr(newFp, outFp, fpCap);
     return 1;
@@ -1240,6 +1434,12 @@ const glintImports = {
     if (!lib.clips.has(fp)) return 0;
     lib.clips.delete(fp);
     idbDelete("clips", fp);
+    for (const c of lib.clips.values()) {
+      if (c.parentRef === fp) {
+        c.parentRef = "";
+        idbPut("clips", c);
+      }
+    }
     return 1;
   },
   ov_lib_get_notes: (out, cap) => writeStr(lib.lastNotes, out, cap),
@@ -1270,6 +1470,17 @@ const glintImports = {
     }
     const pcm = new Float32Array(memBuf(), samplesPtr, count);
     specGl.uploadPcmAndCompute(pcm, sampleRate);
+  },
+  spec_upload_ref_pcm: (samplesPtr, count, sampleRate) => {
+    if (count < 64 || sampleRate <= 0) {
+      specGl.clearRef();
+      return;
+    }
+    const pcm = new Float32Array(memBuf(), samplesPtr, count);
+    specGl.uploadRefPcmAndCompute(pcm, sampleRate);
+  },
+  spec_clear_ref: () => {
+    specGl.clearRef();
   },
   spec_alloc_tier: (tier, w, h) => {
     specGl.allocTier(tier, w, h);
@@ -1504,8 +1715,9 @@ const glintImports = {
     }
 
     // Stage 2: Vowel / Consonant isolation + Timing (0=In-place, 1=Compact, 2=TD-PSOLA Stretch/Hold)
+    const gainDb = isRef ? 0.0 : audioState.playGainDb;
     if (mode === 0) {
-      return startPlayback(pcm, sampleRate, startSec, endSec, loop !== 0, null);
+      return startPlayback(pcm, sampleRate, startSec, endSec, loop !== 0, null, gainDb);
     }
     const iso = buildIsolatedAudio(
       pcm,
@@ -1525,6 +1737,7 @@ const glintImports = {
       iso.endSec,
       loop !== 0,
       iso.timeMap,
+      gainDb,
     );
   },
   ov_klatt_play: (f0, f1, f2, f3, f4, durSec, tiltDb) => {

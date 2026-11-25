@@ -74,6 +74,18 @@ impl GlintPage {
     g.contrast = model.contrast
     g.displayFloorDb = model.displayFloorDb
     g.displayCeilingDb = model.displayCeilingDb
+    g.splitMode = model.isSplitRefSpec()
+    g.takeGainDb = model.activeTakeGainDb()
+
+    if model.gpuNeedRefReload {
+      model.gpuNeedRefReload = false
+      if model.refClip.active && model.refClip.samples.length() > 64 {
+        g.uploadRefPcm(model.refClip.samples.asSlice(), model.refClip.sampleRate)
+      } else {
+        g.clearRef()
+      }
+      model.gpuNeedRedraw = true
+    }
 
     if model.gpuNeedClear {
       model.gpuNeedClear = false

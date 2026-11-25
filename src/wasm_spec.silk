@@ -21,6 +21,8 @@ pub const LIVE_TEXTURE_COLUMNS: usize = 8192
 static if Intrinsic.targetArchitecture() == "wasm32" {
   unsafe extern "C" fn js_spec_set_lut(rgba: ?[*]const u8, len: usize) -> () as "glint#spec_set_lut"
   unsafe extern "C" fn js_spec_upload_pcm(samples: ?[*]const f32, count: i32, sampleRate: f64) -> () as "glint#spec_upload_pcm"
+  unsafe extern "C" fn js_spec_upload_ref_pcm(samples: ?[*]const f32, count: i32, sampleRate: f64) -> () as "glint#spec_upload_ref_pcm"
+  unsafe extern "C" fn js_spec_clear_ref() -> () as "glint#spec_clear_ref"
   unsafe extern "C" fn js_spec_alloc_tier(tier: u32, w: u32, h: u32) -> () as "glint#spec_alloc_tier"
   unsafe extern "C" fn js_spec_write_tier(
     tier: u32,
@@ -85,6 +87,8 @@ pub struct WasmSpectrogram {
   pub contrast: f32,
   pub displayFloorDb: f32,
   pub displayCeilingDb: f32,
+  pub splitMode: bool,
+  pub takeGainDb: f32,
   pub palette: Palette,
   uploadScratch: List<u8>,
 }
@@ -111,6 +115,8 @@ impl WasmSpectrogram {
       contrast: 1.0,
       displayFloorDb: DEFAULT_DISPLAY_FLOOR_DB,
       displayCeilingDb: DEFAULT_DISPLAY_CEILING_DB,
+      splitMode: false,
+      takeGainDb: 0.0,
       palette: Palette.Muted,
       uploadScratch: List<u8>.make(),
     }
@@ -379,8 +385,27 @@ impl WasmSpectrogram {
     }
   }
 
+  pub fn uploadRefPcm(self: &mut Self, samples: &[f32], sampleRate: f64) -> () {
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      if samples.length > 0 && sampleRate > 0.0 {
+        unsafe js_spec_upload_ref_pcm(Pointer.fromSlice(samples), usize.toI32(samples.length), sampleRate)
+      } else {
+        unsafe js_spec_clear_ref()
+      }
+    } else {
+      drop samples
+      drop sampleRate
+    }
+  }
+
+  pub fn clearRef(self: &mut Self) -> () {
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      unsafe js_spec_clear_ref()
+    }
+  }
+
   pub fn draw(self: &Self, vp: &Viewport) -> () {
-    let uniforms: [f32; 28] = [
+    let uniforms: [f32; 32] = [
       f64.toF32(vp.t0),
       f64.toF32(vp.t1),
       f64.toF32(vp.f0),
@@ -407,11 +432,15 @@ impl WasmSpectrogram {
       self.displayFloorDb,
       self.displayCeilingDb,
       0.0,
+      if self.splitMode { 1.0 } else { 0.0 },
+      self.takeGainDb,
+      0.0,
+      0.0,
       0.0,
       0.0,
     ]
     static if Intrinsic.targetArchitecture() == "wasm32" {
-      unsafe js_spec_draw(Pointer.fromSlice(&uniforms), 28)
+      unsafe js_spec_draw(Pointer.fromSlice(&uniforms), 32)
     } else {
       drop uniforms
     }

@@ -18,6 +18,9 @@ import studio {
   ISOLATE_CONSONANTS,
   ISOLATE_FULL,
   ISOLATE_VOWELS,
+  LISTEN_BOTH,
+  LISTEN_REF,
+  LISTEN_YOU,
   LAB_BREATH,
   LAB_GLOTTAL,
   LAB_MONOTONE,
@@ -252,6 +255,7 @@ fn renderTopBar(m: &Overtone, h: &Document<Message>) -> Node {
         &[
           topAction(h, "New", Message.NewDocument),
           topAction(h, "Open", Message.AskOpenFile),
+          topAction(h, "Trim", Message.TrimSilence),
           topAction(h, "Save", Message.SaveCurrentClip),
           topAction(h, "Export WAV", Message.AskSaveWav),
           h.box(&[h.class("w-[1px] h-[16px] bg-[#E6E6E8]")], &[]),
@@ -348,7 +352,7 @@ fn renderToolbar(m: &Overtone, h: &Document<Message>) -> Node {
             ],
             &[
               h.box(&[h.class("w-[8px] h-[8px] rounded-[4px] bg-[#FF4D3A]")], &[]),
-              txt(h, "Rec", "text-[12px] leading-[16px] font-medium text-white"),
+              txt(h, if m.isEditingActiveRef() { "Rec take" } else { "Rec" }, "text-[12px] leading-[16px] font-medium text-white"),
             ],
           ),
           h.row(
@@ -363,6 +367,21 @@ fn renderToolbar(m: &Overtone, h: &Document<Message>) -> Node {
               txt(h, if m.playing && !m.playingRefOnly { "Pause" } else { "Play" }, "text-[12px] leading-[16px] text-[#0B0B0C]"),
             ],
           ),
+          if m.refClip.active {
+            h.row(
+              &[
+                h.testId("listen-mix-group"),
+                h.class("items-center h-[28px] rounded-[6px] border border-[#E6E6E8] overflow-hidden bg-white shrink-0"),
+              ],
+              &[
+                listenModeBtn(h, "You", m.listenMode == LISTEN_YOU, true, Message.SetListenMode { mode: LISTEN_YOU }),
+                listenModeBtn(h, "Ref", m.listenMode == LISTEN_REF, true, Message.SetListenMode { mode: LISTEN_REF }),
+                listenModeBtn(h, "Both", m.listenMode == LISTEN_BOTH, false, Message.SetListenMode { mode: LISTEN_BOTH }),
+              ],
+            )
+          } else {
+            h.empty()
+          },
           if !m.refClip.active {
             h.box(
               &[
@@ -588,6 +607,19 @@ fn overlayPill(h: &Document<Message>, label: string, active: bool, msg: Message)
       h.onClick(move msg),
     ],
     &[txt(h, label, "text-[12px] leading-[16px] font-medium")],
+  )
+}
+
+fn listenModeBtn(h: &Document<Message>, label: string, active: bool, borderRight: bool, msg: Message) -> Node {
+  return h.box(
+    &[
+      h.class("flex items-center h-full px-[7px]"),
+      h.classSelect(active, "bg-[#0B0B0C] text-white font-semibold", "bg-white text-[#6B6B70] glint-btn-hover"),
+      h.classWhen(borderRight, "border-r border-[#E6E6E8]"),
+      h.cursor(Cursor.Pointer),
+      h.onClick(move msg),
+    ],
+    &[txt(h, label, "text-[11px] leading-[14px]")],
   )
 }
 
@@ -848,7 +880,19 @@ fn renderLibraryRail(m: &Overtone, h: &Document<Message>) -> Node {
               &[h.class("items-center flex-wrap gap-[4px]")],
               &[
                 refDarkPill(h, if m.playingRefOnly { "❚❚ Ref" } else { "▶ Play" }, m.playingRefOnly, false, Message.PlayReferenceOnce),
-                refDarkPill(h, "✦ Target", m.showVoicePreview, true, Message.ToggleVoicePreview),
+                refDarkPill(h, "Split", m.isSplitRefSpec(), true, Message.ToggleSplitRefSpec),
+                refDarkPill(
+                  h,
+                  if m.normToRef && String.byteLength(String.view(&m.readoutNormGain)) > 0 {
+                    String.view(&m.readoutNormGain)
+                  } else {
+                    "Norm dB"
+                  },
+                  m.normToRef,
+                  m.normToRef,
+                  Message.ToggleNormToRef,
+                ),
+                refDarkPill(h, "✦ Target", m.showVoicePreview, false, Message.ToggleVoicePreview),
                 refDarkPill(h, "DTW", m.useDtwAlign, false, Message.ToggleDtwAlign),
                 refDarkPill(h, "Heat", m.showHeatmap, false, Message.ToggleHeatmap),
                 refDarkPill(h, "Wave", m.showRefWave, false, Message.ToggleRefWave),
@@ -858,7 +902,27 @@ fn renderLibraryRail(m: &Overtone, h: &Document<Message>) -> Node {
           ],
         )
       } else {
-        h.empty()
+        h.row(
+          &[h.class("px-[10px] py-[5px] gap-[5px] bg-[#FAFAFA] border-b border-[#F1F1F2] shrink-0 items-center")],
+          &[
+            h.box(
+              &[
+                h.class("px-[6px] py-[2px] rounded-[4px] border border-[#DCDCDF] bg-white glint-btn-hover"),
+                h.cursor(Cursor.Pointer),
+                h.onClick(Message.CreateEmptyRef),
+              ],
+              &[txt(h, "+ Empty ref", "text-[10px] leading-[13px] font-medium text-[#3A3A3F]")],
+            ),
+            h.box(
+              &[
+                h.class("px-[6px] py-[2px] rounded-[4px] border border-[#DCDCDF] bg-white glint-btn-hover"),
+                h.cursor(Cursor.Pointer),
+                h.onClick(Message.SelectGeneralMode),
+              ],
+              &[txt(h, "General", "text-[10px] leading-[13px] font-medium text-[#6B6B70]")],
+            ),
+          ],
+        )
       },
       if m.showNewFolderInput {
         let nfRel = String.view(&m.newFolderTargetRel)
@@ -994,6 +1058,56 @@ fn renderLibraryRail(m: &Overtone, h: &Document<Message>) -> Node {
             ),
           ],
         )
+      },
+      if m.selectedClipPaths.length() > 0 {
+        let selN = m.selectedClipPaths.length()
+        h.row(
+          &[
+            h.testId("lib-bulk-bar"),
+            h.class("px-[10px] py-[6px] gap-[6px] bg-[#FFF5F3] border-t border-[#FFD4CC] shrink-0 items-center justify-between"),
+          ],
+          &[
+            h.row(
+              &[h.class("items-center gap-[5px]")],
+              &[
+                txt(h, pctDigits(usize.toI32(selN)), "glint-mono text-[11px] font-semibold text-[#D9381E]"),
+                txt(h, "selected", "text-[11px] text-[#6B6B70]"),
+              ],
+            ),
+            h.row(
+              &[h.class("items-center gap-[4px]")],
+              &[
+                h.box(
+                  &[
+                    h.testId("lib-bulk-delete"),
+                    h.class("px-[7px] py-[2px] rounded-[4px] bg-[#D9381E] text-white"),
+                    h.cursor(Cursor.Pointer),
+                    h.onClick(Message.DeleteSelectedLibClips),
+                  ],
+                  &[txt(h, "Delete", "text-[10px] leading-[13px] font-semibold text-white")],
+                ),
+                h.box(
+                  &[
+                    h.class("px-[5px] py-[2px] rounded-[4px] border border-[#DCDCDF] bg-white glint-btn-hover"),
+                    h.cursor(Cursor.Pointer),
+                    h.onClick(Message.SelectAllLibClips),
+                  ],
+                  &[txt(h, "All", "text-[10px] leading-[13px] text-[#3A3A3F]")],
+                ),
+                h.box(
+                  &[
+                    h.class("px-[5px] py-[2px] rounded-[4px] text-[#6B6B70] hover:text-[#0B0B0C]"),
+                    h.cursor(Cursor.Pointer),
+                    h.onClick(Message.ClearLibSelection),
+                  ],
+                  &[txt(h, "×", "text-[12px] leading-[12px]")],
+                ),
+              ],
+            ),
+          ],
+        )
+      } else {
+        h.empty()
       },
       if m.activeClipInLib {
         h.column(
@@ -1139,7 +1253,7 @@ fn renderExplorerRow(m: &Overtone, h: &Document<Message>, idx: usize, topY: f32)
         h.style(&[css.top(px(topY)), css.paddingLeft(px(indentPx))]),
         h.cursor(Cursor.Pointer),
         h.onLayout(|r| Message.ExplorerRowLayout { idx: idx, rect: r }),
-        h.onPointerDown(|e| Reply<Message>.EmitAndStop { message: Message.ExplorerRowDown { idx: idx, x: e.x, y: e.y, button: e.button } }),
+        h.onPointerDown(|e| Reply<Message>.EmitAndStop { message: Message.ExplorerRowDown { idx: idx, x: e.x, y: e.y, button: e.button, modifiers: e.modifiers } }),
       ],
       &[
         txt(h, if node.expanded { "▾" } else { "▸" }, "w-[10px] shrink-0 text-[9px]"),
@@ -1149,7 +1263,9 @@ fn renderExplorerRow(m: &Overtone, h: &Document<Message>, idx: usize, topY: f32)
   }
 
   let isActive = String.view(&node.fullPath) == String.view(&m.activeClipPath)
+  let isMultiSel = m.isClipMultiSelected(String.view(&node.fullPath))
   let isRef = m.refClip.active && String.view(&node.fullPath) == String.view(&m.refClip.fullPath)
+  let hasKids = node.childCount > 0
   let score = node.scoreOverall
   let hasScore = score >= 0
   let barPct: f32 = if hasScore { i32.toF32(if score > 100 { 100 } else { score }) } else { 0.0 }
@@ -1157,15 +1273,51 @@ fn renderExplorerRow(m: &Overtone, h: &Document<Message>, idx: usize, topY: f32)
 
   return h.row(
     &[
-      h.class("absolute left-0 right-0 h-[26px] items-center gap-[6px] pr-[12px]"),
-      h.classSelect(isActive, "bg-[#F1F1F2] text-[#0B0B0C] font-semibold", "text-[#3A3A40] glint-btn-hover"),
-      h.style(&[css.top(px(topY)), css.paddingLeft(px(indentPx + 14.0))]),
+      h.class("absolute left-0 right-0 h-[26px] items-center gap-[5px] pr-[10px]"),
+      h.classSelect(
+        isMultiSel,
+        "bg-[#E6F6FD] text-[#0B0B0C] font-medium",
+        if isActive { "bg-[#F1F1F2] text-[#0B0B0C] font-semibold" } else { "text-[#3A3A40] glint-btn-hover" },
+      ),
+      h.style(&[css.top(px(topY)), css.paddingLeft(px(indentPx + 4.0))]),
       h.cursor(Cursor.Pointer),
       h.onLayout(|r| Message.ExplorerRowLayout { idx: idx, rect: r }),
-      h.onPointerDown(|e| Reply<Message>.EmitAndStop { message: Message.ExplorerRowDown { idx: idx, x: e.x, y: e.y, button: e.button } }),
+      h.onPointerDown(|e| Reply<Message>.EmitAndStop { message: Message.ExplorerRowDown { idx: idx, x: e.x, y: e.y, button: e.button, modifiers: e.modifiers } }),
     ],
     &[
+      if hasKids {
+        h.box(
+          &[
+            h.class("w-[12px] h-[16px] flex items-center justify-center shrink-0 text-[#6B6B70] hover:text-[#0B0B0C]"),
+            h.cursor(Cursor.Pointer),
+            h.onPointerDown(|_| Reply<Message>.EmitAndStop { message: Message.ToggleRefGroupExpand { idx: idx } }),
+          ],
+          &[txt(h, if node.expanded { "▾" } else { "▸" }, "text-[9px]")],
+        )
+      } else {
+        h.box(
+          &[
+            h.class("w-[12px] h-[16px] flex items-center justify-center shrink-0"),
+            h.cursor(Cursor.Pointer),
+            h.onPointerDown(|_| Reply<Message>.EmitAndStop { message: Message.ToggleSelectLibClip { idx: idx } }),
+          ],
+          &[
+            h.box(
+              &[
+                h.class("w-[10px] h-[10px] rounded-[2px] border flex items-center justify-center"),
+                h.classSelect(isMultiSel, "bg-[#0E0E10] border-[#0E0E10]", "border-[#D4D4D8] bg-white"),
+              ],
+              &[if isMultiSel { txt(h, "✓", "text-[7px] leading-[8px] text-white font-bold") } else { h.empty() }],
+            ),
+          ],
+        )
+      },
       txt(h, String.view(&node.displayName), "flex-1 text-[12px] leading-[16px] truncate"),
+      if hasKids {
+        txt(h, pctDigits(u32.toI32(node.childCount)), "glint-mono text-[9px] px-[4px] py-[0px] rounded-[3px] bg-[#ECECEE] text-[#6B6B70] shrink-0")
+      } else {
+        h.empty()
+      },
       if isRef {
         txt(h, "REF", "glint-mono text-[9px] px-[4px] py-[1px] rounded-[3px] bg-[#0E0E10] text-white shrink-0")
       } else {
@@ -1263,6 +1415,7 @@ fn scriptPresetBtn(h: &Document<Message>, label: string, msg: Message) -> Node {
 
 fn renderSpectrogramWell(m: &Overtone, h: &Document<Message>) -> Node {
   let onRef = m.isPlottingOnRef()
+  let split = m.isSplitRefSpec()
   let sw = f32.max(1.0, m.specRect.width())
 
   // Selection overlay coordinates
@@ -1324,10 +1477,22 @@ fn renderSpectrogramWell(m: &Overtone, h: &Document<Message>) -> Node {
         &[
           h.box(
             &[
-              h.class("shrink-0 h-full overflow-hidden"),
+              h.class("shrink-0 h-full relative overflow-hidden"),
               h.style(&[css.width(px(PIANO_W))]),
             ],
-            &[h.drawing(&m.pianoDrawing, &[h.class("w-full h-full")])],
+            &[
+              if split {
+                h.box(
+                  &[h.class("absolute inset-0")],
+                  &[
+                    h.box(&[h.class("absolute left-0 right-0 top-0 overflow-hidden"), h.style(&[css.height(percent(49.7))])], &[h.drawing(&m.refPianoDrawing, &[h.class("w-full h-full")])]),
+                    h.box(&[h.class("absolute left-0 right-0 bottom-0 overflow-hidden"), h.style(&[css.height(percent(49.7))])], &[h.drawing(&m.pianoDrawing, &[h.class("w-full h-full")])]),
+                  ],
+                )
+              } else {
+                h.drawing(&m.pianoDrawing, &[h.class("w-full h-full")])
+              },
+            ],
           ),
           h.box(
             &[
@@ -1335,17 +1500,57 @@ fn renderSpectrogramWell(m: &Overtone, h: &Document<Message>) -> Node {
               h.style(&[css.width(px(AXIS_W))]),
             ],
             &[
-              h.each<AxisTick>(
-                m.freqTicks.asSlice(),
-                |tk| txtA(
-                  h,
-                  String.view(&tk.label),
+              if split {
+                h.box(
+                  &[h.class("absolute inset-0")],
                   &[
-                    h.class("absolute right-[6px] glint-mono text-[10px] leading-[12px] text-[#6E6E76]"),
-                    h.style(&[css.top(px(tk.pos - 6.0))]),
+                    h.box(
+                      &[h.class("absolute left-0 right-0 top-0 overflow-hidden"), h.style(&[css.height(percent(49.7))])],
+                      &[
+                        h.each<AxisTick>(
+                          m.refFreqTicks.asSlice(),
+                          |tk| txtA(
+                            h,
+                            String.view(&tk.label),
+                            &[
+                              h.class("absolute right-[6px] glint-mono text-[10px] leading-[12px] text-[#6E6E76]"),
+                              h.style(&[css.top(px(tk.pos - 6.0))]),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                    h.box(
+                      &[h.class("absolute left-0 right-0 bottom-0 overflow-hidden"), h.style(&[css.height(percent(49.7))])],
+                      &[
+                        h.each<AxisTick>(
+                          m.freqTicks.asSlice(),
+                          |tk| txtA(
+                            h,
+                            String.view(&tk.label),
+                            &[
+                              h.class("absolute right-[6px] glint-mono text-[10px] leading-[12px] text-[#6E6E76]"),
+                              h.style(&[css.top(px(tk.pos - 6.0))]),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
                   ],
-                ),
-              ),
+                )
+              } else {
+                h.each<AxisTick>(
+                  m.freqTicks.asSlice(),
+                  |tk| txtA(
+                    h,
+                    String.view(&tk.label),
+                    &[
+                      h.class("absolute right-[6px] glint-mono text-[10px] leading-[12px] text-[#6E6E76]"),
+                      h.style(&[css.top(px(tk.pos - 6.0))]),
+                    ],
+                  ),
+                )
+              },
             ],
           ),
           h.box(
@@ -1375,8 +1580,47 @@ fn renderSpectrogramWell(m: &Overtone, h: &Document<Message>) -> Node {
               } else {
                 h.empty()
               },
-              h.drawing(&m.overlayDrawing, &[h.class("absolute inset-0 w-full h-full pointer-events-none")]),
-              if m.refClip.active && m.showRefWave {
+              if split {
+                h.box(
+                  &[h.class("absolute inset-0 pointer-events-none")],
+                  &[
+                    h.box(
+                      &[h.class("absolute left-0 right-0 top-0 overflow-hidden"), h.style(&[css.height(percent(49.7))])],
+                      &[
+                        h.drawing(&m.refOverlayDrawing, &[h.class("w-full h-full")]),
+                        h.row(
+                          &[h.class("absolute left-[8px] top-[6px] items-center gap-[5px] px-[6px] py-[2px] rounded-[4px] bg-[#0E0E10]/85 border border-[#5BCEFA]/40")],
+                          &[
+                            txt(h, "REF", "glint-mono text-[9px] leading-[11px] font-semibold tracking-[0.06em] text-[#5BCEFA]"),
+                            txt(h, String.view(&m.refClip.name), "text-[10px] leading-[12px] text-white/90 truncate max-w-[200px]"),
+                          ],
+                        ),
+                      ],
+                    ),
+                    h.box(
+                      &[h.class("absolute left-0 right-0 bottom-0 overflow-hidden"), h.style(&[css.height(percent(49.7))])],
+                      &[
+                        h.drawing(&m.overlayDrawing, &[h.class("w-full h-full")]),
+                        h.row(
+                          &[h.class("absolute left-[8px] top-[6px] items-center gap-[5px] px-[6px] py-[2px] rounded-[4px] bg-[#0E0E10]/85 border border-white/20")],
+                          &[
+                            txt(h, "YOU", "glint-mono text-[9px] leading-[11px] font-semibold tracking-[0.06em] text-white"),
+                            txt(h, String.view(&m.clipName), "text-[10px] leading-[12px] text-white/80 truncate max-w-[200px]"),
+                            if m.normToRef && String.byteLength(String.view(&m.readoutNormGain)) > 0 {
+                              txt(h, String.view(&m.readoutNormGain), "glint-mono text-[9px] leading-[11px] text-[#5BCEFA]")
+                            } else {
+                              h.empty()
+                            },
+                          ],
+                        ),
+                      ],
+                    ),
+                  ],
+                )
+              } else {
+                h.drawing(&m.overlayDrawing, &[h.class("absolute inset-0 w-full h-full pointer-events-none")])
+              },
+              if m.refClip.active && m.showRefWave && !split {
                 txt(
                   h,
                   if m.useDtwAlign { "REF · DTW" } else { "REF" },
