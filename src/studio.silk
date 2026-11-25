@@ -283,6 +283,9 @@ pub union Message {
   CreateNewFolder,
   RevealDirInFinder,
   RevealEntryInFinder { pub idx: usize },
+  DownloadLibClip { pub idx: usize },
+  ShareLibClip { pub idx: usize },
+  TogglePinchZoom,
   SetLibFilter { pub filter: u32 },
   SetLibSortMode { pub mode: i32 },
   RescoreVisibleClips,
@@ -720,6 +723,7 @@ pub struct Overtone {
 
   // Hear in your voice (Pitch / Size / Weight preview resynthesis)
   pub showVoicePreview: bool,
+  pub enablePinchZoom: bool,
   pub synthPitchOn: bool,
   pub synthSizeOn: bool,
   pub synthWeightOn: bool,
@@ -1062,6 +1066,7 @@ impl Overtone {
       neuralStatusFlags: 0,
 
       showVoicePreview: false,
+      enablePinchZoom: false,
       synthPitchOn: true,
       synthSizeOn: true,
       synthWeightOn: true,
@@ -1415,7 +1420,7 @@ impl Overtone {
 
   pub fn scheduleSharp(self: &mut Self) -> () {
     self.gpuNeedSharp = true
-    self.sharpDueTime = self.nowTime + 0.02
+    self.sharpDueTime = 0.0
     self.gpuNeedRedraw = true
   }
 
@@ -1831,6 +1836,8 @@ impl Overtone {
   }
 
   /// Evaluates the destination folder for an Explorer drag-and-drop pointer position.
+  /// Uses exact virtualized tree math (`explorerTreeRect` + `explorerScrollY`) so dropping onto
+  /// ANY folder (nested, scrolled, expanded, or collapsed) works reliably on both web and native.
   effect fn updateExplorerDropTarget(self: &mut Self, x: f32, y: f32) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
@@ -1846,22 +1853,48 @@ impl Overtone {
       self.explorerDropValid = false
       return ()
     }
-    // Check if pointer is over any visible tree row
+
+    // 1. Primary hit-test: exact tree coordinate against virtualized rows (always fresh, immune to stale DOM rects!)
     let mut dstRel = String.make()
-    let rects = self.explorerRowRects.asSlice()
-    let mut i: usize = 0
-    while i < rects.length && i < nodes.length {
-      let r = rects[i]
-      if r.width() > 1.0 && r.height() > 1.0 && y >= r.yMin && y <= r.yMax {
-        if nodes[i].isDir {
-          dstRel = run String.copy(String.view(&nodes[i].relPath))
-        } else {
-          dstRel = run String.copy(String.view(&nodes[i].parentRel))
+    let mut matched = false
+    let tr = self.explorerTreeRect
+    if tr.height() > 1.0 && y >= tr.yMin && y <= tr.yMax {
+      let localY = (y - tr.yMin) + self.explorerScrollY
+      let slots = self.explorerVisibleRows.asSlice()
+      let mut s: usize = 0
+      while s < slots.length {
+        let slot = &slots[s]
+        if slot.idx < nodes.length && localY >= slot.y && localY <= slot.y + slot.h {
+          if nodes[slot.idx].isDir {
+            dstRel = run String.copy(String.view(&nodes[slot.idx].relPath))
+          } else {
+            dstRel = run String.copy(String.view(&nodes[slot.idx].parentRel))
+          }
+          matched = true
+          break
         }
-        break
+        s = s + 1
       }
-      i = i + 1
     }
+
+    // 2. Fallback to reported row rects if tree rect hasn't been laid out yet
+    if !matched {
+      let rects = self.explorerRowRects.asSlice()
+      let mut i: usize = 0
+      while i < rects.length && i < nodes.length {
+        let r = rects[i]
+        if r.width() > 1.0 && r.height() > 1.0 && y >= r.yMin && y <= r.yMax {
+          if nodes[i].isDir {
+            dstRel = run String.copy(String.view(&nodes[i].relPath))
+          } else {
+            dstRel = run String.copy(String.view(&nodes[i].parentRel))
+          }
+          break
+        }
+        i = i + 1
+      }
+    }
+
     let srcParent = String.view(&nodes[self.explorerDragIdx].parentRel)
     let srcRel = String.view(&nodes[self.explorerDragIdx].relPath)
     let srcIsDir = nodes[self.explorerDragIdx].isDir
@@ -4815,6 +4848,38 @@ impl Overtone {
         }
       }
 
+      Message.DownloadLibClip { idx } => {
+        self.ctxMenuKind = CTX_NONE
+        let nodes = self.libTree.asSlice()
+        if idx < nodes.length && !nodes[idx].isDir {
+          let ok = audio_native.libDownloadEntry(
+            String.view(&nodes[idx].parentRel),
+            String.view(&nodes[idx].name),
+          )
+          if ok {
+            self.statusMsg = run String.copy("Downloaded WAV")
+          }
+        }
+      }
+
+      Message.ShareLibClip { idx } => {
+        self.ctxMenuKind = CTX_NONE
+        let nodes = self.libTree.asSlice()
+        if idx < nodes.length && !nodes[idx].isDir {
+          let ok = audio_native.libShareEntry(
+            String.view(&nodes[idx].parentRel),
+            String.view(&nodes[idx].name),
+          )
+          if ok {
+            self.statusMsg = run String.copy("Ready to share WAV")
+          }
+        }
+      }
+
+      Message.TogglePinchZoom => {
+        self.enablePinchZoom = !self.enablePinchZoom
+      }
+
       Message.SetLibFilter { filter } => {
         self.libFilter = filter
         self.explorerScrollY = 0.0
@@ -6218,25 +6283,38 @@ impl Overtone {
 
         let alt = (modifiers & MOD_ALT) != 0
         let shift = (modifiers & MOD_SHIFT) != 0
-        let pinch = (modifiers & (MOD_CONTROL | MOD_META)) != 0
+        let cmd = (modifiers & MOD_META) != 0
+        let ctrl = (modifiers & MOD_CONTROL) != 0
 
-        if shift {
+        if cmd {
+          // VoceVista-style Command + scroll zooms time (and frequency too when holding Alt/Option)
+          let factor = f64.exp(f32.toF64(dy) * 0.0045)
+          self.vp.zoomTimeAbout(ax, factor)
+          if alt {
+            self.vp.zoomFreqAbout(ay, factor)
+          }
+        } else if ctrl {
+          // Trackpad pinch (browsers synthesize ctrlKey + wheel) — opt-in via Settings -> Playback
+          if self.enablePinchZoom {
+            let factor = f64.exp(f32.toF64(dy) * 0.006)
+            self.vp.zoomTimeAbout(ax, factor)
+            self.vp.zoomFreqAbout(ay, factor)
+          } else {
+            return ()
+          }
+        } else if alt {
+          let factor = f64.exp(f32.toF64(dy) * 0.0035)
+          self.vp.zoomFreqAbout(ay, factor)
+        } else if shift {
           let d = if f32.abs(dx) > f32.abs(dy) { dx } else { dy }
           self.vp.panTime(f32.toF64(d) * 0.0025)
-        } else if pinch {
-          let factor = f64.exp(f32.toF64(dy) * 0.006)
-          self.vp.zoomTimeAbout(ax, factor)
-          self.vp.zoomFreqAbout(ay, factor)
-        } else if alt {
-          let factor = f64.exp(f32.toF64(dy) * 0.003)
-          self.vp.zoomFreqAbout(ay, factor)
         } else {
-          if f32.abs(dx) > 0.5 {
-            self.vp.panTime(f32.toF64(dx) * 0.002)
+          // Plain two-finger scroll = clean, steady 2D panning (zero accidental zoom wobble!)
+          if f32.abs(dx) > 0.25 {
+            self.vp.panTime(f32.toF64(dx) * 0.0022)
           }
-          if f32.abs(dy) > 0.5 {
-            let factor = f64.exp(f32.toF64(dy) * 0.003)
-            self.vp.zoomTimeAbout(ax, factor)
+          if f32.abs(dy) > 0.25 {
+            self.vp.panFreq(-f32.toF64(dy) * 0.0022)
           }
         }
         self.scheduleSharp()

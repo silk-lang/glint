@@ -141,26 +141,31 @@ impl GlintPage {
       }
     }
 
-    if model.gpuNeedSharp && !model.recording && self.lastTime >= model.sharpDueTime {
+    if model.gpuNeedSharp && !model.recording {
       model.gpuNeedSharp = false
       let dur = model.gpuDuration()
       let sr = model.gpuSampleRate()
       let src = model.gpuSamples()
       if dur > 0.0 && src.length > 0 {
         let span = f64.max(model.vp.t1 - model.vp.t0, 0.005)
-        let cssW = f32.toUsize(f32.max(200.0, f32.min(720.0, model.specRect.width())))
-        let desiredStepSec = span / usize.toF64(cssW)
+        let zoomRatio = dur / span
+        // Variable LOD time-axis resolution: scales smoothly with zoom depth & viewport width
+        let baseCssW = f32.max(240.0, f32.min(960.0, model.specRect.width()))
+        let lodScale: f64 = if zoomRatio > 6.0 { 1.15 } else if zoomRatio > 2.0 { 0.95 } else { 0.78 }
+        let cssCols = f64.toUsize(f64.max(220.0, f64.min(960.0, f32.toF64(baseCssW) * lodScale)))
+        let desiredStepSec = span / usize.toF64(cssCols)
         let desiredHzPerBin = sr / usize.toF64(model.sharpWin.size)
         if g.coarseCovers(&model.vp, desiredStepSec, desiredHzPerBin) {
           g.clearSharpTier()
           model.gpuNeedRedraw = true
         } else if !g.sharpCovers(&model.vp, desiredStepSec) {
-          let margin = span * 0.25
+          // Strict time & frequency culling with 18% overscan margin for smooth zero-recompute micro-pans
+          let margin = span * 0.18
           let t0 = f64.max(0.0, model.vp.t0 - margin)
           let t1 = f64.min(dur, model.vp.t1 + margin)
-          let rawCols = f64.toUsize(f64.round(usize.toF64(cssW) * ((t1 - t0) / span)))
-          let targetCols = if rawCols < 48 { 48 } else if rawCols > 720 { 720 } else { rawCols }
-          let sharpMaxHz = f64.min(sr * 0.5, f64.max(model.vp.f1 * 1.4, 10000.0))
+          let rawCols = f64.toUsize(f64.round(usize.toF64(cssCols) * ((t1 - t0) / span)))
+          let targetCols = if rawCols < 64 { 64 } else if rawCols > 960 { 960 } else { rawCols }
+          let culledMaxHz = f64.min(sr * 0.5, f64.max(model.vp.f1 * 1.18, 2200.0))
           let sharpCols = run computeColumns(
             src,
             sr,
@@ -168,7 +173,7 @@ impl GlintPage {
             t1,
             targetCols,
             &model.sharpWin,
-            sharpMaxHz,
+            culledMaxHz,
             0,
           )
           run g.setSharpTier(&sharpCols)

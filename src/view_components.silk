@@ -302,7 +302,7 @@ pub fn menuItem(
   return h.row(
     &[
       h.class("items-center gap-[6px] h-[26px] pl-[6px] pr-[10px] rounded-[5px]"),
-      h.classSelect(highlight, "bg-[#0E0E10] text-white", "glint-menu-item"),
+      h.classSelect(highlight, "bg-[#0E0E10] text-white", if danger { "glint-menu-item-danger" } else { "glint-menu-item" }),
       h.cursor(Cursor.Pointer),
       h.onClick(move msg),
     ],

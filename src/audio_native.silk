@@ -114,6 +114,18 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
     name: ?[*]const u8,
     nameLen: usize,
   ) -> () as "glint#ov_lib_reveal_entry"
+  unsafe extern "C" fn ov_lib_download_entry(
+    parentRel: ?[*]const u8,
+    parentLen: usize,
+    name: ?[*]const u8,
+    nameLen: usize,
+  ) -> i32 as "glint#ov_lib_download_entry"
+  unsafe extern "C" fn ov_lib_share_entry(
+    parentRel: ?[*]const u8,
+    parentLen: usize,
+    name: ?[*]const u8,
+    nameLen: usize,
+  ) -> i32 as "glint#ov_lib_share_entry"
   unsafe extern "C" fn ov_lib_save_wav(
     relDir: ?[*]const u8,
     relDirLen: usize,
@@ -1287,6 +1299,35 @@ pub fn getOutputDevice() -> u32 {
 
 pub fn setInputDevice(devId: u32) -> bool {
   return unsafe ov_audio_set_input_device(devId) != 0
+}
+
+pub fn libDownloadEntry(parentRel: string, name: string) -> bool {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    return unsafe ov_lib_download_entry(
+      Pointer.fromSlice(String.utf8Bytes(parentRel)),
+      String.byteLength(parentRel),
+      Pointer.fromSlice(String.utf8Bytes(name)),
+      String.byteLength(name),
+    ) != 0
+  } else {
+    drop parentRel
+    drop name
+    return false
+  }
+}
+
+pub fn libShareEntry(parentRel: string, name: string) -> bool {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    return unsafe ov_lib_share_entry(
+      Pointer.fromSlice(String.utf8Bytes(parentRel)),
+      String.byteLength(parentRel),
+      Pointer.fromSlice(String.utf8Bytes(name)),
+      String.byteLength(name),
+    ) != 0
+  } else {
+    libRevealEntry(parentRel, name)
+    return true
+  }
 }
 
 pub fn setOutputDevice(devId: u32) -> bool {

@@ -358,7 +358,8 @@ impl WasmSpectrogram {
     return self.sharp.t0 <= vp.t0 + 0.001
       && self.sharp.t1 >= vp.t1 - 0.001
       && self.sharp.maxHz >= vp.f1 * 0.99
-      && self.sharpStepSec <= desiredStepSec * 1.35
+      && self.sharpStepSec <= desiredStepSec * 1.30
+      && self.sharpStepSec >= desiredStepSec * 0.42
   }
 
   pub fn draw(self: &Self, vp: &Viewport) -> () {

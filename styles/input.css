@@ -58,4 +58,95 @@
     background-color: #0e0e10;
     color: #ffffff;
   }
+
+  .glint-menu-item:hover * {
+    color: #ffffff !important;
+  }
+
+  .glint-menu-item-danger:hover {
+    background-color: #d9381e;
+    color: #ffffff;
+  }
+
+  .glint-menu-item-danger:hover * {
+    color: #ffffff !important;
+  }
+
+  .prism-top-ribbon {
+    background: linear-gradient(
+      90deg,
+      #5bcefa 0%,
+      #f5a9b8 20%,
+      #ffffff 36%,
+      #f5a9b8 52%,
+      #5bcefa 70%,
+      #f5a9b8 86%,
+      #5bcefa 100%
+    );
+    background-size: 260% 100%;
+    animation: prism-sheen-slide 9s ease-in-out infinite;
+  }
+
+  .prism-wordmark {
+    background-image: linear-gradient(
+      115deg,
+      #0b0b0c 0%,
+      #0b0b0c 34%,
+      #3ab8ee 43%,
+      #f08ea3 50%,
+      #d7ecfa 54%,
+      #f08ea3 58%,
+      #3ab8ee 64%,
+      #0b0b0c 73%,
+      #0b0b0c 100%
+    );
+    background-size: 280% 100%;
+    background-position: 100% 0%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+    animation: prism-text-sheen 7.5s ease-in-out infinite;
+  }
+
+  .prism-gem {
+    background-image: linear-gradient(
+      135deg,
+      #5bcefa 0%,
+      #f5a9b8 38%,
+      #ffffff 52%,
+      #f5a9b8 68%,
+      #5bcefa 100%
+    );
+    background-size: 240% 240%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+    animation: prism-sheen-slide 6s ease-in-out infinite;
+  }
+}
+
+@keyframes prism-sheen-slide {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
+
+@keyframes prism-text-sheen {
+  0%, 18% {
+    background-position: 100% 0%;
+  }
+  58% {
+    background-position: 0% 0%;
+  }
+  72%, 100% {
+    background-position: 0% 0%;
+  }
 }

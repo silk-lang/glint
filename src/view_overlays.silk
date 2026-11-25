@@ -70,6 +70,14 @@ import silk.num.i32
 import silk.num.u32
 import silk.text.string { String }
 
+fn isWebBuild() -> bool {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    return true
+  } else {
+    return false
+  }
+}
+
 fn clampMenuX(x: f32, menuW: f32) -> f32 {
   let maxX = f32.max(12.0, 1420.0 - menuW)
   return f32.max(8.0, f32.min(maxX, x))
@@ -671,8 +679,17 @@ pub fn renderContextMenu(m: &Overtone, h: &Document<Message>) -> Node {
           h.empty()
         },
         menuSep(h),
-        menuItem(h, false, "Reveal in Finder", "", false, false, Message.RevealEntryInFinder { idx: idx }),
-        menuItem(h, false, "Move to Trash", "", true, false, Message.DeleteLibEntry { idx: idx }),
+        if isWebBuild() {
+          menuItem(h, false, "Download WAV", "", false, false, Message.DownloadLibClip { idx: idx })
+        } else {
+          menuItem(h, false, "Reveal in Finder", "", false, false, Message.RevealEntryInFinder { idx: idx })
+        },
+        menuItem(h, false, "Share…", "", false, false, Message.ShareLibClip { idx: idx }),
+        if isWebBuild() {
+          menuItem(h, false, "Delete", "", true, false, Message.DeleteLibEntry { idx: idx })
+        } else {
+          menuItem(h, false, "Move to Trash", "", true, false, Message.DeleteLibEntry { idx: idx })
+        },
       ],
     )
   } else if m.ctxMenuKind == CTX_EXPLORER_DIR {
@@ -696,8 +713,16 @@ pub fn renderContextMenu(m: &Overtone, h: &Document<Message>) -> Node {
           h.empty()
         },
         menuSep(h),
-        menuItem(h, false, "Reveal in Finder", "", false, false, Message.RevealEntryInFinder { idx: idx }),
-        menuItem(h, false, "Move to Trash", "", true, false, Message.DeleteLibEntry { idx: idx }),
+        if !isWebBuild() {
+          menuItem(h, false, "Reveal in Finder", "", false, false, Message.RevealEntryInFinder { idx: idx })
+        } else {
+          h.empty()
+        },
+        if isWebBuild() {
+          menuItem(h, false, "Delete folder", "", true, false, Message.DeleteLibEntry { idx: idx })
+        } else {
+          menuItem(h, false, "Move to Trash", "", true, false, Message.DeleteLibEntry { idx: idx })
+        },
       ],
     )
   } else if m.ctxMenuKind == CTX_EXPLORER_ROOT {
@@ -710,7 +735,7 @@ pub fn renderContextMenu(m: &Overtone, h: &Document<Message>) -> Node {
         h.style(&[css.left(px(menuX)), css.top(px(menuY))]),
       ],
       &[
-        menuHeader(h, "Glint library"),
+        menuHeader(h, "Prism library"),
         menuItem(h, false, "New folder…", "", false, false, Message.OpenNewFolderAtRoot),
         menuItem(h, isRootSelected, "Save new takes here", "", false, false, Message.SelectRootFolder),
         menuSep(h),
@@ -721,7 +746,11 @@ pub fn renderContextMenu(m: &Overtone, h: &Document<Message>) -> Node {
         menuItem(h, false, "Re-score visible takes", "", false, false, Message.RescoreVisibleClips),
         menuSep(h),
         menuItem(h, false, "Refresh", "", false, false, Message.RefreshLibDir),
-        menuItem(h, false, "Reveal library in Finder", "", false, false, Message.RevealDirInFinder),
+        if !isWebBuild() {
+          menuItem(h, false, "Reveal library in Finder", "", false, false, Message.RevealDirInFinder)
+        } else {
+          h.empty()
+        },
       ],
     )
   } else if m.ctxMenuKind == CTX_LIB_SORT {
@@ -1087,7 +1116,7 @@ fn renderSettingsPlayback(m: &Overtone, h: &Document<Message>) -> Node {
         ],
       ),
       h.row(
-        &[h.class("items-center gap-[16px] py-[9px]")],
+        &[h.class("items-center gap-[16px] py-[9px] border-b border-[#F0F0F2]")],
         &[
           h.column(
             &[h.class("w-[180px] shrink-0 gap-[1px]")],
@@ -1097,6 +1126,19 @@ fn renderSettingsPlayback(m: &Overtone, h: &Document<Message>) -> Node {
             ],
           ),
           toggleSwitch(h, m.loopSelection, true, Message.ToggleLoop),
+        ],
+      ),
+      h.row(
+        &[h.class("items-center gap-[16px] py-[9px]")],
+        &[
+          h.column(
+            &[h.class("w-[180px] shrink-0 gap-[1px]")],
+            &[
+              txt(h, "Trackpad pinch zoom", "text-[13px] leading-[16px] text-[#0B0B0C]"),
+              txt(h, "Off by default · use ⌘ + scroll to zoom", "text-[11px] leading-[14px] text-[#8A8A90]"),
+            ],
+          ),
+          toggleSwitch(h, m.enablePinchZoom, true, Message.TogglePinchZoom),
         ],
       ),
     ],

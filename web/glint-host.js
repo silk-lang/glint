@@ -1026,6 +1026,36 @@ const glintImports = {
   },
   ov_lib_reveal_dir: () => {},
   ov_lib_reveal_entry: () => {},
+  ov_lib_download_entry: (pPtr, pLen, nPtr, nLen) => {
+    const parentRel = cleanRel(readStr(pPtr, pLen));
+    const name = readStr(nPtr, nLen);
+    const fp = `idb://${joinRel(parentRel, name)}`;
+    const clip = lib.clips.get(fp);
+    if (!clip || !clip.samples || clip.samples.length === 0) return 0;
+    triggerWavDownload(clip.displayName || clip.name, clip.samples, clip.sampleRate || 48000);
+    return 1;
+  },
+  ov_lib_share_entry: (pPtr, pLen, nPtr, nLen) => {
+    const parentRel = cleanRel(readStr(pPtr, pLen));
+    const name = readStr(nPtr, nLen);
+    const fp = `idb://${joinRel(parentRel, name)}`;
+    const clip = lib.clips.get(fp);
+    if (!clip || !clip.samples || clip.samples.length === 0) return 0;
+    const clean = (clip.displayName || clip.name || "prism-take").replace(/\.wav$/i, "") + ".wav";
+    const blob = encodeWav16(clip.samples, clip.sampleRate || 48000);
+    const file = new File([blob], clean, { type: "audio/wav" });
+    if (typeof navigator !== "undefined" && typeof navigator.share === "function") {
+      const canShareFiles = typeof navigator.canShare === "function" && navigator.canShare({ files: [file] });
+      if (canShareFiles) {
+        navigator.share({ title: clip.displayName || "Prism take", files: [file] }).catch((err) => {
+          if (err && err.name !== "AbortError") triggerWavDownload(clean, clip.samples, clip.sampleRate || 48000);
+        });
+        return 1;
+      }
+    }
+    triggerWavDownload(clean, clip.samples, clip.sampleRate || 48000);
+    return 1;
+  },
   ov_lib_save_wav: (dirPtr, dirLen, namePtr, nameLen, overwrite, samplesPtr, count, sr, score, outFn, fnCap, outFp, fpCap) => {
     const relDir = cleanRel(readStr(dirPtr, dirLen));
     if (relDir && !lib.folders.has(relDir)) {

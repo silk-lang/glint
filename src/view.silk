@@ -106,6 +106,7 @@ pub fn render(m: &Overtone, h: &Document<Message>) -> Node {
       h.onPointerUp(|_| Reply<Message>.Emit { message: Message.ExplorerPointerUp }),
     ],
     &[
+      h.box(&[h.class("w-full h-[2.5px] shrink-0 prism-top-ribbon")], &[]),
       renderTopBar(m, h),
       renderToolbar(m, h),
       renderErrorBanner(m, h),
@@ -180,7 +181,13 @@ fn renderTopBar(m: &Overtone, h: &Document<Message>) -> Node {
   return h.row(
     &[h.class(barPadCls)],
     &[
-      txt(h, "Glint", "text-[16px] leading-[20px] font-extrabold tracking-[-0.03em] text-[#0B0B0C] shrink-0"),
+      h.row(
+        &[h.class("items-center gap-[5px] shrink-0")],
+        &[
+          txt(h, "◈", "text-[15px] leading-[18px] prism-gem"),
+          txt(h, "Prism", "text-[16px] leading-[20px] font-extrabold tracking-[-0.03em] prism-wordmark"),
+        ],
+      ),
       h.row(
         &[h.class("items-center gap-[2px] text-[13px] font-medium shrink-0")],
         &[
@@ -341,31 +348,22 @@ fn renderToolbar(m: &Overtone, h: &Document<Message>) -> Node {
               txt(h, if m.playing && !m.playingRefOnly { "Pause" } else { "Play" }, "text-[12px] leading-[16px] text-[#0B0B0C]"),
             ],
           ),
-          h.row(
-            &[
-              h.class("items-center gap-[5px] h-[28px] px-[10px] rounded-[6px] border border-[#E6E6E8]"),
-              h.classSelect(m.playingRefOnly, "bg-[#F1F1F2] text-[#0B0B0C]", "bg-white text-[#0B0B0C] glint-btn-hover"),
-              h.classWhen(!m.refClip.active, "opacity-40"),
-              h.cursor(Cursor.Pointer),
-              h.onClick(Message.PlayReferenceOnce),
-            ],
-            &[
-              txt(h, "▷", "text-[10px] text-[#0B0B0C]"),
-              txt(h, "Ref", "text-[12px] leading-[16px] text-[#0B0B0C]"),
-            ],
-          ),
-          h.box(
-            &[
-              h.class("flex items-center gap-[5px] h-[28px] px-[9px] rounded-[6px]"),
-              h.classSelect(m.showVoicePreview, "bg-[#0E0E10] text-white", "text-[#2E7D96] hover:bg-[#2E7D96]/10"),
-              h.cursor(Cursor.Pointer),
-              h.onClick(Message.ToggleVoicePreview),
-            ],
-            &[
-              txt(h, "✦", if m.showVoicePreview { "text-[10px] text-white" } else { "text-[10px] text-[#2E7D96]" }),
-              txt(h, "Hear target", if m.showVoicePreview { "text-[12px] leading-[16px] font-medium text-white" } else { "text-[12px] leading-[16px] font-medium text-[#2E7D96]" }),
-            ],
-          ),
+          if !m.refClip.active {
+            h.box(
+              &[
+                h.class("flex items-center gap-[5px] h-[28px] px-[9px] rounded-[6px]"),
+                h.classSelect(m.showVoicePreview, "bg-[#0E0E10] text-white", "text-[#2E7D96] hover:bg-[#2E7D96]/10"),
+                h.cursor(Cursor.Pointer),
+                h.onClick(Message.ToggleVoicePreview),
+              ],
+              &[
+                txt(h, "✦", if m.showVoicePreview { "text-[10px] text-white" } else { "text-[10px] text-[#2E7D96]" }),
+                txt(h, "Hear target", if m.showVoicePreview { "text-[12px] leading-[16px] font-medium text-white" } else { "text-[12px] leading-[16px] font-medium text-[#2E7D96]" }),
+              ],
+            )
+          } else {
+            h.empty()
+          },
           h.box(
             &[
               h.class("flex items-center h-[28px] px-[9px] rounded-[6px]"),
@@ -410,22 +408,6 @@ fn renderToolbar(m: &Overtone, h: &Document<Message>) -> Node {
           overlayPill(h, "Contours", m.showMetricsLane, Message.ToggleMetricsLane),
           overlayPill(h, "Grid", m.showNoteGrid, Message.ToggleNoteGrid),
           overlayPill(h, if guideCount > 0 { "Guides ·" } else { "Guides" }, m.showGuidesPanel || guideCount > 0, Message.ToggleGuidesPanel),
-          overlayPill(h, "DTW", m.useDtwAlign, Message.ToggleDtwAlign),
-          if m.refClip.active {
-            overlayPill(h, "Heatmap", m.showHeatmap, Message.ToggleHeatmap)
-          } else {
-            h.empty()
-          },
-          if m.refClip.active {
-            overlayPill(h, "Ref wave", m.showRefWave, Message.ToggleRefWave)
-          } else {
-            h.empty()
-          },
-          if m.refClip.active {
-            overlayPill(h, "On ref", m.plotOnRef, Message.TogglePlotOnRef)
-          } else {
-            h.empty()
-          },
         ],
       ),
       h.box(&[h.class("flex-1")], &[]),
@@ -719,27 +701,43 @@ fn renderLibraryRail(m: &Overtone, h: &Document<Message>) -> Node {
         ],
       ),
       if m.refClip.active {
-        h.row(
-          &[h.class("items-center gap-[8px] px-[14px] py-[6px] bg-[#0E0E10] shrink-0")],
+        h.column(
+          &[h.class("px-[12px] py-[8px] gap-[7px] bg-[#0E0E10] shrink-0")],
           &[
-            txt(h, "REF", "glint-mono text-[9px] leading-[12px] tracking-[0.08em] text-[#9A9AA2] shrink-0"),
-            txtA(
-              h,
-              String.view(&m.refClip.name),
+            h.row(
+              &[h.class("items-center gap-[7px]")],
               &[
-                h.class("flex-1 text-[12px] leading-[16px] font-semibold text-white truncate"),
-                h.cursor(Cursor.Pointer),
-                h.onClick(Message.PlayReferenceOnce),
+                txt(h, "REF", "glint-mono text-[9px] leading-[12px] tracking-[0.08em] text-[#5BCEFA] shrink-0"),
+                txtA(
+                  h,
+                  String.view(&m.refClip.name),
+                  &[
+                    h.class("flex-1 text-[12px] leading-[16px] font-semibold text-white truncate"),
+                    h.cursor(Cursor.Pointer),
+                    h.onClick(Message.PlayReferenceOnce),
+                  ],
+                ),
+                txt(h, String.view(&m.readoutRefDuration), "glint-mono text-[10px] leading-[12px] text-[#9A9AA2] shrink-0"),
+                txtA(
+                  h,
+                  "×",
+                  &[
+                    h.class("text-[13px] leading-[14px] text-[#9A9AA2] hover:text-white px-[2px] shrink-0"),
+                    h.cursor(Cursor.Pointer),
+                    h.onClick(Message.ClearReference),
+                  ],
+                ),
               ],
             ),
-            txt(h, String.view(&m.readoutRefDuration), "glint-mono text-[10px] leading-[12px] text-[#9A9AA2] shrink-0"),
-            txtA(
-              h,
-              "×",
+            h.row(
+              &[h.class("items-center flex-wrap gap-[4px]")],
               &[
-                h.class("text-[13px] leading-[14px] text-[#9A9AA2] hover:text-white px-[2px] shrink-0"),
-                h.cursor(Cursor.Pointer),
-                h.onClick(Message.ClearReference),
+                refDarkPill(h, if m.playingRefOnly { "❚❚ Ref" } else { "▶ Play" }, m.playingRefOnly, false, Message.PlayReferenceOnce),
+                refDarkPill(h, "✦ Target", m.showVoicePreview, true, Message.ToggleVoicePreview),
+                refDarkPill(h, "DTW", m.useDtwAlign, false, Message.ToggleDtwAlign),
+                refDarkPill(h, "Heat", m.showHeatmap, false, Message.ToggleHeatmap),
+                refDarkPill(h, "Wave", m.showRefWave, false, Message.ToggleRefWave),
+                refDarkPill(h, "On ref", m.plotOnRef, false, Message.TogglePlotOnRef),
               ],
             ),
           ],
@@ -933,6 +931,28 @@ fn railHeaderBtn(h: &Document<Message>, label: string, active: bool, msg: Messag
   )
 }
 
+fn refDarkPill(h: &Document<Message>, label: string, active: bool, accent: bool, msg: Message) -> Node {
+  let cls = if active {
+    if accent {
+      "px-[6px] py-[2px] rounded-[4px] bg-[#5BCEFA] text-[#0B0B0C] font-semibold"
+    } else {
+      "px-[6px] py-[2px] rounded-[4px] bg-white/20 text-white font-medium"
+    }
+  } else if accent {
+    "px-[6px] py-[2px] rounded-[4px] bg-white/10 text-[#5BCEFA] hover:bg-white/20 font-medium"
+  } else {
+    "px-[6px] py-[2px] rounded-[4px] bg-white/5 text-[#B4B4BC] hover:bg-white/15 hover:text-white"
+  }
+  return h.box(
+    &[
+      h.class(cls),
+      h.cursor(Cursor.Pointer),
+      h.onClick(move msg),
+    ],
+    &[txt(h, label, "text-[10px] leading-[13px]")],
+  )
+}
+
 fn starBtn(h: &Document<Message>, m: &Overtone, r: i32) -> Node {
   let active = m.activeItemRating >= r
   let nextVal = if m.activeItemRating == r { 0 } else { r }
@@ -1000,7 +1020,7 @@ fn renderExplorerRow(m: &Overtone, h: &Document<Message>, idx: usize, topY: f32)
       &[
         h.class("absolute left-0 right-0 h-[26px] items-center gap-[6px] pr-[12px] glint-btn-hover"),
         h.classSelect(selectedFolder, "font-semibold text-[#0B0B0C]", "text-[#6B6B70]"),
-        h.classWhen(isDropTarget, "border-t-2 border-t-[#0E0E10] bg-[#F1F1F2]"),
+        h.classWhen(isDropTarget, "bg-[#5BCEFA]/20 border border-[#5BCEFA] rounded-[4px]"),
         h.style(&[css.top(px(topY)), css.paddingLeft(px(indentPx))]),
         h.cursor(Cursor.Pointer),
         h.onLayout(|r| Message.ExplorerRowLayout { idx: idx, rect: r }),
@@ -1129,7 +1149,6 @@ fn scriptPresetBtn(h: &Document<Message>, label: string, msg: Message) -> Node {
 fn renderSpectrogramWell(m: &Overtone, h: &Document<Message>) -> Node {
   let onRef = m.isPlottingOnRef()
   let sw = f32.max(1.0, m.specRect.width())
-  let sh = f32.max(1.0, m.specRect.height())
 
   // Selection overlay coordinates
   let selLo = f64.min(m.selStart, m.selEnd)
@@ -1153,8 +1172,6 @@ fn renderSpectrogramWell(m: &Overtone, h: &Document<Message>) -> Node {
   let ovPlayPct = f64.toF32(f64.max(0.0, f64.min(1.0, m.cursorSec / ovDur))) * 100.0
 
   // Hover readout pill position
-  let hoverPillX = if m.hoverX > sw - 160.0 { f32.max(8.0, m.hoverX - 150.0) } else { m.hoverX + 10.0 }
-  let hoverPillY = f32.max(40.0, f32.min(sh - 44.0, m.hoverY - 14.0))
 
   // Spectrogram opacity dimming scrim
   let dimAlpha: f32 = if !m.showSpectrogram { 1.0 } else { f32.max(0.0, f32.min(1.0, 1.0 - m.specOpacity)) }
@@ -1364,10 +1381,9 @@ fn renderSpectrogramWell(m: &Overtone, h: &Document<Message>) -> Node {
                     h.box(&[h.class("absolute left-0 right-0 h-[1px] bg-white/20"), h.style(&[css.top(px(m.hoverY))])], &[]),
                     h.box(
                       &[
-                        h.class("absolute px-[7px] py-[4px] rounded-[4px] bg-white shadow-sm"),
-                        h.style(&[css.left(px(hoverPillX)), css.top(px(hoverPillY))]),
+                        h.class("absolute right-[10px] bottom-[8px] px-[8px] py-[4px] rounded-[5px] bg-[#0E0E10]/90 border border-white/15 shadow-sm"),
                       ],
-                      &[txt(h, String.view(&m.hoverReadout), "glint-mono text-[10px] leading-[12px] text-[#0B0B0C]")],
+                      &[txt(h, String.view(&m.hoverReadout), "glint-mono text-[10px] leading-[12px] text-white")],
                     ),
                   ],
                 )
