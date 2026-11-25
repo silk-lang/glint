@@ -18,6 +18,7 @@ import formants {
   FormantFrame,
   VOWELS_FEM,
   VOWELS_MASC,
+  estimateVowelForResonance,
   lpcEnvelopeDb,
   vowelLandmarkAt
 }
@@ -512,22 +513,33 @@ effect fn drawFormantBand(
   width: f32,
   height: f32,
   color: Rgba<f32>,
+  faded: bool,
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  // Draw tracked voiced formant contours as smooth anti-aliased ribbons (dark halo + crisp stroke)
-  // instead of scattered raw dots!
-  let haloCol = Rgba<f32> { r: 0.04, g: 0.04, b: 0.05, a: 0.52 }
-  let strokeW: f32 = if which == 0 { 2.2 } else if which == 1 { 2.1 } else { 1.7 }
-  let haloW: f32 = strokeW + 2.0
+  // Draw tracked voiced formant contours as smooth anti-aliased ribbons (dark halo + crisp stroke).
+  // When `faded` is true (Reference's own formants in On-ref mode), draw softened dashed ribbons so
+  // YOUR aligned solid ribbons stand out cleanly on top.
+  let haloCol = Rgba<f32> { r: 0.04, g: 0.04, b: 0.05, a: if faded { 0.22 } else { 0.52 } }
+  let mainCol = if faded {
+    Rgba<f32> { r: color.r, g: color.g, b: color.b, a: color.a * 0.48 }
+  } else {
+    color
+  }
+  let baseW: f32 = if which == 0 { 2.2 } else if which == 1 { 2.1 } else { 1.7 }
+  let strokeW: f32 = if faded { baseW * 0.80 } else { baseW }
+  let haloPad: f32 = if faded { 1.4 } else { 2.0 }
+  let haloW: f32 = strokeW + haloPad
 
   // Pass 0: dark halo backing, Pass 1: crisp formant ribbon
   let mut pass: usize = 0
   while pass < 2 {
     let mut inRun = false
-    let mut runPts: usize = 0
+    let mut prevX: f32 = 0.0
+    let mut prevY: f32 = 0.0
     let mut prevHz: f64 = 0.0
     let mut prevT: f64 = 0.0
+    let mut segIdx: usize = 0
     let mut drewAny = false
     let mut i: usize = 0
     while i < frames.length {
@@ -541,20 +553,32 @@ effect fn drawFormantBand(
         && fr.time <= vp.t1 + 0.08
       if !ok || (inRun && ((fr.time - prevT) > 0.055 || semitonesBetween(prevHz, hz) > 7.5)) {
         inRun = false
-        runPts = 0
+        segIdx = 0
       }
       if ok {
         let x = xOfTime(vp, fr.time, width)
         let y = yOfFreq(vp, hz, height)
         if !inRun {
-          run cmds.append(CanvasCommand.MoveTo { x: x, y: y })
+          if !faded {
+            run cmds.append(CanvasCommand.MoveTo { x: x, y: y })
+          }
           inRun = true
-          runPts = 1
+          segIdx = 0
         } else {
-          run cmds.append(CanvasCommand.LineTo { x: x, y: y })
-          runPts = runPts + 1
-          drewAny = true
+          if faded {
+            if (segIdx % 3) != 2 {
+              run cmds.append(CanvasCommand.MoveTo { x: prevX, y: prevY })
+              run cmds.append(CanvasCommand.LineTo { x: x, y: y })
+              drewAny = true
+            }
+            segIdx = segIdx + 1
+          } else {
+            run cmds.append(CanvasCommand.LineTo { x: x, y: y })
+            drewAny = true
+          }
         }
+        prevX = x
+        prevY = y
         prevHz = hz
         prevT = fr.time
       }
@@ -562,7 +586,7 @@ effect fn drawFormantBand(
     }
     if drewAny {
       run cmds.append(CanvasCommand.Stroke {
-        color: if pass == 0 { haloCol } else { color },
+        color: if pass == 0 { haloCol } else { mainCol },
         width: if pass == 0 { haloW } else { strokeW },
       })
     }
@@ -666,30 +690,88 @@ effect fn drawAlignedSolidPitch(
   }
 }
 
+effect fn drawAlignedFormantBand(
+  cmds: &mut List<CanvasCommand>,
+  aligned: &[AlignedRefPoint],
+  which: usize,
+  vp: &Viewport,
+  width: f32,
+  height: f32,
+  color: Rgba<f32>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  // Render DTW-aligned take formants as the exact same smooth haloed ribbons as `drawFormantBand`!
+  let haloCol = Rgba<f32> { r: 0.04, g: 0.04, b: 0.05, a: 0.58 }
+  let strokeW: f32 = if which == 0 { 2.3 } else if which == 1 { 2.2 } else { 1.8 }
+  let haloW: f32 = strokeW + 2.2
+
+  let mut pass: usize = 0
+  while pass < 2 {
+    let mut inRun = false
+    let mut prevHz: f64 = 0.0
+    let mut prevT: f64 = 0.0
+    let mut drewAny = false
+    let mut i: usize = 0
+    while i < aligned.length {
+      let pt = aligned[i]
+      let hz = if which == 0 { pt.f1 } else if which == 1 { pt.f2 } else if which == 2 { pt.f3 } else { pt.f4 }
+      let ok = pt.voiced
+        && pt.hasFormants
+        && hz > 100.0
+        && hz >= vp.f0
+        && hz <= vp.f1
+        && pt.time >= vp.t0 - 0.10
+        && pt.time <= vp.t1 + 0.10
+      if !ok || (inRun && ((pt.time - prevT) > 0.12 || semitonesBetween(prevHz, hz) > 7.5)) {
+        inRun = false
+      }
+      if ok {
+        let x = xOfTime(vp, pt.time, width)
+        let y = yOfFreq(vp, hz, height)
+        if !inRun {
+          run cmds.append(CanvasCommand.MoveTo { x: x, y: y })
+          inRun = true
+        } else {
+          run cmds.append(CanvasCommand.LineTo { x: x, y: y })
+          drewAny = true
+        }
+        prevHz = hz
+        prevT = pt.time
+      }
+      i = i + 1
+    }
+    if drewAny {
+      run cmds.append(CanvasCommand.Stroke {
+        color: if pass == 0 { haloCol } else { color },
+        width: if pass == 0 { haloW } else { strokeW },
+      })
+    }
+    pass = pass + 1
+  }
+}
+
 effect fn drawAlignedFormants(
   cmds: &mut List<CanvasCommand>,
   aligned: &[AlignedRefPoint],
   vp: &Viewport,
   width: f32,
   height: f32,
+  mask: u32,
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  let mut i: usize = 0
-  while i < aligned.length {
-    let pt = aligned[i]
-    if pt.voiced && pt.hasFormants && pt.time >= vp.t0 && pt.time <= vp.t1 {
-      let x = xOfTime(vp, pt.time, width)
-      if pt.f1 >= vp.f0 && pt.f1 <= vp.f1 {
-        let y1 = yOfFreq(vp, pt.f1, height)
-        run cmds.append(CanvasCommand.FillRect { x: x - 2.6, y: y1 - 2.6, width: 5.2, height: 5.2, radius: 1.0, color: COL_F1 })
-      }
-      if pt.f2 >= vp.f0 && pt.f2 <= vp.f1 {
-        let y2 = yOfFreq(vp, pt.f2, height)
-        run cmds.append(CanvasCommand.FillRect { x: x - 2.6, y: y2 - 2.6, width: 5.2, height: 5.2, radius: 1.0, color: COL_F2 })
-      }
-    }
-    i = i + 1
+  if (mask & 1) != 0 {
+    run drawAlignedFormantBand(&mut cmds, aligned, 0, vp, width, height, COL_F1)
+  }
+  if (mask & 2) != 0 {
+    run drawAlignedFormantBand(&mut cmds, aligned, 1, vp, width, height, COL_F2)
+  }
+  if (mask & 4) != 0 {
+    run drawAlignedFormantBand(&mut cmds, aligned, 2, vp, width, height, COL_F3)
+  }
+  if (mask & 8) != 0 {
+    run drawAlignedFormantBand(&mut cmds, aligned, 3, vp, width, height, COL_F4)
   }
 }
 
@@ -1148,19 +1230,21 @@ pub effect fn buildSpectrogramOverlay(
     g = g + 1
   }
 
-  // 4. Viterbi-tracked Formant ribbons (F1 coral, F2 gold, F3 cyan, F4 violet — individually selectable)
+  // 4. Viterbi-tracked Formant ribbons (F1 coral, F2 gold, F3 cyan, F4 violet — individually selectable).
+  // In On-ref mode, Reference's formants render as softened dashed ribbons so YOUR solid aligned ribbons pop on top!
   if opts.showFormants && formantFrames.length > 0 {
+    let fadeBase = opts.plotOnRef && alignedRef.length > 0
     if (opts.formantMask & 1) != 0 {
-      run drawFormantBand(&mut cmds, formantFrames, 0, vp, width, height, COL_F1)
+      run drawFormantBand(&mut cmds, formantFrames, 0, vp, width, height, COL_F1, fadeBase)
     }
     if (opts.formantMask & 2) != 0 {
-      run drawFormantBand(&mut cmds, formantFrames, 1, vp, width, height, COL_F2)
+      run drawFormantBand(&mut cmds, formantFrames, 1, vp, width, height, COL_F2, fadeBase)
     }
     if (opts.formantMask & 4) != 0 {
-      run drawFormantBand(&mut cmds, formantFrames, 2, vp, width, height, COL_F3)
+      run drawFormantBand(&mut cmds, formantFrames, 2, vp, width, height, COL_F3, fadeBase)
     }
     if (opts.formantMask & 8) != 0 {
-      run drawFormantBand(&mut cmds, formantFrames, 3, vp, width, height, COL_F4)
+      run drawFormantBand(&mut cmds, formantFrames, 3, vp, width, height, COL_F4, fadeBase)
     }
   }
 
@@ -1171,10 +1255,10 @@ pub effect fn buildSpectrogramOverlay(
     run drawPitchRuns(&mut cmds, pitchFrames, vp, width, height, opts.displayClarity, 4.0, COL_HARMONIC, 0.8)
   }
 
-  // 5b & 6: Pitch contours (either Take base + Ref dashed ghost, OR Ref base + YOUR voice plotted on top!)
+  // 5b & 6: Pitch & aligned Formant contours (either Take base + Ref dashed ghost, OR Ref base + YOUR voice plotted on top!)
   if opts.plotOnRef {
     if opts.showFormants && alignedRef.length > 0 {
-      run drawAlignedFormants(&mut cmds, alignedRef, vp, width, height)
+      run drawAlignedFormants(&mut cmds, alignedRef, vp, width, height, opts.formantMask)
     }
     if opts.showPitch && pitchFrames.length > 1 {
       run drawPitchRuns(&mut cmds, pitchFrames, vp, width, height, opts.displayClarity, 1.0, COL_REF, 1.8)
@@ -2488,6 +2572,313 @@ pub effect fn buildPitchContourLaneDrawing(
   }
 
   return run Drawing.make(move cmds)
+}
+
+// ============================================================================
+// Time-Synced Vowel Shape Lane (Frontness F2 + Height F1 over time + IPA badges)
+// ============================================================================
+
+fn f2ToFrontNorm(f2: f64) -> f64 {
+  let lo = f64.log2(700.0)
+  let hi = f64.log2(2700.0)
+  let cur = f64.log2(f64.max(600.0, f64.min(3200.0, f2)))
+  return f64.max(0.0, f64.min(1.0, (cur - lo) / (hi - lo)))
+}
+
+fn f1ToHeightNorm(f1: f64) -> f64 {
+  // Inverted F1: 240 Hz (close /i/ /u/) -> 1.0 (top), 950 Hz (open /ɑ/ /æ/) -> 0.0 (bottom)
+  let lo = f64.log2(240.0)
+  let hi = f64.log2(950.0)
+  let cur = f64.log2(f64.max(200.0, f64.min(1100.0, f1)))
+  return f64.max(0.0, f64.min(1.0, 1.0 - (cur - lo) / (hi - lo)))
+}
+
+pub effect fn buildVowelLaneDrawing(
+  vp: &Viewport,
+  width: f32,
+  height: f32,
+  voiceFrames: &[VoiceFrame],
+  alignedRef: &[AlignedRefPoint],
+  showRef: bool,
+  plotOnRef: bool,
+) -> Drawing
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut cmds = List<CanvasCommand>.make()
+  if width <= 4.0 || height <= 4.0 {
+    return run Drawing.make(move cmds)
+  }
+
+  // Glint light card background (#F7F7F8)
+  run cmds.append(
+    CanvasCommand.FillRect {
+      x: 0.0,
+      y: 0.0,
+      width: width,
+      height: height,
+      radius: 4.0,
+      color: Rgba<f32> { r: 0.969, g: 0.969, b: 0.973, a: 1.0 },
+    },
+  )
+
+  let padTop: f32 = 16.0
+  let padBot: f32 = 5.0
+  let usableH = f32.max(4.0, height - padTop - padBot)
+
+  // Subtle horizontal reference grid (25%, 50%, 75%)
+  let mut g: usize = 1
+  while g < 4 {
+    let gy = padTop + usableH * usize.toF32(g) * 0.25
+    run cmds.append(
+      CanvasCommand.FillRect {
+        x: 0.0,
+        y: gy,
+        width: width,
+        height: 1.0,
+        radius: 0.0,
+        color: Rgba<f32> { r: 0.902, g: 0.902, b: 0.910, a: if g == 2 { 1.0 } else { 0.55 } },
+      },
+    )
+    g = g + 1
+  }
+
+  let frontCol = if plotOnRef { Rgba<f32> { r: 0.180, g: 0.490, b: 0.588, a: 0.55 } } else { COL_INK }
+  let heightCol = if plotOnRef {
+    Rgba<f32> { r: 0.851, g: 0.294, b: 0.220, a: 0.42 }
+  } else {
+    Rgba<f32> { r: 0.851, g: 0.294, b: 0.220, a: 0.92 }
+  }
+
+  // 1. Base clip contours: Height (F1 inverted, coral) & Frontness (F2, ink)
+  if voiceFrames.length > 1 {
+    // Height (F1)
+    let mut inRun = false
+    let mut prevT: f64 = 0.0
+    let mut drewH = false
+    let mut i: usize = 0
+    while i < voiceFrames.length {
+      let fr = voiceFrames[i]
+      let ok = fr.voiced && fr.hasFormants && fr.f1 > 160.0 && fr.time >= vp.t0 - 0.1 && fr.time <= vp.t1 + 0.1
+      if !ok || (inRun && (fr.time - prevT) > 0.12) {
+        inRun = false
+      }
+      if ok {
+        let x = xOfTime(vp, fr.time, width)
+        let y = padTop + (1.0 - f64.toF32(f1ToHeightNorm(fr.f1))) * usableH
+        if !inRun {
+          run cmds.append(CanvasCommand.MoveTo { x: x, y: y })
+          inRun = true
+        } else {
+          run cmds.append(CanvasCommand.LineTo { x: x, y: y })
+          drewH = true
+        }
+        prevT = fr.time
+      }
+      i = i + 1
+    }
+    if drewH {
+      run cmds.append(CanvasCommand.Stroke { color: heightCol, width: if plotOnRef { 1.4 } else { 1.9 } })
+    }
+
+    // Frontness (F2)
+    inRun = false
+    prevT = 0.0
+    let mut drewF = false
+    i = 0
+    while i < voiceFrames.length {
+      let fr = voiceFrames[i]
+      let ok = fr.voiced && fr.hasFormants && fr.f2 > fr.f1 + 100.0 && fr.time >= vp.t0 - 0.1 && fr.time <= vp.t1 + 0.1
+      if !ok || (inRun && (fr.time - prevT) > 0.12) {
+        inRun = false
+      }
+      if ok {
+        let x = xOfTime(vp, fr.time, width)
+        let y = padTop + (1.0 - f64.toF32(f2ToFrontNorm(fr.f2))) * usableH
+        if !inRun {
+          run cmds.append(CanvasCommand.MoveTo { x: x, y: y })
+          inRun = true
+        } else {
+          run cmds.append(CanvasCommand.LineTo { x: x, y: y })
+          drewF = true
+        }
+        prevT = fr.time
+      }
+      i = i + 1
+    }
+    if drewF {
+      run cmds.append(CanvasCommand.Stroke { color: frontCol, width: if plotOnRef { 1.5 } else { 2.1 } })
+    }
+  }
+
+  // 2. DTW-aligned Reference (or Your take when On-ref) Frontness & Height curves
+  if showRef && alignedRef.length > 1 {
+    let refFrontCol = if plotOnRef { COL_INK } else { COL_REF_TEAL }
+    let refHeightCol = if plotOnRef {
+      Rgba<f32> { r: 0.851, g: 0.294, b: 0.220, a: 0.92 }
+    } else {
+      Rgba<f32> { r: 0.180, g: 0.490, b: 0.588, a: 0.55 }
+    }
+
+    // Aligned Height (F1)
+    let mut hasPrev = false
+    let mut prevX: f32 = 0.0
+    let mut prevY: f32 = 0.0
+    let mut prevT: f64 = 0.0
+    let mut seg: usize = 0
+    let mut drewAH = false
+    let mut i: usize = 0
+    while i < alignedRef.length {
+      let pt = alignedRef[i]
+      let ok = pt.voiced && pt.hasFormants && pt.f1 > 160.0 && pt.time >= vp.t0 - 0.1 && pt.time <= vp.t1 + 0.1
+      if !ok {
+        hasPrev = false
+      } else {
+        let x = xOfTime(vp, pt.time, width)
+        let y = padTop + (1.0 - f64.toF32(f1ToHeightNorm(pt.f1))) * usableH
+        if hasPrev && (pt.time - prevT) < 0.16 {
+          if plotOnRef || (seg % 3) != 2 {
+            run cmds.append(CanvasCommand.MoveTo { x: prevX, y: prevY })
+            run cmds.append(CanvasCommand.LineTo { x: x, y: y })
+            drewAH = true
+          }
+          seg = seg + 1
+        } else {
+          seg = 0
+        }
+        prevX = x
+        prevY = y
+        prevT = pt.time
+        hasPrev = true
+      }
+      i = i + 1
+    }
+    if drewAH {
+      run cmds.append(CanvasCommand.Stroke { color: refHeightCol, width: if plotOnRef { 1.9 } else { 1.4 } })
+    }
+
+    // Aligned Frontness (F2)
+    hasPrev = false
+    seg = 0
+    let mut drewAF = false
+    i = 0
+    while i < alignedRef.length {
+      let pt = alignedRef[i]
+      let ok = pt.voiced && pt.hasFormants && pt.f2 > pt.f1 + 100.0 && pt.time >= vp.t0 - 0.1 && pt.time <= vp.t1 + 0.1
+      if !ok {
+        hasPrev = false
+      } else {
+        let x = xOfTime(vp, pt.time, width)
+        let y = padTop + (1.0 - f64.toF32(f2ToFrontNorm(pt.f2))) * usableH
+        if hasPrev && (pt.time - prevT) < 0.16 {
+          if plotOnRef || (seg % 3) != 2 {
+            run cmds.append(CanvasCommand.MoveTo { x: prevX, y: prevY })
+            run cmds.append(CanvasCommand.LineTo { x: x, y: y })
+            drewAF = true
+          }
+          seg = seg + 1
+        } else {
+          seg = 0
+        }
+        prevX = x
+        prevY = y
+        prevT = pt.time
+        hasPrev = true
+      }
+      i = i + 1
+    }
+    if drewAF {
+      run cmds.append(CanvasCommand.Stroke { color: refFrontCol, width: if plotOnRef { 2.1 } else { 1.6 } })
+    }
+  }
+
+  return run Drawing.make(move cmds)
+}
+
+/// Computes time-positioned IPA vowel labels along the Vowels contour lane.
+/// Uses detected vowel spans when available (falling back to acoustic F1/F2 classification
+/// at the active resonance setting whenever neural phoneme labels aren't present).
+pub effect fn computeVowelLaneBadges(
+  spans: &[VowelSpan],
+  voiceFrames: &[VoiceFrame],
+  vp: &Viewport,
+  width: f32,
+  vowelResonance: f32,
+) -> List<VowelBadge>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<VowelBadge>.make()
+  if width <= 20.0 {
+    return move out
+  }
+  let res = f32.toF64(vowelResonance)
+  let mut lastRight: f32 = -100.0
+  if spans.length > 0 {
+    let mut i: usize = 0
+    while i < spans.length {
+      let sp = &spans[i]
+      if sp.t1 >= vp.t0 && sp.t0 <= vp.t1 {
+        let x0 = f32.max(0.0, f32.min(width, xOfTime(vp, sp.t0, width)))
+        let x1 = f32.max(0.0, f32.min(width, xOfTime(vp, sp.t1, width)))
+        let w = x1 - x0
+        if w >= 5.0 && x0 >= lastRight + 2.0 && x0 <= width - 16.0 {
+          let rawLbl = String.view(&sp.label)
+          let mut lbl = String.make()
+          if String.byteLength(rawLbl) > 0 {
+            lbl = run String.copy(rawLbl)
+          } else {
+            // Compute mean F1/F2 inside the vowel span core to estimate IPA at current resonance
+            let dur = sp.t1 - sp.t0
+            let margin = f64.min(0.015, dur * 0.18)
+            let lo = sp.t0 + margin
+            let hi = sp.t1 - margin
+            let mut sumF1 = 0.0
+            let mut sumF2 = 0.0
+            let mut cnt: usize = 0
+            let mut k: usize = 0
+            while k < voiceFrames.length {
+              let vf = voiceFrames[k]
+              if vf.time >= lo && vf.time <= hi && vf.voiced && vf.hasFormants && vf.f1 > 160.0 && vf.f2 > vf.f1 + 100.0 {
+                sumF1 = sumF1 + vf.f1
+                sumF2 = sumF2 + vf.f2
+                cnt = cnt + 1
+              }
+              k = k + 1
+            }
+            if cnt > 0 {
+              let est = estimateVowelForResonance(sumF1 / usize.toF64(cnt), sumF2 / usize.toF64(cnt), res)
+              if est != "—" {
+                lbl = run String.copy(est)
+              }
+            }
+          }
+          if String.byteLength(String.view(&lbl)) > 0 {
+            let pillW = f32.max(16.0, w)
+            run out.append(VowelBadge { idx: i, x: x0, w: pillW, hasLabel: true, label: move lbl })
+            lastRight = x0 + pillW
+          }
+        }
+      }
+      i = i + 1
+    }
+  } else if voiceFrames.length > 0 {
+    // Fallback when spans aren't populated yet: sample voiced formant segments directly
+    let mut i: usize = 0
+    while i < voiceFrames.length {
+      let vf = voiceFrames[i]
+      if vf.voiced && vf.hasFormants && vf.f1 > 160.0 && vf.f2 > vf.f1 + 100.0 && vf.time >= vp.t0 && vf.time <= vp.t1 {
+        let x = xOfTime(vp, vf.time, width)
+        if x >= lastRight + 24.0 && x <= width - 18.0 {
+          let est = estimateVowelForResonance(vf.f1, vf.f2, res)
+          if est != "—" {
+            run out.append(VowelBadge { idx: i, x: x, w: 18.0, hasLabel: true, label: run String.copy(est) })
+            lastRight = x + 18.0
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  return move out
 }
 
 // ============================================================================

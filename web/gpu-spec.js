@@ -683,7 +683,14 @@ export class WebGLSpectrogram {
 
   // Live microphone rolling tier (used ONLY while actively recording)
   allocTier(tier, w, h) {
-    if (!this.gl || tier !== 1) return;
+    if (!this.gl) return;
+    if (tier === 0) {
+      // Starting a new recording or blank document: drop the previous full-clip GPU texture immediately!
+      this.fullValid = false;
+      this.fullDur = 0;
+      return;
+    }
+    if (tier !== 1) return;
     const gl = this.gl;
     gl.bindTexture(gl.TEXTURE_2D, this.liveTex);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);

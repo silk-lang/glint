@@ -86,12 +86,14 @@ import overlays {
   buildSpectrogramOverlay,
   buildSpectrumSliceDrawing,
   buildVowelChartDrawing,
+  buildVowelLaneDrawing,
   buildWaveformOverview,
   computeFreqTicks,
   computeGuideBadges,
   computeTimeTicks,
   computeVowelBadges,
   computeVowelChartDots,
+  computeVowelLaneBadges,
   vowelF1OfY,
   vowelF2OfX,
   formatCents,
@@ -253,6 +255,11 @@ pub const FILTER_STARRED: u32 = 1
 pub const LISTEN_YOU: u32 = 0
 pub const LISTEN_REF: u32 = 1
 pub const LISTEN_BOTH: u32 = 2
+
+// Bottom time-synced contour lane tabs
+pub const LANE_PITCH: u32 = 0
+pub const LANE_SIZE_WEIGHT: u32 = 1
+pub const LANE_VOWELS: u32 = 2
 
 pub const LIB_W: f32 = 232.0
 pub const INIT_SPEC_W: f32 = 844.0
@@ -434,7 +441,7 @@ pub union Message {
   SetHeatmapMetric { pub metric: u32 },
   ToggleFormantBit { pub bit: u32 },
   SetFormantMask { pub mask: u32 },
-  SetBottomLaneTab { pub pitch: bool },
+  SetBottomLaneTab { pub tab: u32 },
   ToggleNeural,
   NeuralReady { pub jobId: i32, pub isRef: bool, pub hasPitch: bool, pub hasFormants: bool },
   NeuralStatus { pub flags: i32 },
@@ -630,7 +637,7 @@ pub struct Overtone {
   pub formantMask: u32,
   pub showHeatmap: bool,
   pub heatmapMetric: u32,
-  pub showPitchLaneTab: bool,
+  pub bottomLaneTab: u32,
 
   // IDE-style Explorer Tree (~/Documents/Overtone Library/)
   pub expandedDirs: List<String>,
@@ -760,6 +767,8 @@ pub struct Overtone {
   pub overlayDrawing: Drawing,
   pub metricsLaneDrawing: Drawing,
   pub pitchLaneDrawing: Drawing,
+  pub vowelLaneDrawing: Drawing,
+  pub vowelLaneBadges: List<VowelBadge>,
   pub pianoDrawing: Drawing,
   pub sizeWeightDrawing: Drawing,
   pub sliceDrawing: Drawing,
@@ -1022,7 +1031,7 @@ impl Overtone {
       formantMask: 7,
       showHeatmap: true,
       heatmapMetric: HEATMAP_OVERALL,
-      showPitchLaneTab: true,
+      bottomLaneTab: LANE_PITCH,
 
       expandedDirs: move expandedDirs,
       selectedFolderRel: String.make(),
@@ -1146,6 +1155,8 @@ impl Overtone {
       overlayDrawing: emptyDraw.clone(),
       metricsLaneDrawing: emptyDraw.clone(),
       pitchLaneDrawing: emptyDraw.clone(),
+      vowelLaneDrawing: emptyDraw.clone(),
+      vowelLaneBadges: List<VowelBadge>.make(),
       pianoDrawing: emptyDraw.clone(),
       sizeWeightDrawing: emptyDraw.clone(),
       sliceDrawing: emptyDraw.clone(),
@@ -5391,6 +5402,17 @@ impl Overtone {
       onRef,
       self.displayClarity,
     )
+    let activeVoiceFs = if onRef { self.refClip.voiceFrames.asSlice() } else { self.voiceMetrics.frames.asSlice() }
+    self.vowelLaneDrawing = run buildVowelLaneDrawing(
+      &self.vp,
+      sw,
+      METRICS_H,
+      activeVoiceFs,
+      if onRef { self.compare.takeOnRef.asSlice() } else { self.compare.points.asSlice() },
+      self.showRefOverlay && self.refClip.active,
+      onRef,
+    )
+    self.vowelLaneBadges = run computeVowelLaneBadges(activeVowels, activeVoiceFs, &self.vp, sw, self.vowelResonance)
     self.pianoDrawing = run buildPianoDrawing(&self.vp, PIANO_W, paneH, self.lastPianoMidi, self.lastPianoActive)
     self.freqTicks = run computeFreqTicks(&self.vp, paneH)
     self.timeTicks = run computeTimeTicks(&self.vp, sw)
@@ -5529,6 +5551,17 @@ impl Overtone {
       onRef,
       self.displayClarity,
     )
+    let activeVoiceFs = if onRef { self.refClip.voiceFrames.asSlice() } else { self.voiceMetrics.frames.asSlice() }
+    self.vowelLaneDrawing = run buildVowelLaneDrawing(
+      &self.vp,
+      sw,
+      METRICS_H,
+      activeVoiceFs,
+      if onRef { self.compare.takeOnRef.asSlice() } else { self.compare.points.asSlice() },
+      self.showRefOverlay && self.refClip.active,
+      onRef,
+    )
+    self.vowelLaneBadges = run computeVowelLaneBadges(activeVowels, activeVoiceFs, &self.vp, sw, self.vowelResonance)
     let rightPlotW = f32.max(180.0, self.readoutsWidth - 32.0)
     self.pianoDrawing = run buildPianoDrawing(&self.vp, PIANO_W, paneH, activeMidi, hasActivePitch)
     self.sizeWeightDrawing = run buildSizeWeightPadDrawing(
@@ -7928,8 +7961,8 @@ impl Overtone {
         run self.updateViewportDrawings()
       }
 
-      Message.SetBottomLaneTab { pitch } => {
-        self.showPitchLaneTab = pitch
+      Message.SetBottomLaneTab { tab } => {
+        self.bottomLaneTab = tab
       }
 
       Message.SetVowelResonance { value } => {

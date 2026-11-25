@@ -45,9 +45,11 @@ pub struct VoiceFrame {
   pub weightLightNorm: f64,
   /// Harmonics-to-Noise Ratio (dB) from Boersma autocorrelation peak.
   pub hnrDb: f64,
-  /// Formant snapshot for vowel cloud plotting.
+  /// Formant snapshot for vowel cloud & aligned formant ribbon plotting.
   pub f1: f64,
   pub f2: f64,
+  pub f3: f64,
+  pub f4: f64,
   pub hasFormants: bool,
 }
 
@@ -67,6 +69,8 @@ impl VoiceFrame {
       hnrDb: 0.0,
       f1: 0.0,
       f2: 0.0,
+      f3: 0.0,
+      f4: 0.0,
       hasFormants: false,
     }
   }
@@ -266,13 +270,17 @@ impl VoiceMetricsTrack {
         let mut vtlCm: f64 = 0.0
         let mut f1: f64 = 0.0
         let mut f2: f64 = 0.0
+        let mut f3: f64 = 0.0
+        let mut f4: f64 = 0.0
         let mut hasFormants = false
         if i < formantFrames.length {
           let ff = formantFrames[i]
           vtlCm = estimateVtlCm(ff)
-          if ff.count >= 2 && ff.f1 > 160.0 && ff.f2 > ff.f1 {
+          if ff.tracked && ff.count >= 2 && ff.f1 > 160.0 && ff.f2 > ff.f1 {
             f1 = ff.f1
             f2 = ff.f2
+            if ff.count >= 3 && ff.f3 > ff.f2 { f3 = ff.f3 }
+            if ff.count >= 4 && ff.f4 > ff.f3 { f4 = ff.f4 }
             hasFormants = true
           }
         }
@@ -298,6 +306,8 @@ impl VoiceMetricsTrack {
           hnrDb: hnrDb,
           f1: f1,
           f2: f2,
+          f3: f3,
+          f4: f4,
           hasFormants: hasFormants,
         })
       }

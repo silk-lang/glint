@@ -18,6 +18,9 @@ import studio {
   ISOLATE_CONSONANTS,
   ISOLATE_FULL,
   ISOLATE_VOWELS,
+  LANE_PITCH,
+  LANE_SIZE_WEIGHT,
+  LANE_VOWELS,
   LISTEN_BOTH,
   LISTEN_REF,
   LISTEN_YOU,
@@ -1490,7 +1493,7 @@ fn renderSpectrogramWell(m: &Overtone, h: &Document<Message>) -> Node {
           &[
             txt(h, "BASE · REF", "glint-mono text-[10px] leading-[12px] tracking-[0.06em] text-white shrink-0"),
             txt(h, String.view(&m.refClip.name), "glint-mono text-[10px] leading-[12px] text-[#9A9AA2] truncate max-w-[160px]"),
-            txt(h, "White line = your pitch, DTW-aligned", "text-[11px] leading-[14px] text-[#C8C8CC]"),
+            txt(h, "Solid ribbons = your voice (DTW-aligned) · Dashed = ref", "text-[11px] leading-[14px] text-[#C8C8CC]"),
             h.box(&[h.class("flex-1")], &[]),
             txtA(
               h,
@@ -1897,6 +1900,12 @@ fn renderSizeWeightLane(m: &Overtone, h: &Document<Message>) -> Node {
   let selR = f64.toF32(f64.max(0.0, f64.min(1.0, m.vp.timeToNormAt(selHi)))) * 100.0
   let selW = f32.max(0.0, selR - selL)
 
+  let lane = m.bottomLaneTab
+  let isPitch = lane == LANE_PITCH
+  let isSizeWt = lane == LANE_SIZE_WEIGHT
+  let isVowels = lane == LANE_VOWELS
+  let vBadges = m.vowelLaneBadges.asSlice()
+
   return h.column(
     &[h.class("shrink-0 gap-[4px]")],
     &[
@@ -1906,11 +1915,12 @@ fn renderSizeWeightLane(m: &Overtone, h: &Document<Message>) -> Node {
           h.row(
             &[h.class("items-center gap-[2px] p-[2px] rounded-[5px] bg-[#F1F1F2]")],
             &[
-              miniTabBtn(h, "Pitch contour", m.showPitchLaneTab, Message.SetBottomLaneTab { pitch: true }),
-              miniTabBtn(h, "Size & weight", !m.showPitchLaneTab, Message.SetBottomLaneTab { pitch: false }),
+              miniTabBtn(h, "Pitch contour", isPitch, Message.SetBottomLaneTab { tab: LANE_PITCH }),
+              miniTabBtn(h, "Size & weight", isSizeWt, Message.SetBottomLaneTab { tab: LANE_SIZE_WEIGHT }),
+              miniTabBtn(h, "Vowels", isVowels, Message.SetBottomLaneTab { tab: LANE_VOWELS }),
             ],
           ),
-          if m.showPitchLaneTab {
+          if isPitch {
             h.row(
               &[h.class("items-center gap-[10px]")],
               &[
@@ -1934,7 +1944,7 @@ fn renderSizeWeightLane(m: &Overtone, h: &Document<Message>) -> Node {
                 },
               ],
             )
-          } else {
+          } else if isSizeWt {
             h.row(
               &[h.class("items-center gap-[10px]")],
               &[
@@ -1965,9 +1975,40 @@ fn renderSizeWeightLane(m: &Overtone, h: &Document<Message>) -> Node {
                 },
               ],
             )
+          } else {
+            h.row(
+              &[h.class("items-center gap-[10px]")],
+              &[
+                h.row(
+                  &[h.class("items-center gap-[5px]")],
+                  &[
+                    h.box(&[h.class("w-[12px] h-[2px] bg-[#0B0B0C]")], &[]),
+                    h.text("Front (F2 ↑)"),
+                  ],
+                ),
+                h.row(
+                  &[h.class("items-center gap-[5px]")],
+                  &[
+                    h.box(&[h.class("w-[12px] h-[2px] bg-[#D94B38]")], &[]),
+                    h.text("Height (F1 ↓)"),
+                  ],
+                ),
+                if m.refClip.active {
+                  h.row(
+                    &[h.class("items-center gap-[5px]")],
+                    &[
+                      h.box(&[h.class("w-[12px] h-[1.5px] bg-[#2E7D96]")], &[]),
+                      txt(h, "Ref", "text-[#2E7D96]"),
+                    ],
+                  )
+                } else {
+                  h.empty()
+                },
+              ],
+            )
           },
           h.box(&[h.class("flex-1")], &[]),
-          h.text(if m.showPitchLaneTab { "Higher pitch ↑" } else { "Small / light ↑" }),
+          h.text(if isPitch { "Higher pitch ↑" } else if isSizeWt { "Small / light ↑" } else { "Front / close ↑" }),
         ],
       ),
       h.row(
@@ -1976,8 +2017,8 @@ fn renderSizeWeightLane(m: &Overtone, h: &Document<Message>) -> Node {
           h.column(
             &[h.class("w-[46px] shrink-0 justify-between items-end pr-[8px] py-[4px] text-[10px] leading-[12px] text-[#9A9AA0]")],
             &[
-              txt(h, if m.showPitchLaneTab { "High" } else { "Small" }, ""),
-              txt(h, if m.showPitchLaneTab { "Low" } else { "Heavy" }, ""),
+              txt(h, if isPitch { "High" } else if isSizeWt { "Small" } else { "Front" }, ""),
+              txt(h, if isPitch { "Low" } else if isSizeWt { "Heavy" } else { "Back" }, ""),
             ],
           ),
           h.box(
@@ -1986,10 +2027,33 @@ fn renderSizeWeightLane(m: &Overtone, h: &Document<Message>) -> Node {
               h.style(&[css.height(px(METRICS_H))]),
             ],
             &[
-              if m.showPitchLaneTab {
+              if isPitch {
                 h.drawing(&m.pitchLaneDrawing, &[h.class("absolute inset-0 w-full h-full pointer-events-none")])
-              } else {
+              } else if isSizeWt {
                 h.drawing(&m.metricsLaneDrawing, &[h.class("absolute inset-0 w-full h-full pointer-events-none")])
+              } else {
+                h.drawing(&m.vowelLaneDrawing, &[h.class("absolute inset-0 w-full h-full pointer-events-none")])
+              },
+              if isVowels && vBadges.length > 0 {
+                h.box(
+                  &[h.class("absolute inset-x-0 top-[2px] h-[14px]")],
+                  &[
+                    h.each<VowelBadge>(
+                      vBadges,
+                      |vb| h.box(
+                        &[
+                          h.class("absolute top-0 h-[13px] px-[3px] rounded-[3px] bg-white/85 border border-[#E2E2E6] flex items-center justify-center hover:border-[#0B0B0C]"),
+                          h.style(&[css.left(px(vb.x))]),
+                          h.cursor(Cursor.Pointer),
+                          h.onClick(Message.SelectVowelSpan { idx: vb.idx }),
+                        ],
+                        &[txt(h, String.view(&vb.label), "glint-mono text-[9px] leading-[11px] font-semibold text-[#0B0B0C]")],
+                      ),
+                    ),
+                  ],
+                )
+              } else {
+                h.empty()
               },
               if selValid && selW > 0.05 {
                 h.box(
