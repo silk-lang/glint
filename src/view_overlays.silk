@@ -1184,7 +1184,7 @@ fn renderSettingsAudio(m: &Overtone, h: &Document<Message>) -> Node {
             &[h.class("w-[180px] shrink-0 gap-[1px]")],
             &[
               txt(h, "Gap between appends", "text-[13px] leading-[16px] text-[#0B0B0C]"),
-              txt(h, "R appends · ⌘R starts a new take", "text-[11px] leading-[14px] text-[#8A8A90]"),
+              txt(h, "R starts a new take · ⌘R appends to current clip", "text-[11px] leading-[14px] text-[#8A8A90]"),
             ],
           ),
           h.row(
@@ -1736,8 +1736,8 @@ fn renderSettingsShortcuts(h: &Document<Message>) -> Node {
         &[h.class("flex-1 min-w-0")],
         &[
           settingsSection(h, "Transport"),
-          shortcutRow(h, "Record / stop, append", "R", ""),
-          shortcutRow(h, "Record new take", "⌘", "R"),
+          shortcutRow(h, "Record / stop (new take)", "R", ""),
+          shortcutRow(h, "Append to current clip", "⌘", "R"),
           shortcutRow(h, "Play / pause", "Space", ""),
           shortcutRow(h, "Loop selection", "L", ""),
           shortcutRow(h, "Repeat drill", "D", ""),

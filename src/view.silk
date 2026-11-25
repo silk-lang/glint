@@ -650,7 +650,7 @@ fn renderRecordingToolbar(m: &Overtone, h: &Document<Message>) -> Node {
         &[
           h.text("Recording into "),
           txt(h, String.view(&m.clipName), "text-[#0B0B0C] font-medium"),
-          h.text(" · ⌘R for a new take"),
+          h.text(" · ⌘R to append to same clip"),
         ],
       ),
       h.box(&[h.class("flex-1")], &[]),

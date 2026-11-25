@@ -282,7 +282,7 @@ pub union Command {
 pub union Message {
   Tick { pub time: f64 },
   ToggleRecord,
-  RecordNewClip,
+  RecordAppendClip,
   TogglePlay,
   ToggleLoop,
   LoadDemo,
@@ -583,7 +583,7 @@ pub struct Overtone {
   pub refOverlayDrawing: Drawing,
   pub refPianoDrawing: Drawing,
   pub refFreqTicks: List<AxisTick>,
-  pub recordOntoRefOnce: bool,
+  pub appendRecordOnce: bool,
   pub useDtwAlign: bool,
   pub showNoteGrid: bool,
   pub showLtasTab: bool,
@@ -982,7 +982,7 @@ impl Overtone {
       refOverlayDrawing: emptyDraw.clone(),
       refPianoDrawing: emptyDraw.clone(),
       refFreqTicks: List<AxisTick>.make(),
-      recordOntoRefOnce: false,
+      appendRecordOnce: false,
       useDtwAlign: true,
       showNoteGrid: true,
       showLtasTab: false,
@@ -4381,18 +4381,18 @@ impl Overtone {
   }
 
   /// Recording effect triggered by the `silk.machine` transport statechart:
-  /// SAFE REFERENCE PROTECTION: if the currently open clip IS a Reference (and user
-  /// didn't explicitly choose "Record onto this ref"), activates it as `self.refClip` and
-  /// ALWAYS starts a brand-new take attached as a child of that Reference!
+  /// By default (`R` or Rec button), ALWAYS starts a brand-new clip!
+  /// If viewing a Reference clip, activates it as `self.refClip` so the new take attaches beneath it.
+  /// Only appends onto the currently open clip when explicitly requested via `⌘R` or "Record onto this ref".
   effect fn doStartRecording(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    let protectRef = self.isViewingRefClip() && !self.recordOntoRefOnce && self.samples.length() >= 64
-    self.recordOntoRefOnce = false
-    if protectRef && !self.refClip.active {
+    let wantAppend = self.appendRecordOnce
+    self.appendRecordOnce = false
+    if !wantAppend && self.isViewingRefClip() && !self.refClip.active && self.samples.length() >= 64 {
       run self.activateCurrentRefForRecording()
     }
-    let appending = !protectRef && !self.isDemoClip && self.samples.length() > 0 && self.sampleRate > 0.0
+    let appending = wantAppend && !self.isDemoClip && self.samples.length() > 0 && self.sampleRate > 0.0
     let wantRate = if appending { self.sampleRate } else { 0.0 }
     if !audio_native.micStartAt(wantRate) {
       self.errorMsg = run audio_native.micError()
@@ -4446,7 +4446,7 @@ impl Overtone {
       self.gpuNeedFullReload = false
       self.gpuNeedSharp = false
       self.gpuNeedRedraw = true
-      self.statusMsg = run String.copy("Appending live mic to document… press R or Space to stop (⌘N for blank doc)")
+      self.statusMsg = run String.copy("Appending live mic to current clip… press R or Space to stop")
     } else {
       run self.beginLiveRecStream(false)
       self.statusMsg = run String.copy("Recording live microphone… press R or Space to stop")
@@ -5834,15 +5834,13 @@ impl Overtone {
         run self.sendTransport(TransportEvent.ToggleRecord)
       }
 
-      Message.RecordNewClip => {
+      Message.RecordAppendClip => {
         if isManualRecording(self.transport.value) {
           run self.sendTransport(TransportEvent.ToggleRecord)
+        } else {
+          self.appendRecordOnce = true
+          run self.sendTransport(TransportEvent.ToggleRecord)
         }
-        if self.isViewingRefClip() && !self.refClip.active && self.samples.length() >= 64 {
-          run self.activateCurrentRefForRecording()
-        }
-        run self.newDocument()
-        run self.sendTransport(TransportEvent.ToggleRecord)
       }
 
       Message.TogglePlay => {
@@ -6894,7 +6892,7 @@ impl Overtone {
 
       Message.RecordOntoRef => {
         self.ctxMenuKind = CTX_NONE
-        self.recordOntoRefOnce = true
+        self.appendRecordOnce = true
         run self.sendTransport(TransportEvent.ToggleRecord)
       }
 
@@ -7367,7 +7365,7 @@ impl Overtone {
         } else if cmd && (k == "n" || k == "N") {
           run self.newDocument()
         } else if cmd && (k == "r" || k == "R") {
-          run self.handleMessage(Message.RecordNewClip)
+          run self.handleMessage(Message.RecordAppendClip)
         } else if cmd && (k == "c" || k == "C") {
           run self.copySelection()
         } else if cmd && (k == "x" || k == "X") {
