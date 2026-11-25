@@ -254,7 +254,7 @@ pub const LISTEN_YOU: u32 = 0
 pub const LISTEN_REF: u32 = 1
 pub const LISTEN_BOTH: u32 = 2
 
-pub const LIB_W: f32 = 216.0
+pub const LIB_W: f32 = 232.0
 pub const INIT_SPEC_W: f32 = 844.0
 pub const INIT_SPEC_H: f32 = 460.0
 pub const PIANO_W: f32 = 12.0
@@ -350,10 +350,15 @@ pub union Message {
   ExplorerPointerUp,
   // Reference-grouped library, multi-selection, safe ref recording, split view, mix, norm, trim & favorites
   ToggleRefGroupExpand { pub idx: usize },
+  ToggleLibSelectMode,
+  EnterSelectModeWithClip { pub idx: usize },
   ToggleSelectLibClip { pub idx: usize },
   SelectAllLibClips,
   ClearLibSelection,
   DeleteSelectedLibClips,
+  UnmarkLibClipAsRef { pub idx: usize },
+  UnmarkCurrentRef,
+  DetachLibClipFromRef { pub idx: usize },
   CreateEmptyRef,
   SelectGeneralMode,
   RecordOntoRef,
@@ -654,10 +659,14 @@ pub struct Overtone {
   pub activeCommentDraft: String,
   pub activeItemRating: i32,
   pub activeItemStarred: bool,
-  // Library multi-selection (Cmd/Ctrl+Click, Shift+Click, bulk delete)
+  pub activeClipIsRef: bool,
+  pub activeClipParentRef: String,
+  pub pendingNewRef: bool,
+  // Library multi-selection (Cmd/Ctrl+Click, Shift+Click, Select mode, bulk delete)
+  pub libSelectMode: bool,
   pub selectedClipPaths: List<String>,
   pub lastSelectedLibIdx: i32,
-  // Virtualized Explorer viewport & Drag-Drop state (real file & folder moving)
+  // Virtualized Explorer viewport & Drag-Drop state (real file & folder moving + attach to Ref)
   pub explorerPanelRect: Rect<f32>,
   pub explorerTreeRect: Rect<f32>,
   pub explorerScrollY: f32,
@@ -671,6 +680,8 @@ pub struct Overtone {
   pub explorerDragX: f32,
   pub explorerDragY: f32,
   pub explorerDropTargetRel: String,
+  pub explorerDropTargetRefPath: String,
+  pub explorerDropTargetLabel: String,
   pub explorerDropValid: bool,
   // Explorer Context Menu target
   pub ctxExplorerIdx: usize,
@@ -681,6 +692,7 @@ pub struct Overtone {
   pub ctxExplorerExpanded: bool,
   pub ctxExplorerStarred: bool,
   pub ctxExplorerIsRef: bool,
+  pub ctxExplorerHasParentRef: bool,
 
   // Hands-free practice modes (Repeat Drill & Silence-Triggered Echo)
   pub practiceMode: u32,
@@ -1038,6 +1050,10 @@ impl Overtone {
       activeCommentDraft: String.make(),
       activeItemRating: 0,
       activeItemStarred: false,
+      activeClipIsRef: false,
+      activeClipParentRef: String.make(),
+      pendingNewRef: false,
+      libSelectMode: false,
       selectedClipPaths: List<String>.make(),
       lastSelectedLibIdx: -1,
       explorerPanelRect: Rect<f32>.new(0.0, 0.0, LIB_W, 500.0),
@@ -1053,6 +1069,8 @@ impl Overtone {
       explorerDragX: 0.0,
       explorerDragY: 0.0,
       explorerDropTargetRel: String.make(),
+      explorerDropTargetRefPath: String.make(),
+      explorerDropTargetLabel: String.make(),
       explorerDropValid: false,
       ctxExplorerIdx: 0,
       ctxExplorerRel: String.make(),
@@ -1062,6 +1080,7 @@ impl Overtone {
       ctxExplorerExpanded: false,
       ctxExplorerStarred: false,
       ctxExplorerIsRef: false,
+      ctxExplorerHasParentRef: false,
 
       practiceMode: PRACTICE_OFF,
       practicePhase: PHASE_IDLE,
@@ -1244,6 +1263,21 @@ impl Overtone {
     return self.refClip.active
       && String.byteLength(String.view(&self.refClip.fullPath)) > 0
       && String.view(&self.activeClipPath) == String.view(&self.refClip.fullPath)
+  }
+
+  pub fn isViewingRefClip(self: &Self) -> bool {
+    return self.activeClipIsRef || self.isEditingActiveRef()
+  }
+
+  fn clearActiveRefSilent(self: &mut Self) -> () {
+    if self.refClip.active {
+      self.refClip.clear()
+      self.gpuNeedRefReload = true
+    }
+    self.plotOnRef = false
+    self.listenMode = LISTEN_YOU
+    self.bgScoreActive = false
+    self.readoutBgScore.clear()
   }
 
   pub fn activeTakeGainDb(self: &Self) -> f32 {
@@ -1477,19 +1511,9 @@ impl Overtone {
 
     run self.reloadTree(false)
 
-    // Read BOTH savedRef and savedClip BEFORE loading either, since loadLibraryClip saves prefs!
-    let savedRef = run audio_native.prefGet("last_ref")
+    // Restore last open clip (opening a child take automatically activates its parent Reference;
+    // opening a Reference itself or a loose clip leaves no Reference active).
     let savedClip = run audio_native.prefGet("last_clip")
-
-    // Restore last active Reference first (so match scores & split view hydrate cleanly!)
-    if String.byteLength(String.view(&savedRef)) > 0 {
-      let refIdx = self.findLibIdxByFullPath(String.view(&savedRef))
-      if refIdx < self.libTree.length() {
-        run self.loadLibraryClip(refIdx, true)
-      }
-    }
-
-    // Restore last open clip (falling back to first library clip)
     let mut opened = false
     if String.byteLength(String.view(&savedClip)) > 0 {
       let clipIdx = self.findLibIdxByFullPath(String.view(&savedClip))
@@ -1626,6 +1650,7 @@ impl Overtone {
     }
     self.selectedClipPaths.clear()
     self.lastSelectedLibIdx = -1
+    self.libSelectMode = false
     run self.reloadTree(false)
     run self.saveSessionPrefs()
     let mut msg = String.make()
@@ -2163,6 +2188,8 @@ impl Overtone {
           self.activeItemRating = nodes[i].rating
           self.activeItemStarred = nodes[i].starred
           self.activeCommentDraft = run String.copy(String.view(&nodes[i].comment))
+          self.activeClipIsRef = nodes[i].isRef || nodes[i].childCount > 0
+          self.activeClipParentRef = run String.copy(String.view(&nodes[i].parentRef))
           return ()
         }
         i = i + 1
@@ -2172,6 +2199,8 @@ impl Overtone {
       self.activeItemRating = 0
       self.activeItemStarred = false
       self.activeCommentDraft.clear()
+      self.activeClipIsRef = false
+      self.activeClipParentRef.clear()
     }
   }
 
@@ -2489,9 +2518,9 @@ impl Overtone {
     }
   }
 
-  /// Evaluates the destination folder for an Explorer drag-and-drop pointer position.
-  /// Uses exact virtualized tree math (`explorerTreeRect` + `explorerScrollY`) so dropping onto
-  /// ANY folder (nested, scrolled, expanded, or collapsed) works reliably on both web and native.
+  /// Evaluates the destination folder OR parent Reference clip for an Explorer drag-and-drop position.
+  /// Dropping a clip onto a Reference clip (or one of its takes) puts it inside that Reference.
+  /// Dropping a clip onto a folder moves it into that folder (and detaches from any Reference).
   effect fn updateExplorerDropTarget(self: &mut Self, x: f32, y: f32) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
@@ -2500,17 +2529,28 @@ impl Overtone {
     let nodes = self.libTree.asSlice()
     if self.explorerDragIdx >= nodes.length {
       self.explorerDropValid = false
+      self.explorerDropTargetRefPath.clear()
+      self.explorerDropTargetLabel.clear()
       return ()
     }
     let pr = self.explorerPanelRect
     if x < pr.xMin || x > pr.xMax || y < pr.yMin || y > pr.yMax {
       self.explorerDropValid = false
+      self.explorerDropTargetRefPath.clear()
+      self.explorerDropTargetLabel.clear()
       return ()
     }
 
-    // 1. Primary hit-test: exact tree coordinate against virtualized rows (always fresh, immune to stale DOM rects!)
-    let mut dstRel = String.make()
-    let mut matched = false
+    let srcNode = &nodes[self.explorerDragIdx]
+    let srcParent = String.view(&srcNode.parentRel)
+    let srcRel = String.view(&srcNode.relPath)
+    let srcFull = String.view(&srcNode.fullPath)
+    let srcParentRef = String.view(&srcNode.parentRef)
+    let srcIsDir = srcNode.isDir
+    let srcHasKids = srcNode.childCount > 0
+
+    // 1. Primary hit-test: exact tree coordinate against virtualized rows
+    let mut hitIdx: usize = nodes.length
     let tr = self.explorerTreeRect
     if tr.height() > 1.0 && y >= tr.yMin && y <= tr.yMax {
       let localY = (y - tr.yMin) + self.explorerScrollY
@@ -2519,44 +2559,141 @@ impl Overtone {
       while s < slots.length {
         let slot = &slots[s]
         if slot.idx < nodes.length && localY >= slot.y && localY <= slot.y + slot.h {
-          if nodes[slot.idx].isDir {
-            dstRel = run String.copy(String.view(&nodes[slot.idx].relPath))
-          } else {
-            dstRel = run String.copy(String.view(&nodes[slot.idx].parentRel))
-          }
-          matched = true
+          hitIdx = slot.idx
           break
         }
         s = s + 1
       }
     }
-
     // 2. Fallback to reported row rects if tree rect hasn't been laid out yet
-    if !matched {
+    if hitIdx >= nodes.length {
       let rects = self.explorerRowRects.asSlice()
       let mut i: usize = 0
       while i < rects.length && i < nodes.length {
         let r = rects[i]
         if r.width() > 1.0 && r.height() > 1.0 && y >= r.yMin && y <= r.yMax {
-          if nodes[i].isDir {
-            dstRel = run String.copy(String.view(&nodes[i].relPath))
-          } else {
-            dstRel = run String.copy(String.view(&nodes[i].parentRel))
-          }
+          hitIdx = i
           break
         }
         i = i + 1
       }
     }
 
-    let srcParent = String.view(&nodes[self.explorerDragIdx].parentRel)
-    let srcRel = String.view(&nodes[self.explorerDragIdx].relPath)
-    let srcIsDir = nodes[self.explorerDragIdx].isDir
+    // Check if dragging a clip onto a Reference clip (or onto one of its child takes)
+    if !srcIsDir && !srcHasKids && hitIdx < nodes.length && !nodes[hitIdx].isDir {
+      let mut targetRefPath = String.make()
+      let mut targetRefLabel = String.make()
+      if nodes[hitIdx].isRef || nodes[hitIdx].childCount > 0 {
+        targetRefPath = run String.copy(String.view(&nodes[hitIdx].fullPath))
+        targetRefLabel = run String.copy(String.view(&nodes[hitIdx].displayName))
+      } else if String.byteLength(String.view(&nodes[hitIdx].parentRef)) > 0 {
+        let prp = String.view(&nodes[hitIdx].parentRef)
+        targetRefPath = run String.copy(prp)
+        let refIdx = self.findLibIdxByFullPath(prp)
+        if refIdx < nodes.length {
+          targetRefLabel = run String.copy(String.view(&nodes[refIdx].displayName))
+        }
+      }
+      if String.byteLength(String.view(&targetRefPath)) > 0
+        && String.view(&targetRefPath) != srcFull
+        && String.view(&targetRefPath) != srcParentRef
+      {
+        self.explorerDropTargetRel.clear()
+        self.explorerDropTargetRefPath = move targetRefPath
+        self.explorerDropTargetLabel = move targetRefLabel
+        self.explorerDropValid = true
+        return ()
+      }
+    }
+
+    let mut dstRel = String.make()
+    if hitIdx < nodes.length {
+      if nodes[hitIdx].isDir {
+        dstRel = run String.copy(String.view(&nodes[hitIdx].relPath))
+      } else {
+        dstRel = run String.copy(String.view(&nodes[hitIdx].parentRel))
+      }
+    }
     let dstView = String.view(&dstRel)
     let sameParent = dstView == srcParent
     let intoSelf = srcIsDir && Overtone.isSameOrSubpath(dstView, srcRel)
+    let canDetach = !srcIsDir && String.byteLength(srcParentRef) > 0
+    self.explorerDropTargetRefPath.clear()
+    self.explorerDropTargetLabel = if String.byteLength(dstView) > 0 { run String.copy(dstView) } else { run String.copy("/") }
     self.explorerDropTargetRel = move dstRel
-    self.explorerDropValid = !sameParent && !intoSelf
+    self.explorerDropValid = (!sameParent || canDetach) && !intoSelf
+  }
+
+  /// Attaches a library clip as a child take inside `refFullPath` (moving folders if needed).
+  effect fn attachLibEntryToRef(self: &mut Self, srcIdx: usize, refFullPath: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let nodes = self.libTree.asSlice()
+    if srcIdx >= nodes.length || nodes[srcIdx].isDir {
+      return ()
+    }
+    let refIdx = self.findLibIdxByFullPath(refFullPath)
+    if refIdx >= nodes.length || nodes[refIdx].isDir {
+      return ()
+    }
+    let srcParent = run String.copy(String.view(&nodes[srcIdx].parentRel))
+    let nameCopy = run String.copy(String.view(&nodes[srcIdx].name))
+    let dispCopy = run String.copy(String.view(&nodes[srcIdx].displayName))
+    let oldFull = run String.copy(String.view(&nodes[srcIdx].fullPath))
+    let refDir = run String.copy(String.view(&nodes[refIdx].parentRel))
+    let refDisp = run String.copy(String.view(&nodes[refIdx].displayName))
+    let refPathCopy = run String.copy(refFullPath)
+
+    if String.view(&oldFull) == String.view(&refPathCopy) {
+      return ()
+    }
+
+    let mut curDir = run String.copy(String.view(&srcParent))
+    let mut curFull = run String.copy(String.view(&oldFull))
+    if String.view(&srcParent) != String.view(&refDir) {
+      let res = run audio_native.libMoveEntry(
+        String.view(&srcParent),
+        String.view(&nameCopy),
+        String.view(&refDir),
+        false,
+      )
+      if res.ok {
+        curDir = run String.copy(String.view(&refDir))
+        curFull = run String.copy(String.view(&res.fullPath))
+        if String.view(&self.activeClipPath) == String.view(&oldFull) {
+          self.activeClipDir = run String.copy(String.view(&curDir))
+          self.activeClipPath = run String.copy(String.view(&curFull))
+        }
+      }
+    }
+
+    drop audio_native.libSetParentRef(
+      String.view(&curDir),
+      String.view(&nameCopy),
+      String.view(&refPathCopy),
+    )
+    run self.ensureDirExpanded(String.view(&refDir))
+    run self.ensureDirExpanded(String.view(&refPathCopy))
+    run self.reloadTree(false)
+
+    // If the clip we just put inside a reference is currently open, activate that reference now!
+    if String.view(&self.activeClipPath) == String.view(&curFull) {
+      let newRefIdx = self.findLibIdxByFullPath(String.view(&refPathCopy))
+      if newRefIdx < self.libTree.length() {
+        run self.loadLibraryClip(newRefIdx, true)
+      }
+      run self.refreshActiveLibMeta()
+      run self.recomputeNormGain()
+      run self.recomputeCompare()
+      run self.rebuildDrawings(true)
+    }
+    run self.saveSessionPrefs()
+    let mut msg = String.make()
+    run msg.append("Put ")
+    run msg.append(String.view(&dispCopy))
+    run msg.append(" inside ")
+    run msg.append(String.view(&refDisp))
+    self.statusMsg = move msg
   }
 
   /// Moves a real file OR directory into `dstFolderRel` ("" = library root) and updates all open paths.
@@ -2568,14 +2705,32 @@ impl Overtone {
       return ()
     }
     let srcParent = run String.copy(String.view(&nodes[srcIdx].parentRel))
+    let srcParentRef = run String.copy(String.view(&nodes[srcIdx].parentRef))
     let nameCopy = run String.copy(String.view(&nodes[srcIdx].name))
     let dispCopy = run String.copy(String.view(&nodes[srcIdx].displayName))
     let oldRel = run String.copy(String.view(&nodes[srcIdx].relPath))
     let oldFull = run String.copy(String.view(&nodes[srcIdx].fullPath))
     let isDir = nodes[srcIdx].isDir
     let dstCopy = run String.copy(dstFolderRel)
+    let hadParentRef = !isDir && String.byteLength(String.view(&srcParentRef)) > 0
 
     if String.view(&srcParent) == String.view(&dstCopy) {
+      if hadParentRef {
+        drop audio_native.libSetParentRef(String.view(&srcParent), String.view(&nameCopy), "")
+        if String.view(&self.activeClipPath) == String.view(&oldFull) {
+          self.clearActiveRefSilent()
+          run self.recomputeNormGain()
+          run self.recomputeCompare()
+          run self.rebuildDrawings(false)
+        }
+        run self.reloadTree(false)
+        run self.saveSessionPrefs()
+        let mut dmsg = String.make()
+        run dmsg.append("Detached ")
+        run dmsg.append(String.view(&dispCopy))
+        run dmsg.append(" from reference")
+        self.statusMsg = move dmsg
+      }
       return ()
     }
     if isDir && Overtone.isSameOrSubpath(String.view(&dstCopy), String.view(&oldRel)) {
@@ -2640,9 +2795,18 @@ impl Overtone {
           }
         }
       } else {
+        if hadParentRef {
+          drop audio_native.libSetParentRef(String.view(&dstCopy), String.view(&nameCopy), "")
+        }
         if String.view(&self.activeClipPath) == String.view(&oldFull) {
           self.activeClipDir = run String.copy(String.view(&dstCopy))
           self.activeClipPath = run String.copy(String.view(&newFull))
+          if hadParentRef {
+            self.clearActiveRefSilent()
+            run self.recomputeNormGain()
+            run self.recomputeCompare()
+            run self.rebuildDrawings(false)
+          }
         }
         if self.refClip.active && String.view(&self.refClip.fullPath) == String.view(&oldFull) {
           self.refClip.fullPath = run String.copy(String.view(&newFull))
@@ -2650,6 +2814,7 @@ impl Overtone {
       }
       run self.ensureDirExpanded(String.view(&dstCopy))
       run self.reloadTree(false)
+      run self.saveSessionPrefs()
       let mut msg = String.make()
       run msg.append("Moved ")
       run msg.append(String.view(&dispCopy))
@@ -3090,8 +3255,11 @@ impl Overtone {
         self.matchWeights,
       )
       if self.compare.score.valid {
-        // Persist all 5 metric scores scoped to the current Reference (skip comparing clip against itself!)
-        if self.activeClipInLib && String.view(&self.activeClipPath) != String.view(&self.refClip.fullPath) {
+        // Persist scores ONLY for child takes attached to the active Reference (never loose clips or refs!)
+        if self.activeClipInLib
+          && String.byteLength(String.view(&self.activeClipParentRef)) > 0
+          && String.view(&self.activeClipParentRef) == String.view(&self.refClip.fullPath)
+        {
           drop audio_native.libUpdateScores(
             String.view(&self.activeClipDir),
             String.view(&self.activeClipFilename),
@@ -3744,7 +3912,9 @@ impl Overtone {
     run self.saveSessionPrefs()
   }
 
-  effect fn pinCurrentAsReference(self: &mut Self) -> ()
+  /// Promotes the currently open clip into `self.refClip` in memory (used right before recording a new take
+  /// or starting Repeat Drill while viewing a Reference clip).
+  effect fn activateCurrentRefForRecording(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
     if self.samples.length() < 64 {
@@ -3778,12 +3948,32 @@ impl Overtone {
     if String.byteLength(String.view(&refExpCopy)) > 0 {
       run self.ensureDirExpanded(String.view(&refExpCopy))
     }
+  }
+
+  /// Turns the currently open clip into a Reference clip in the library.
+  /// Because you are viewing the Reference itself, no comparison ref is set active until you record or open a take under it.
+  effect fn pinCurrentAsReference(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.samples.length() < 64 {
+      return ()
+    }
+    if !self.activeClipInLib {
+      self.pendingNewRef = true
+      run self.saveCurrentClipToFolder(false)
+    } else {
+      drop audio_native.libSetIsRef(
+        String.view(&self.activeClipDir),
+        String.view(&self.activeClipFilename),
+        true,
+      )
+    }
+    self.clearActiveRefSilent()
+    run self.reloadTree(false)
     run self.recomputeNormGain()
     run self.recomputeCompare()
-    run self.reloadTree(false)
-    run self.startBgScoring(false)
     run self.saveSessionPrefs()
-    self.statusMsg = run String.copy("Set current clip as Reference · Press R to record a new take attached to it")
+    self.statusMsg = run String.copy("Turned into Reference · Press R (Rec take) or Repeat drill to record takes under it")
     run self.rebuildDrawings(false)
   }
 
@@ -3794,21 +3984,26 @@ impl Overtone {
     if self.samples.length() < 64 {
       return ()
     }
-    let sc: i32 = if self.compare.score.valid
+    let updateInPlace = !forceNewFile
+      && self.activeClipInLib
+      && String.byteLength(String.view(&self.activeClipFilename)) > 0
+
+    let makeNewRef = self.pendingNewRef && !updateInPlace
+    self.pendingNewRef = false
+
+    let attachToRef = !updateInPlace
+      && !makeNewRef
+      && self.refClip.active
+      && String.byteLength(String.view(&self.refClip.fullPath)) > 0
+
+    let sc: i32 = if (attachToRef || (updateInPlace && String.byteLength(String.view(&self.activeClipParentRef)) > 0))
+      && self.compare.score.valid
       && String.view(&self.activeClipPath) != String.view(&self.refClip.fullPath)
     {
       u32.toI32(self.compare.score.overall)
     } else {
       -1
     }
-
-    let updateInPlace = !forceNewFile
-      && self.activeClipInLib
-      && String.byteLength(String.view(&self.activeClipFilename)) > 0
-
-    let attachToRef = !updateInPlace
-      && self.refClip.active
-      && String.byteLength(String.view(&self.refClip.fullPath)) > 0
 
     let mut refDir = String.make()
     if attachToRef {
@@ -3840,6 +4035,8 @@ impl Overtone {
       let mut tn = run String.copy(String.view(&self.refClip.name))
       run tn.append(" take")
       move tn
+    } else if makeNewRef {
+      run String.copy("reference")
     } else {
       run String.copy("recording")
     }
@@ -3861,24 +4058,36 @@ impl Overtone {
       self.activeClipDir = move saveDir
       self.activeClipInLib = true
       self.isDemoClip = false
-      if attachToRef {
+      if makeNewRef {
+        drop audio_native.libSetIsRef(
+          String.view(&self.activeClipDir),
+          String.view(&self.activeClipFilename),
+          true,
+        )
+        self.activeClipIsRef = true
+        self.activeClipParentRef.clear()
+      } else if attachToRef {
         drop audio_native.libSetParentRef(
           String.view(&self.activeClipDir),
           String.view(&self.activeClipFilename),
           String.view(&self.refClip.fullPath),
         )
+        self.activeClipIsRef = false
+        self.activeClipParentRef = run String.copy(String.view(&self.refClip.fullPath))
         let refExp = run String.copy(String.view(&self.refClip.fullPath))
         run self.ensureDirExpanded(String.view(&refExp))
       }
-      if sc >= 0 && self.refClip.active {
-        drop audio_native.libUpdateMeta(
+      if sc >= 0 && self.refClip.active && String.byteLength(String.view(&self.activeClipParentRef)) > 0 {
+        drop audio_native.libUpdateScores(
           String.view(&self.activeClipDir),
           String.view(&self.activeClipFilename),
-          self.activeItemRating,
-          self.activeItemStarred,
-          sc,
           String.view(&self.refClip.fullPath),
-          String.view(&self.activeCommentDraft),
+          u32.toI32(self.compare.score.overall),
+          u32.toI32(self.compare.score.pitchScore),
+          u32.toI32(self.compare.score.sizeScore),
+          u32.toI32(self.compare.score.weightScore),
+          u32.toI32(self.compare.score.vowelScore),
+          SCORE_VERSION,
         )
       }
       run self.ensureDirExpanded(String.view(&dirCopy))
@@ -3963,16 +4172,24 @@ impl Overtone {
     let dispName = run String.copy(String.view(&nodes[idx].displayName))
     let parentDir = run String.copy(String.view(&nodes[idx].parentRel))
     let parentRef = run String.copy(String.view(&nodes[idx].parentRef))
-    let childCount = nodes[idx].childCount
+    let isClipRef = nodes[idx].isRef || nodes[idx].childCount > 0
 
-    // If clicking a take attached to a Reference, automatically activate that Reference!
-    if !setAsRef && String.byteLength(String.view(&parentRef)) > 0 {
-      let alreadyActiveRef = self.refClip.active && String.view(&self.refClip.fullPath) == String.view(&parentRef)
-      if !alreadyActiveRef {
-        let pIdx = self.findLibIdxByFullPath(String.view(&parentRef))
-        if pIdx < self.libTree.length() {
-          run self.loadLibraryClip(pIdx, true)
+    // Strict reference activation rule:
+    // - Child of a reference -> its parent reference becomes active!
+    // - Reference itself OR loose clip (no parent ref) -> nothing is set as reference!
+    if !setAsRef {
+      if String.byteLength(String.view(&parentRef)) > 0 && !isClipRef {
+        let alreadyActiveRef = self.refClip.active && String.view(&self.refClip.fullPath) == String.view(&parentRef)
+        if !alreadyActiveRef {
+          let pIdx = self.findLibIdxByFullPath(String.view(&parentRef))
+          if pIdx < self.libTree.length() {
+            run self.loadLibraryClip(pIdx, true)
+          } else {
+            self.clearActiveRefSilent()
+          }
         }
+      } else {
+        self.clearActiveRefSilent()
       }
     }
 
@@ -3995,18 +4212,14 @@ impl Overtone {
           self.statusMsg = move msg
           run self.rebuildDrawings(true)
         } else {
-          // If clicking a clip that already has takes nested under it, also activate it as Ref!
-          if childCount > 0 && (!self.refClip.active || String.view(&self.refClip.fullPath) != String.view(&path)) {
-            let refSamples = run copyF32List(value.samples.asSlice())
-            let refName = run String.copy(String.view(&dispName))
-            let refPath = run String.copy(String.view(&path))
-            run self.analyzeAndPinBufferAsRef(move refName, move refSamples, value.sampleRate, move refPath)
-          }
           self.activeClipPath = move path
           self.activeClipFilename = move fname
           self.activeClipDir = run String.copy(String.view(&parentDir))
           self.selectedFolderRel = move parentDir
           self.activeClipInLib = true
+          self.activeClipIsRef = isClipRef
+          self.activeClipParentRef = move parentRef
+          self.pendingNewRef = false
           self.plotOnRef = false
           run self.loadSamples(move dispName, move value.samples, value.sampleRate)
           run self.recomputeNormGain()
@@ -4157,14 +4370,17 @@ impl Overtone {
   }
 
   /// Recording effect triggered by the `silk.machine` transport statechart:
-  /// SAFE REFERENCE PROTECTION: if the currently open clip IS the active Reference (and user
-  /// didn't explicitly choose "Record onto ref"), ALWAYS starts a brand-new take attached to
-  /// that Reference instead of overwriting/appending to the Reference!
+  /// SAFE REFERENCE PROTECTION: if the currently open clip IS a Reference (and user
+  /// didn't explicitly choose "Record onto this ref"), activates it as `self.refClip` and
+  /// ALWAYS starts a brand-new take attached as a child of that Reference!
   effect fn doStartRecording(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    let protectRef = self.isEditingActiveRef() && !self.recordOntoRefOnce
+    let protectRef = self.isViewingRefClip() && !self.recordOntoRefOnce && self.samples.length() >= 64
     self.recordOntoRefOnce = false
+    if protectRef && !self.refClip.active {
+      run self.activateCurrentRefForRecording()
+    }
     let appending = !protectRef && !self.isDemoClip && self.samples.length() > 0 && self.sampleRate > 0.0
     let wantRate = if appending { self.sampleRate } else { 0.0 }
     if !audio_native.micStartAt(wantRate) {
@@ -5589,6 +5805,9 @@ impl Overtone {
         if isManualRecording(self.transport.value) {
           run self.sendTransport(TransportEvent.ToggleRecord)
         }
+        if self.isViewingRefClip() && !self.refClip.active && self.samples.length() >= 64 {
+          run self.activateCurrentRefForRecording()
+        }
         run self.newDocument()
         run self.sendTransport(TransportEvent.ToggleRecord)
       }
@@ -5848,7 +6067,10 @@ impl Overtone {
             self.errorMsg = run String.copy("Load or record a clip first to use Repeat Drill.")
             return ()
           }
-          run self.pinCurrentAsReference()
+          if !self.activeClipIsRef {
+            run self.pinCurrentAsReference()
+          }
+          run self.activateCurrentRefForRecording()
         }
         run self.sendTransport(TransportEvent.ToggleDrill)
         if isDrill(self.transport.value) {
@@ -6055,7 +6277,94 @@ impl Overtone {
 
       Message.SetLibClipAsRef { idx } => {
         self.ctxMenuKind = CTX_NONE
-        run self.loadLibraryClip(idx, true)
+        let nodes = self.libTree.asSlice()
+        if idx < nodes.length && !nodes[idx].isDir {
+          let parentCopy = run String.copy(String.view(&nodes[idx].parentRel))
+          let fnCopy = run String.copy(String.view(&nodes[idx].name))
+          let fullCopy = run String.copy(String.view(&nodes[idx].fullPath))
+          let dispCopy = run String.copy(String.view(&nodes[idx].displayName))
+          drop audio_native.libSetIsRef(String.view(&parentCopy), String.view(&fnCopy), true)
+          if String.view(&self.activeClipPath) == String.view(&fullCopy) {
+            self.clearActiveRefSilent()
+          }
+          run self.reloadTree(false)
+          run self.recomputeNormGain()
+          run self.recomputeCompare()
+          run self.saveSessionPrefs()
+          run self.rebuildDrawings(false)
+          let mut msg = String.make()
+          run msg.append("Turned ")
+          run msg.append(String.view(&dispCopy))
+          run msg.append(" into a Reference")
+          self.statusMsg = move msg
+        }
+      }
+
+      Message.UnmarkLibClipAsRef { idx } => {
+        self.ctxMenuKind = CTX_NONE
+        let nodes = self.libTree.asSlice()
+        if idx < nodes.length && !nodes[idx].isDir {
+          let parentCopy = run String.copy(String.view(&nodes[idx].parentRel))
+          let fnCopy = run String.copy(String.view(&nodes[idx].name))
+          let fullCopy = run String.copy(String.view(&nodes[idx].fullPath))
+          let dispCopy = run String.copy(String.view(&nodes[idx].displayName))
+          drop audio_native.libSetIsRef(String.view(&parentCopy), String.view(&fnCopy), false)
+          if self.refClip.active && String.view(&self.refClip.fullPath) == String.view(&fullCopy) {
+            self.clearActiveRefSilent()
+          }
+          run self.reloadTree(false)
+          run self.recomputeNormGain()
+          run self.recomputeCompare()
+          run self.saveSessionPrefs()
+          run self.rebuildDrawings(false)
+          let mut msg = String.make()
+          run msg.append("Removed reference status from ")
+          run msg.append(String.view(&dispCopy))
+          self.statusMsg = move msg
+        }
+      }
+
+      Message.UnmarkCurrentRef => {
+        self.ctxMenuKind = CTX_NONE
+        if self.activeClipInLib && self.activeClipIsRef {
+          drop audio_native.libSetIsRef(
+            String.view(&self.activeClipDir),
+            String.view(&self.activeClipFilename),
+            false,
+          )
+          self.clearActiveRefSilent()
+          run self.reloadTree(false)
+          run self.recomputeNormGain()
+          run self.recomputeCompare()
+          run self.saveSessionPrefs()
+          run self.rebuildDrawings(false)
+          self.statusMsg = run String.copy("Removed reference status.")
+        }
+      }
+
+      Message.DetachLibClipFromRef { idx } => {
+        self.ctxMenuKind = CTX_NONE
+        let nodes = self.libTree.asSlice()
+        if idx < nodes.length && !nodes[idx].isDir {
+          let parentCopy = run String.copy(String.view(&nodes[idx].parentRel))
+          let fnCopy = run String.copy(String.view(&nodes[idx].name))
+          let fullCopy = run String.copy(String.view(&nodes[idx].fullPath))
+          let dispCopy = run String.copy(String.view(&nodes[idx].displayName))
+          drop audio_native.libSetParentRef(String.view(&parentCopy), String.view(&fnCopy), "")
+          if String.view(&self.activeClipPath) == String.view(&fullCopy) {
+            self.clearActiveRefSilent()
+          }
+          run self.reloadTree(false)
+          run self.recomputeNormGain()
+          run self.recomputeCompare()
+          run self.saveSessionPrefs()
+          run self.rebuildDrawings(false)
+          let mut msg = String.make()
+          run msg.append("Detached ")
+          run msg.append(String.view(&dispCopy))
+          run msg.append(" from reference")
+          self.statusMsg = move msg
+        }
       }
 
       Message.ToggleStarLibClip { idx } => {
@@ -6320,6 +6629,7 @@ impl Overtone {
           self.ctxExplorerExpanded = true
           self.ctxExplorerStarred = false
           self.ctxExplorerIsRef = false
+          self.ctxExplorerHasParentRef = false
         } else {
           let nodes = self.libTree.asSlice()
           if idx < nodes.length {
@@ -6330,9 +6640,8 @@ impl Overtone {
             self.ctxExplorerIsDir = nodes[idx].isDir
             self.ctxExplorerExpanded = nodes[idx].expanded
             self.ctxExplorerStarred = nodes[idx].starred
-            self.ctxExplorerIsRef = self.refClip.active
-              && String.byteLength(String.view(&self.refClip.fullPath)) > 0
-              && String.view(&nodes[idx].fullPath) == String.view(&self.refClip.fullPath)
+            self.ctxExplorerIsRef = nodes[idx].isRef || nodes[idx].childCount > 0
+            self.ctxExplorerHasParentRef = String.byteLength(String.view(&nodes[idx].parentRef)) > 0
           } else {
             self.ctxMenuKind = CTX_NONE
           }
@@ -6412,7 +6721,7 @@ impl Overtone {
         if button == 0 {
           let cmd = (modifiers & (MOD_META | MOD_CONTROL)) != 0
           let shift = (modifiers & MOD_SHIFT) != 0
-          if !nodes[idx].isDir && cmd {
+          if !nodes[idx].isDir && (cmd || self.libSelectMode) {
             let fp = run String.copy(String.view(&nodes[idx].fullPath))
             run self.toggleMultiSelectPath(String.view(&fp))
             self.lastSelectedLibIdx = usize.toI32(idx)
@@ -6435,6 +6744,8 @@ impl Overtone {
           self.explorerDragX = x
           self.explorerDragY = y
           self.explorerDropTargetRel.clear()
+          self.explorerDropTargetRefPath.clear()
+          self.explorerDropTargetLabel.clear()
           self.explorerDropValid = false
         }
       }
@@ -6465,6 +6776,28 @@ impl Overtone {
         }
       }
 
+      Message.ToggleLibSelectMode => {
+        self.ctxMenuKind = CTX_NONE
+        self.libSelectMode = !self.libSelectMode
+        if !self.libSelectMode {
+          self.selectedClipPaths.clear()
+          self.lastSelectedLibIdx = -1
+        }
+      }
+
+      Message.EnterSelectModeWithClip { idx } => {
+        self.ctxMenuKind = CTX_NONE
+        self.libSelectMode = true
+        let nodes = self.libTree.asSlice()
+        if idx < nodes.length && !nodes[idx].isDir {
+          let fp = run String.copy(String.view(&nodes[idx].fullPath))
+          if !self.isClipMultiSelected(String.view(&fp)) {
+            run self.toggleMultiSelectPath(String.view(&fp))
+          }
+          self.lastSelectedLibIdx = usize.toI32(idx)
+        }
+      }
+
       Message.ToggleSelectLibClip { idx } => {
         let nodes = self.libTree.asSlice()
         if idx < nodes.length && !nodes[idx].isDir {
@@ -6489,6 +6822,7 @@ impl Overtone {
       Message.ClearLibSelection => {
         self.selectedClipPaths.clear()
         self.lastSelectedLibIdx = -1
+        self.libSelectMode = false
       }
 
       Message.DeleteSelectedLibClips => {
@@ -6501,30 +6835,11 @@ impl Overtone {
         if isPractice(self.transport.value) {
           run self.sendTransport(TransportEvent.StopAll)
         }
-        // Create a fresh folder / empty reference slot ready for loose or new-ref recordings
-        let mut folderName = String.make()
-        run folderName.append("Reference ")
-        let mut n: i32 = 1
-        let nodes = self.libTree.asSlice()
-        let mut ni: usize = 0
-        while ni < nodes.length {
-          if nodes[ni].isDir { n = n + 1 }
-          ni = ni + 1
-        }
-        run appendInt(&mut folderName, n)
-        let created = run audio_native.libCreateFolder("", String.view(&folderName))
-        if String.byteLength(String.view(&created)) > 0 {
-          let cCopy = run String.copy(String.view(&created))
-          self.selectedFolderRel = move created
-          run self.ensureDirExpanded(String.view(&cCopy))
-        }
-        self.refClip.clear()
-        self.gpuNeedRefReload = true
-        self.listenMode = LISTEN_YOU
+        self.clearActiveRefSilent()
         run self.newDocument()
-        run self.reloadTree(true)
+        self.pendingNewRef = true
         run self.saveSessionPrefs()
-        self.statusMsg = run String.copy("Created empty Reference slot · Press R to record or drop an audio file")
+        self.statusMsg = run String.copy("New empty Reference · Press R to record or drop an audio file")
       }
 
       Message.SelectGeneralMode => {
@@ -6697,13 +7012,20 @@ impl Overtone {
           let doMove = self.explorerDropValid
           let srcIdx = self.explorerDragIdx
           let dstRel = run String.copy(String.view(&self.explorerDropTargetRel))
+          let dstRefPath = run String.copy(String.view(&self.explorerDropTargetRefPath))
           self.explorerDragPending = false
           self.explorerDragActive = false
           self.explorerDropValid = false
           self.explorerDropTargetRel.clear()
+          self.explorerDropTargetRefPath.clear()
+          self.explorerDropTargetLabel.clear()
           self.drag = DRAG_NONE
           if doMove {
-            run self.moveLibEntry(srcIdx, String.view(&dstRel))
+            if String.byteLength(String.view(&dstRefPath)) > 0 {
+              run self.attachLibEntryToRef(srcIdx, String.view(&dstRefPath))
+            } else {
+              run self.moveLibEntry(srcIdx, String.view(&dstRel))
+            }
           }
         } else if self.explorerDragPending {
           let idx = self.explorerDragIdx
@@ -7034,6 +7356,8 @@ impl Overtone {
               self.ctxMenuKind = CTX_NONE
             } else if self.showSettings {
               self.showSettings = false
+            } else if self.libSelectMode || self.selectedClipPaths.length() > 0 {
+              run self.handleMessage(Message.ClearLibSelection)
             } else {
               run self.handleMessage(Message.ClearSelection)
             }

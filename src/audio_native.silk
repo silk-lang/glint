@@ -78,6 +78,13 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
     parentRef: ?[*]const u8,
     parentRefLen: usize,
   ) -> i32 as "glint#ov_lib_set_parent_ref"
+  unsafe extern "C" fn ov_lib_set_is_ref(
+    relDir: ?[*]const u8,
+    relDirLen: usize,
+    fileName: ?[*]const u8,
+    fnLen: usize,
+    isRef: i32,
+  ) -> i32 as "glint#ov_lib_set_is_ref"
   unsafe extern "C" fn ov_play_stop() -> () as "glint#ov_play_stop"
   unsafe extern "C" fn ov_play_is_playing() -> i32 as "glint#ov_play_is_playing"
   unsafe extern "C" fn ov_play_take_finished() -> i32 as "glint#ov_play_take_finished"
@@ -951,6 +958,8 @@ pub struct LibTreeNode {
   pub parentRef: String,
   /// Number of attached takes nested directly beneath this Reference clip
   pub childCount: u32,
+  /// True if this clip is marked as a Reference (or has attached child takes)
+  pub isRef: bool,
 }
 
 pub struct LibTreeListing {
@@ -1081,6 +1090,8 @@ pub effect fn libScanTree(expandedLines: string, notesDir: string, activeRefPath
         ci = ci + 1
       }
     }
+    let l9 = unsafe ov_lib_tree_str(i, 9, Pointer.fromMutSlice(&mut buf), 1024)
+    let isRef = (l9 > 0 && buf[0] == 49) || childCount > 0
 
     let sc = if sortMode == SORT_PITCH {
       piArr[0]
@@ -1118,6 +1129,7 @@ pub effect fn libScanTree(expandedLines: string, notesDir: string, activeRefPath
       comment: move comment,
       parentRef: move parentRef,
       childCount: childCount,
+      isRef: isRef,
     })
     i = i + 1
   }
@@ -1363,6 +1375,23 @@ pub fn libSetParentRef(relDir: string, filename: string, parentRef: string) -> b
     drop relDir
     drop filename
     drop parentRef
+    return false
+  }
+}
+
+pub fn libSetIsRef(relDir: string, filename: string, isRef: bool) -> bool {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    return unsafe ov_lib_set_is_ref(
+      Pointer.fromSlice(String.utf8Bytes(relDir)),
+      String.byteLength(relDir),
+      Pointer.fromSlice(String.utf8Bytes(filename)),
+      String.byteLength(filename),
+      if isRef { 1 } else { 0 },
+    ) != 0
+  } else {
+    drop relDir
+    drop filename
+    drop isRef
     return false
   }
 }

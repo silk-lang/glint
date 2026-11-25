@@ -230,24 +230,19 @@ fn renderTopBar(m: &Overtone, h: &Document<Message>) -> Node {
               &[
                 txt(h, "vs", "text-[#C4C4C8]"),
                 txt(h, String.view(&m.refClip.name), "text-[#0B0B0C] font-semibold truncate max-w-[140px]"),
-                h.box(
-                  &[
-                    h.class("px-[6px] py-[2px] border border-[#E6E6E8] rounded-[4px] bg-white glint-btn-hover"),
-                    h.cursor(Cursor.Pointer),
-                    h.onClick(Message.PinReference),
-                  ],
-                  &[txt(h, "Change", "text-[11px] leading-[14px] text-[#6B6B70]")],
-                ),
               ],
             )
+          } else if m.activeClipIsRef {
+            txt(h, "REF", "glint-mono text-[10px] leading-[14px] px-[6px] py-[2px] rounded-[4px] bg-[#0E0E10] text-white shrink-0")
           } else {
             h.box(
               &[
+                h.testId("make-ref-btn"),
                 h.class("px-[6px] py-[2px] border border-[#E6E6E8] rounded-[4px] bg-white glint-btn-hover shrink-0"),
                 h.cursor(Cursor.Pointer),
                 h.onClick(Message.PinReference),
               ],
-              &[txt(h, "Pin as ref", "text-[11px] leading-[14px] text-[#6B6B70]")],
+              &[txt(h, "Make ref", "text-[11px] leading-[14px] text-[#6B6B70]")],
             )
           },
         ],
@@ -354,7 +349,7 @@ fn renderToolbar(m: &Overtone, h: &Document<Message>) -> Node {
             ],
             &[
               h.box(&[h.class("w-[8px] h-[8px] rounded-[4px] bg-[#FF4D3A]")], &[]),
-              txt(h, if m.isEditingActiveRef() { "Rec take" } else { "Rec" }, "text-[12px] leading-[16px] font-medium text-white"),
+              txt(h, if m.isViewingRefClip() { "Rec take" } else { "Rec" }, "text-[12px] leading-[16px] font-medium text-white"),
             ],
           ),
           h.row(
@@ -834,7 +829,7 @@ fn renderLibraryRail(m: &Overtone, h: &Document<Message>) -> Node {
     ],
     &[
       h.row(
-        &[h.class("h-[36px] shrink-0 items-center justify-between pl-[14px] pr-[8px] border-b border-[#F1F1F2]")],
+        &[h.class("h-[36px] shrink-0 items-center justify-between pl-[12px] pr-[6px] border-b border-[#F1F1F2]")],
         &[
           txt(h, "Library", "text-[11px] leading-[14px] font-semibold tracking-[0.06em] uppercase text-[#6B6B70]"),
           h.row(
@@ -843,6 +838,7 @@ fn renderLibraryRail(m: &Overtone, h: &Document<Message>) -> Node {
               railHeaderBtn(h, "All", m.libFilter == FILTER_ALL, Message.SetLibFilter { filter: FILTER_ALL }),
               railHeaderBtn(h, "★", m.libFilter == FILTER_STARRED, Message.SetLibFilter { filter: FILTER_STARRED }),
               railHeaderBtn(h, sortLabel(m.libSortMode), m.libSortMode != SORT_ALPHA, Message.OpenContextMenu { kind: CTX_LIB_SORT, x: 112.0, y: 120.0 }),
+              railHeaderBtn(h, if m.libSelectMode { "Done" } else { "Select" }, m.libSelectMode, Message.ToggleLibSelectMode),
               railHeaderBtn(h, "+", m.showNewFolderInput, Message.ToggleNewFolderInput),
               railHeaderBtn(h, "‹", false, Message.ToggleLibrary),
             ],
@@ -1153,7 +1149,7 @@ fn renderLibraryRail(m: &Overtone, h: &Document<Message>) -> Node {
 fn railHeaderBtn(h: &Document<Message>, label: string, active: bool, msg: Message) -> Node {
   return h.box(
     &[
-      h.class("px-[6px] py-[3px] rounded-[4px]"),
+      h.class("px-[5px] py-[3px] rounded-[4px] shrink-0"),
       h.classSelect(active, "bg-[#F1F1F2] text-[#0B0B0C] font-medium", "text-[#6B6B70] glint-btn-hover"),
       h.cursor(Cursor.Pointer),
       h.onClick(move msg),
@@ -1243,6 +1239,7 @@ fn renderExplorerRow(m: &Overtone, h: &Document<Message>, idx: usize, topY: f32)
   }
 
   let isDropTarget = m.explorerDragActive && m.explorerDropValid
+    && String.byteLength(String.view(&m.explorerDropTargetRefPath)) == 0
     && String.view(&m.explorerDropTargetRel) == String.view(&node.relPath)
 
   if node.isDir {
@@ -1266,12 +1263,20 @@ fn renderExplorerRow(m: &Overtone, h: &Document<Message>, idx: usize, topY: f32)
 
   let isActive = String.view(&node.fullPath) == String.view(&m.activeClipPath)
   let isMultiSel = m.isClipMultiSelected(String.view(&node.fullPath))
-  let isRef = m.refClip.active && String.view(&node.fullPath) == String.view(&m.refClip.fullPath)
+  let isActiveRef = m.refClip.active && String.view(&node.fullPath) == String.view(&m.refClip.fullPath)
+  let isRefNode = node.isRef || node.childCount > 0
+  let isChildTake = String.byteLength(String.view(&node.parentRef)) > 0
   let hasKids = node.childCount > 0
   let score = node.scoreOverall
-  let hasScore = score >= 0
+  // Only child takes attached to a Reference are scored!
+  let hasScore = isChildTake && score >= 0
   let barPct: f32 = if hasScore { i32.toF32(if score > 100 { 100 } else { score }) } else { 0.0 }
   let barColorCls = if score >= 60 { "bg-[#0B0B0C]" } else { "bg-[#B9B9BE]" }
+  let isRefDropTarget = m.explorerDragActive && m.explorerDropValid
+    && String.byteLength(String.view(&m.explorerDropTargetRefPath)) > 0
+    && String.view(&m.explorerDropTargetRefPath) == String.view(&node.fullPath)
+  // Thread vertical guide line for child takes aligned neatly beneath the parent Reference's ◈ icon
+  let railX = indentPx - 5.0
 
   return h.row(
     &[
@@ -1281,22 +1286,25 @@ fn renderExplorerRow(m: &Overtone, h: &Document<Message>, idx: usize, topY: f32)
         "bg-[#E6F6FD] text-[#0B0B0C] font-medium",
         if isActive { "bg-[#F1F1F2] text-[#0B0B0C] font-semibold" } else { "text-[#3A3A40] glint-btn-hover" },
       ),
+      h.classWhen(isRefDropTarget, "bg-[#5BCEFA]/20 border border-[#5BCEFA] rounded-[4px]"),
       h.style(&[css.top(px(topY)), css.paddingLeft(px(indentPx + 4.0))]),
       h.cursor(Cursor.Pointer),
       h.onLayout(|r| Message.ExplorerRowLayout { idx: idx, rect: r }),
       h.onPointerDown(|e| Reply<Message>.EmitAndStop { message: Message.ExplorerRowDown { idx: idx, x: e.x, y: e.y, button: e.button, modifiers: e.modifiers } }),
     ],
     &[
-      if hasKids {
+      if isChildTake {
         h.box(
           &[
-            h.class("w-[12px] h-[16px] flex items-center justify-center shrink-0 text-[#6B6B70] hover:text-[#0B0B0C]"),
-            h.cursor(Cursor.Pointer),
-            h.onPointerDown(|_| Reply<Message>.EmitAndStop { message: Message.ToggleRefGroupExpand { idx: idx } }),
+            h.class("absolute top-0 bottom-0 w-[1px] bg-[#DCDCE0] pointer-events-none"),
+            h.style(&[css.left(px(railX))]),
           ],
-          &[txt(h, if node.expanded { "▾" } else { "▸" }, "text-[9px]")],
+          &[],
         )
       } else {
+        h.empty()
+      },
+      if m.libSelectMode {
         h.box(
           &[
             h.class("w-[12px] h-[16px] flex items-center justify-center shrink-0"),
@@ -1306,31 +1314,55 @@ fn renderExplorerRow(m: &Overtone, h: &Document<Message>, idx: usize, topY: f32)
           &[
             h.box(
               &[
-                h.class("w-[10px] h-[10px] rounded-[2px] border flex items-center justify-center"),
-                h.classSelect(isMultiSel, "bg-[#0E0E10] border-[#0E0E10]", "border-[#D4D4D8] bg-white"),
+                h.class("w-[11px] h-[11px] rounded-[3px] border flex items-center justify-center"),
+                h.classSelect(isMultiSel, "bg-[#0E0E10] border-[#0E0E10]", "border-[#C8C8CE] bg-white"),
               ],
               &[if isMultiSel { txt(h, "✓", "text-[7px] leading-[8px] text-white font-bold") } else { h.empty() }],
             ),
           ],
         )
-      },
-      txt(h, String.view(&node.displayName), "flex-1 text-[12px] leading-[16px] truncate"),
-      if hasKids {
-        txt(h, pctDigits(u32.toI32(node.childCount)), "glint-mono text-[9px] px-[4px] py-[0px] rounded-[3px] bg-[#ECECEE] text-[#6B6B70] shrink-0")
+      } else if isRefNode {
+        txt(
+          h,
+          "◈",
+          if isActiveRef || isActive {
+            "w-[11px] shrink-0 text-[10px] leading-[12px] text-[#0B0B0C] text-center"
+          } else {
+            "w-[11px] shrink-0 text-[10px] leading-[12px] text-[#7A7A82] text-center"
+          },
+        )
       } else {
         h.empty()
       },
-      if isRef {
-        txt(h, "REF", "glint-mono text-[9px] px-[4px] py-[1px] rounded-[3px] bg-[#0E0E10] text-white shrink-0")
+      txt(h, String.view(&node.displayName), "flex-1 text-[12px] leading-[16px] truncate"),
+      if hasKids {
+        h.row(
+          &[
+            h.class("items-center gap-[2px] px-[4px] py-[1px] rounded-[4px] text-[#6B6B70] hover:text-[#0B0B0C] hover:bg-[#E6E6EA] shrink-0"),
+            h.cursor(Cursor.Pointer),
+            h.onPointerDown(|_| Reply<Message>.EmitAndStop { message: Message.ToggleRefGroupExpand { idx: idx } }),
+          ],
+          &[
+            txt(h, pctDigits(u32.toI32(node.childCount)), "glint-mono text-[10px] leading-[12px]"),
+            txt(h, if node.expanded { "⌄" } else { "›" }, "text-[11px] leading-[12px]"),
+          ],
+        )
       } else {
-        txt(h, if node.starred { "★" } else { "" }, "w-[11px] shrink-0 text-[10px] text-[#0B0B0C]")
+        h.empty()
       },
-      if hasScore && !isRef {
+      if isActiveRef {
+        txt(h, "REF", "glint-mono text-[9px] px-[4px] py-[1px] rounded-[3px] bg-[#0E0E10] text-white shrink-0")
+      } else if node.starred {
+        txt(h, "★", "w-[11px] shrink-0 text-[10px] text-[#0B0B0C]")
+      } else {
+        h.empty()
+      },
+      if hasScore {
         h.row(
           &[h.class("items-center gap-[6px] shrink-0")],
           &[
             h.box(
-              &[h.class("w-[32px] h-[3px] rounded-[2px] bg-[#ECECEE] flex overflow-hidden")],
+              &[h.class("w-[30px] h-[3px] rounded-[2px] bg-[#ECECEE] flex overflow-hidden")],
               &[h.box(&[h.class(barColorCls), h.class("h-full rounded-[2px]"), h.style(&[css.width(percent(barPct))])], &[])],
             ),
             txt(h, pctDigits(score), "w-[18px] text-right glint-mono text-[11px] leading-[14px]"),
@@ -2096,21 +2128,49 @@ fn renderMatchCard(m: &Overtone, h: &Document<Message>) -> Node {
         &[
           txt(
             h,
-            if useSel { "Match vs ref · sel" } else { "Match vs ref" },
+            if m.refClip.active {
+              if useSel { "Match vs ref · sel" } else { "Match vs ref" }
+            } else if m.activeClipIsRef {
+              "Reference clip"
+            } else {
+              "Match vs ref"
+            },
             "text-[11px] leading-[14px] font-semibold tracking-[0.06em] uppercase text-[#6B6B70]",
           ),
           h.row(
             &[h.class("items-center gap-[8px]")],
             &[
-              txtA(
-                h,
-                if m.refClip.active { "Weights ▾" } else { "Pin ref" },
-                &[
-                  h.class("text-[11px] leading-[14px] text-[#6B6B70] hover:text-[#0B0B0C]"),
-                  h.cursor(Cursor.Pointer),
-                  h.onClick(if m.refClip.active { Message.OpenSettingsTab { tab: SET_COMPARE } } else { Message.PinReference }),
-                ],
-              ),
+              if m.refClip.active {
+                txtA(
+                  h,
+                  "Weights ▾",
+                  &[
+                    h.class("text-[11px] leading-[14px] text-[#6B6B70] hover:text-[#0B0B0C]"),
+                    h.cursor(Cursor.Pointer),
+                    h.onClick(Message.OpenSettingsTab { tab: SET_COMPARE }),
+                  ],
+                )
+              } else if m.activeClipIsRef {
+                txtA(
+                  h,
+                  "Unmark",
+                  &[
+                    h.class("text-[11px] leading-[14px] text-[#6B6B70] hover:text-[#0B0B0C]"),
+                    h.cursor(Cursor.Pointer),
+                    h.onClick(Message.UnmarkCurrentRef),
+                  ],
+                )
+              } else {
+                txtA(
+                  h,
+                  "Make ref",
+                  &[
+                    h.class("text-[11px] leading-[14px] text-[#6B6B70] hover:text-[#0B0B0C]"),
+                    h.cursor(Cursor.Pointer),
+                    h.onClick(Message.PinReference),
+                  ],
+                )
+              },
               railHeaderBtn(h, "›", false, Message.ToggleReadouts),
             ],
           ),
@@ -2142,10 +2202,45 @@ fn renderMatchCard(m: &Overtone, h: &Document<Message>) -> Node {
             ),
           ],
         )
+      } else if m.activeClipIsRef {
+        h.column(
+          &[h.class("gap-[8px]")],
+          &[
+            txt(
+              h,
+              "Record a take or start Repeat drill to practice against this reference, or open one of its takes.",
+              "text-[12px] leading-[17px] text-[#6B6B70]",
+            ),
+            h.row(
+              &[h.class("items-center gap-[6px]")],
+              &[
+                h.row(
+                  &[
+                    h.class("items-center gap-[5px] px-[9px] py-[4px] rounded-[5px] bg-[#0E0E10] text-white"),
+                    h.cursor(Cursor.Pointer),
+                    h.onClick(Message.ToggleRecord),
+                  ],
+                  &[
+                    h.box(&[h.class("w-[6px] h-[6px] rounded-full bg-[#FF4D3A]")], &[]),
+                    txt(h, "Rec take", "text-[11px] leading-[14px] font-medium text-white"),
+                  ],
+                ),
+                h.box(
+                  &[
+                    h.class("px-[9px] py-[4px] rounded-[5px] border border-[#DCDCDF] bg-white glint-btn-hover"),
+                    h.cursor(Cursor.Pointer),
+                    h.onClick(Message.ToggleDrillMode),
+                  ],
+                  &[txt(h, "Repeat drill", "text-[11px] leading-[14px] font-medium text-[#0B0B0C]")],
+                ),
+              ],
+            ),
+          ],
+        )
       } else {
         txt(
           h,
-          "Pin any take as a reference (P) to compare pitch, size, weight, vowels, and divergence heatmap.",
+          "No reference active. Turn this clip into a reference (P) or drag it onto a reference in the library.",
           "text-[12px] leading-[17px] text-[#6B6B70]",
         )
       },

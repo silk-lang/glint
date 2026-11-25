@@ -164,6 +164,7 @@ async function hydrateLibrary() {
       }
       c.scoresByRef = c.scoresByRef || {};
       c.parentRef = typeof c.parentRef === "string" ? c.parentRef : "";
+      c.isRef = Boolean(c.isRef);
       lib.clips.set(c.fullPath, c);
     }
   }
@@ -263,16 +264,19 @@ function scanLibraryTree(expandedLines, notesDir, activeRefPath, sortMode) {
   }
 
   function pushClipRow(c, depth, refForScore, childList) {
-    const sc = scoreObjForRef(c, refForScore);
+    const sc = refForScore
+      ? scoreObjForRef(c, refForScore)
+      : { overall: -1, pitch: -1, size: -1, weight: -1, vowel: -1, ver: 0 };
     const hasKids = childList && childList.length > 0;
     const isExp = hasKids && expandedSet.has(c.fullPath);
+    const isRef = Boolean(c.isRef || hasKids);
     rows.push({
       isDir: 0,
       depth,
       expanded: isExp ? 1 : 0,
       rating: c.rating || 0,
       starred: c.starred ? 1 : 0,
-      score: sortKeyForMode(c, refForScore, sortMode),
+      score: refForScore ? sortKeyForMode(c, refForScore, sortMode) : -1,
       overall: sc.overall,
       pitch: sc.pitch,
       size: sc.size,
@@ -288,6 +292,7 @@ function scanLibraryTree(expandedLines, notesDir, activeRefPath, sortMode) {
       displayName: c.displayName || stripExt(c.name),
       parentRef: c.parentRef || "",
       childCount: hasKids ? childList.length : 0,
+      isRef,
     });
     if (isExp) {
       const sortedKids = [...childList];
@@ -339,21 +344,23 @@ function scanLibraryTree(expandedLines, notesDir, activeRefPath, sortMode) {
         displayName: name,
         parentRef: "",
         childCount: 0,
+        isRef: false,
       });
       if (isExp) walk(d.relPath, depth + 1);
     }
 
-    // Direct child clips (excluding takes nested under a parent Ref)
+    // Direct child clips (excluding takes nested under a parent Ref).
+    // Non-child clips (references & loose clips) are NEVER scored.
     const childClips = [];
     for (const c of lib.clips.values()) {
       if (cleanRel(c.relDir) === parentRel && !attachedSet.has(c.fullPath)) {
         childClips.push(c);
       }
     }
-    sortClipList(childClips, activeRefPath);
+    childClips.sort((a, b) => a.name.localeCompare(b.name));
 
     for (const c of childClips) {
-      pushClipRow(c, depth, activeRefPath, childrenByRef.get(c.fullPath) || null);
+      pushClipRow(c, depth, "", childrenByRef.get(c.fullPath) || null);
     }
   }
   walk("", 0);
@@ -1177,14 +1184,43 @@ const glintImports = {
   ov_lib_tree_str: (idx, field, out, cap) => {
     const r = lib.scanRows[idx];
     if (!r) return 0;
-    const vals = [r.name, r.relPath, r.parentRel, r.fullPath, r.modified, r.comment, r.displayName, r.parentRef || "", String(r.childCount || 0)];
+    const vals = [r.name, r.relPath, r.parentRel, r.fullPath, r.modified, r.comment, r.displayName, r.parentRef || "", String(r.childCount || 0), r.isRef ? "1" : "0"];
     return writeStr(vals[field] || "", out, cap);
   },
   ov_lib_set_parent_ref: (dirPtr, dirLen, fnPtr, fnLen, refPtr, refLen) => {
     const fp = `idb://${joinRel(readStr(dirPtr, dirLen), readStr(fnPtr, fnLen))}`;
     const clip = lib.clips.get(fp);
     if (!clip) return 0;
-    clip.parentRef = readStr(refPtr, refLen);
+    const newRef = readStr(refPtr, refLen);
+    if (newRef === fp) return 0;
+    clip.parentRef = newRef;
+    if (newRef) {
+      clip.isRef = false;
+      const parent = lib.clips.get(newRef);
+      if (parent && !parent.isRef) {
+        parent.isRef = true;
+        parent.parentRef = "";
+        idbPut("clips", parent);
+      }
+    }
+    idbPut("clips", clip);
+    return 1;
+  },
+  ov_lib_set_is_ref: (dirPtr, dirLen, fnPtr, fnLen, isRefFlag) => {
+    const fp = `idb://${joinRel(readStr(dirPtr, dirLen), readStr(fnPtr, fnLen))}`;
+    const clip = lib.clips.get(fp);
+    if (!clip) return 0;
+    clip.isRef = !!isRefFlag;
+    if (clip.isRef) {
+      clip.parentRef = "";
+    } else {
+      for (const c of lib.clips.values()) {
+        if (c.parentRef === fp) {
+          c.parentRef = "";
+          idbPut("clips", c);
+        }
+      }
+    }
     idbPut("clips", clip);
     return 1;
   },
@@ -1265,6 +1301,7 @@ const glintImports = {
       comment: existing?.comment || "",
       scoresByRef: existing?.scoresByRef || {},
       parentRef: existing?.parentRef || "",
+      isRef: existing?.isRef || false,
       modified: nowStamp(),
     };
     lib.clips.set(fullPath, rec);

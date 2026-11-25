@@ -706,12 +706,22 @@ pub fn renderContextMenu(m: &Overtone, h: &Document<Message>) -> Node {
       &[
         menuHeader(h, String.view(&m.ctxExplorerDisplayName)),
         menuItem(h, false, "Open", "", false, false, Message.OpenLibClip { idx: idx }),
-        menuItem(h, m.ctxExplorerIsRef, "Set as reference", "P", false, false, Message.SetLibClipAsRef { idx: idx }),
         if m.ctxExplorerIsRef {
           menuItem(h, false, "Record onto this ref", "", false, false, Message.RecordOntoRef)
         } else {
+          menuItem(h, false, "Turn into reference", "P", false, false, Message.SetLibClipAsRef { idx: idx })
+        },
+        if m.ctxExplorerIsRef {
+          menuItem(h, false, "Remove reference status", "", false, false, Message.UnmarkLibClipAsRef { idx: idx })
+        } else {
           h.empty()
         },
+        if m.ctxExplorerHasParentRef {
+          menuItem(h, false, "Detach from reference", "", false, false, Message.DetachLibClipFromRef { idx: idx })
+        } else {
+          h.empty()
+        },
+        menuItem(h, false, "Select multiple", "", false, false, Message.EnterSelectModeWithClip { idx: idx }),
         menuItem(h, false, "Rename", "F2", false, false, Message.StartRenameEntry { idx: idx }),
         menuItem(h, m.ctxExplorerStarred, if m.ctxExplorerStarred { "Unstar" } else { "Star" }, "", false, false, Message.ToggleStarLibClip { idx: idx }),
         if inSub {
@@ -1765,11 +1775,14 @@ fn renderSettingsShortcuts(h: &Document<Message>) -> Node {
   )
 }
 
-/// Floating drag ghost pill when moving a take/folder in the Library rail.
+/// Floating drag ghost pill when moving a take/folder or putting a clip inside a Reference.
 pub fn renderDragGhost(m: &Overtone, h: &Document<Message>) -> Node {
   if !m.explorerDragActive {
     return h.empty()
   }
+  let targetRef = String.view(&m.explorerDropTargetRefPath)
+  let isRefTarget = String.byteLength(targetRef) > 0
+  let targetLabel = String.view(&m.explorerDropTargetLabel)
   let targetRaw = String.view(&m.explorerDropTargetRel)
   let targetEmpty = String.byteLength(targetRaw) == 0
   let cls = if m.explorerDropValid {
@@ -1783,20 +1796,30 @@ pub fn renderDragGhost(m: &Overtone, h: &Document<Message>) -> Node {
       h.style(&[css.left(px(m.explorerDragX + 12.0)), css.top(px(m.explorerDragY - 12.0))]),
     ],
     &[
-      h.text("Move "),
+      h.text(if isRefTarget { "Put " } else { "Move " }),
       txtA(h, String.view(&m.explorerDragLabel), &[h.classWhen(m.explorerDropValid, "font-semibold")]),
       if m.explorerDropValid {
-        h.row(
-          &[h.class("items-center gap-[5px]")],
-          &[
-            txt(h, "→", "text-[#9A9AA2]"),
-            if targetEmpty {
-              txt(h, "/", "glint-mono text-[11px] text-[#C8C8CC]")
-            } else {
-              txt(h, targetRaw, "glint-mono text-[11px] text-[#C8C8CC]")
-            },
-          ],
-        )
+        if isRefTarget {
+          h.row(
+            &[h.class("items-center gap-[5px]")],
+            &[
+              txt(h, "inside ◈", "text-[#5BCEFA]"),
+              txt(h, targetLabel, "font-semibold text-white"),
+            ],
+          )
+        } else {
+          h.row(
+            &[h.class("items-center gap-[5px]")],
+            &[
+              txt(h, "→", "text-[#9A9AA2]"),
+              if targetEmpty {
+                txt(h, "/", "glint-mono text-[11px] text-[#C8C8CC]")
+              } else {
+                txt(h, targetRaw, "glint-mono text-[11px] text-[#C8C8CC]")
+              },
+            ],
+          )
+        }
       } else {
         h.text(" — can’t drop here")
       },
