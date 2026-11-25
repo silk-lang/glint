@@ -79,6 +79,18 @@ pub struct GuideBadge {
   pub label: String,
 }
 
+pub struct VowelSpan {
+  pub t0: f64,
+  pub t1: f64,
+  pub label: String,
+}
+
+pub struct VowelBadge {
+  pub x: f32,
+  pub w: f32,
+  pub label: String,
+}
+
 pub struct OverlayOptions {
   pub showPitch: bool,
   pub showHarmonics: bool,
@@ -91,6 +103,8 @@ pub struct OverlayOptions {
   pub heatmapMetric: u32,
   pub useDtwAlign: bool,
   pub plotOnRef: bool,
+  pub showVowelRegions: bool,
+  pub isolateMode: u32,
   pub displayClarity: f64,
   pub cursorSec: f64,
   pub hasSelection: bool,
@@ -921,6 +935,133 @@ effect fn drawDivergenceHeatmap(
   }
 }
 
+effect fn drawVowelRegionOverlay(
+  cmds: &mut List<CanvasCommand>,
+  vowelSpans: &[VowelSpan],
+  vp: &Viewport,
+  width: f32,
+  height: f32,
+  opts: OverlayOptions,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if width <= 4.0 || height <= 4.0 {
+    return ()
+  }
+  let dimColor = Rgba<f32> { r: 0.035, g: 0.035, b: 0.045, a: 0.46 }
+  let skyTint = Rgba<f32> { r: 0.357, g: 0.808, b: 0.980, a: 0.09 }
+  let skyBar = Rgba<f32> { r: 0.357, g: 0.808, b: 0.980, a: 0.88 }
+  let pinkBar = Rgba<f32> { r: 0.961, g: 0.663, b: 0.722, a: 0.88 }
+
+  if opts.isolateMode == 1 {
+    // Vowels only: dim non-vowel intervals & accent vowel spans with trans-sky edge
+    let mut prevX: f32 = 0.0
+    let mut i: usize = 0
+    while i < vowelSpans.length {
+      let sp = &vowelSpans[i]
+      if sp.t1 >= vp.t0 && sp.t0 <= vp.t1 {
+        let x0 = f32.max(0.0, f32.min(width, xOfTime(vp, sp.t0, width)))
+        let x1 = f32.max(0.0, f32.min(width, xOfTime(vp, sp.t1, width)))
+        if x0 > prevX + 0.5 {
+          run cmds.append(
+            CanvasCommand.FillRect { x: prevX, y: 0.0, width: x0 - prevX, height: height, radius: 0.0, color: dimColor },
+          )
+        }
+        if x1 > x0 + 0.5 {
+          run cmds.append(
+            CanvasCommand.FillRect { x: x0, y: height - 3.0, width: x1 - x0, height: 3.0, radius: 0.0, color: skyBar },
+          )
+        }
+        if x1 > prevX { prevX = x1 }
+      }
+      i = i + 1
+    }
+    if prevX < width - 0.5 {
+      run cmds.append(
+        CanvasCommand.FillRect { x: prevX, y: 0.0, width: width - prevX, height: height, radius: 0.0, color: dimColor },
+      )
+    }
+  } else if opts.isolateMode == 2 {
+    // Consonants only: dim vowel intervals & accent kept consonant intervals with trans-pink edge
+    let mut prevX: f32 = 0.0
+    let mut i: usize = 0
+    while i < vowelSpans.length {
+      let sp = &vowelSpans[i]
+      if sp.t1 >= vp.t0 && sp.t0 <= vp.t1 {
+        let x0 = f32.max(0.0, f32.min(width, xOfTime(vp, sp.t0, width)))
+        let x1 = f32.max(0.0, f32.min(width, xOfTime(vp, sp.t1, width)))
+        if x0 > prevX + 0.5 {
+          run cmds.append(
+            CanvasCommand.FillRect { x: prevX, y: height - 3.0, width: x0 - prevX, height: 3.0, radius: 0.0, color: pinkBar },
+          )
+        }
+        if x1 > x0 + 0.5 {
+          run cmds.append(
+            CanvasCommand.FillRect { x: x0, y: 0.0, width: x1 - x0, height: height, radius: 0.0, color: dimColor },
+          )
+        }
+        if x1 > prevX { prevX = x1 }
+      }
+      i = i + 1
+    }
+    if prevX < width - 0.5 {
+      run cmds.append(
+        CanvasCommand.FillRect { x: prevX, y: height - 3.0, width: width - prevX, height: 3.0, radius: 0.0, color: pinkBar },
+      )
+    }
+  } else {
+    // Highlight vowel regions passively without dimming consonants
+    let mut i: usize = 0
+    while i < vowelSpans.length {
+      let sp = &vowelSpans[i]
+      if sp.t1 >= vp.t0 && sp.t0 <= vp.t1 {
+        let x0 = f32.max(0.0, f32.min(width, xOfTime(vp, sp.t0, width)))
+        let x1 = f32.max(0.0, f32.min(width, xOfTime(vp, sp.t1, width)))
+        if x1 > x0 + 0.8 {
+          run cmds.append(
+            CanvasCommand.FillRect { x: x0, y: 0.0, width: x1 - x0, height: height, radius: 0.0, color: skyTint },
+          )
+          run cmds.append(
+            CanvasCommand.FillRect { x: x0, y: height - 3.0, width: x1 - x0, height: 3.0, radius: 0.0, color: skyBar },
+          )
+        }
+      }
+      i = i + 1
+    }
+  }
+}
+
+pub effect fn computeVowelBadges(
+  spans: &[VowelSpan],
+  vp: &Viewport,
+  width: f32,
+) -> List<VowelBadge>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<VowelBadge>.make()
+  if width <= 16.0 || spans.length == 0 {
+    return move out
+  }
+  let mut lastRight: f32 = -100.0
+  let mut i: usize = 0
+  while i < spans.length {
+    let sp = &spans[i]
+    let lbl = String.view(&sp.label)
+    if String.byteLength(lbl) > 0 && sp.t1 >= vp.t0 && sp.t0 <= vp.t1 {
+      let x0 = f32.max(0.0, f32.min(width, xOfTime(vp, sp.t0, width)))
+      let x1 = f32.max(0.0, f32.min(width, xOfTime(vp, sp.t1, width)))
+      let w = x1 - x0
+      let cx = 0.5 * (x0 + x1)
+      if w >= 8.0 && cx - 8.0 >= lastRight && cx <= width - 12.0 {
+        run out.append(VowelBadge { x: x0, w: f32.max(16.0, w), label: run String.copy(lbl) })
+        lastRight = x0 + f32.max(16.0, w) + 2.0
+      }
+    }
+    i = i + 1
+  }
+  return move out
+}
+
 pub effect fn buildSpectrogramOverlay(
   vp: &Viewport,
   width: f32,
@@ -931,6 +1072,7 @@ pub effect fn buildSpectrogramOverlay(
   refSamples: &[f32],
   refSampleRate: f64,
   guides: &[f64],
+  vowelSpans: &[VowelSpan],
   opts: OverlayOptions,
 ) -> Drawing
   ! OutOfMemoryError
@@ -938,6 +1080,11 @@ pub effect fn buildSpectrogramOverlay(
   let mut cmds = List<CanvasCommand>.make()
   if width <= 2.0 || height <= 2.0 {
     return run Drawing.make(move cmds)
+  }
+
+  // 0. Optional vowel/consonant isolation shading (underneath pitch/formants so curves stay crisp)
+  if (opts.showVowelRegions || opts.isolateMode != 0) && vowelSpans.length > 0 {
+    run drawVowelRegionOverlay(&mut cmds, vowelSpans, vp, width, height, opts)
   }
 
   // 1. Optional musical note grid lines (C notes stronger, other natural notes faint)

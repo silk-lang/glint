@@ -249,6 +249,46 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
   ) -> i32 as "glint#ov_synth_render"
   unsafe extern "C" fn ov_synth_play(startSec: f64, endSec: f64, loop: i32) -> i32 as "glint#ov_synth_play"
   unsafe extern "C" fn ov_synth_copy(out: ?[*]mut f32, maxCount: i32) -> i32 as "glint#ov_synth_copy"
+
+  unsafe extern "C" fn ov_phoneme_set_enabled(enabled: i32) -> () as "glint#ov_phoneme_set_enabled"
+  unsafe extern "C" fn ov_vowel_analyze(
+    jobId: i32,
+    isRef: i32,
+    samples: ?[*]const f32,
+    count: i32,
+    sampleRate: f64,
+    f0Times: ?[*]const f64,
+    f0Hz: ?[*]const f64,
+    f0Conf: ?[*]const f64,
+    f0Count: i32,
+    fmtTimes: ?[*]const f64,
+    f1: ?[*]const f64,
+    f2: ?[*]const f64,
+    f3: ?[*]const f64,
+    fmtCount: i32,
+    wantNeural: i32,
+  ) -> i32 as "glint#ov_vowel_analyze"
+  unsafe extern "C" fn ov_vowel_span_count(isRef: i32) -> i32 as "glint#ov_vowel_span_count"
+  unsafe extern "C" fn ov_vowel_is_neural(isRef: i32) -> i32 as "glint#ov_vowel_is_neural"
+  unsafe extern "C" fn ov_vowel_copy_spans(
+    isRef: i32,
+    t0: ?[*]mut f64,
+    t1: ?[*]mut f64,
+    labelBuf: ?[*]mut u8,
+    labelStride: i32,
+    maxCount: i32,
+  ) -> i32 as "glint#ov_vowel_copy_spans"
+  unsafe extern "C" fn ov_play_filtered(
+    isRef: i32,
+    samples: ?[*]const f32,
+    totalCount: i32,
+    sampleRate: f64,
+    startSec: f64,
+    endSec: f64,
+    loop: i32,
+    mode: i32,
+    compact: i32,
+  ) -> i32 as "glint#ov_play_filtered"
 } else {
   unsafe extern "C" fn ov_audio_refresh_devices() -> i32
   unsafe extern "C" fn ov_audio_input_count() -> i32
@@ -1513,5 +1553,179 @@ pub fn synthCopy(out: &mut [f32]) -> usize {
   } else {
     drop out
     return 0
+  }
+}
+
+pub fn phonemeSetEnabled(enabled: bool) -> () {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    unsafe ov_phoneme_set_enabled(if enabled { 1 } else { 0 })
+  } else {
+    drop enabled
+  }
+}
+
+pub fn vowelAnalyze(
+  jobId: i32,
+  isRef: bool,
+  samples: &[f32],
+  sampleRate: f64,
+  f0Times: &[f64],
+  f0Hz: &[f64],
+  f0Conf: &[f64],
+  fmtTimes: &[f64],
+  f1: &[f64],
+  f2: &[f64],
+  f3: &[f64],
+  wantNeural: bool,
+) -> usize {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    if samples.length < 64 {
+      return 0
+    }
+    let mut f0N = f0Times.length
+    if f0Hz.length < f0N { f0N = f0Hz.length }
+    if f0Conf.length < f0N { f0N = f0Conf.length }
+    let mut fmtN = fmtTimes.length
+    if f1.length < fmtN { fmtN = f1.length }
+    if f2.length < fmtN { fmtN = f2.length }
+    if f3.length < fmtN { fmtN = f3.length }
+    let n = unsafe ov_vowel_analyze(
+      jobId,
+      if isRef { 1 } else { 0 },
+      Pointer.fromSlice(samples),
+      usize.toI32(samples.length),
+      sampleRate,
+      Pointer.fromSlice(f0Times),
+      Pointer.fromSlice(f0Hz),
+      Pointer.fromSlice(f0Conf),
+      usize.toI32(f0N),
+      Pointer.fromSlice(fmtTimes),
+      Pointer.fromSlice(f1),
+      Pointer.fromSlice(f2),
+      Pointer.fromSlice(f3),
+      usize.toI32(fmtN),
+      if wantNeural { 1 } else { 0 },
+    )
+    return if n > 0 { i32.toUsize(n) } else { 0 }
+  } else {
+    drop jobId
+    drop isRef
+    drop samples
+    drop sampleRate
+    drop f0Times
+    drop f0Hz
+    drop f0Conf
+    drop fmtTimes
+    drop f1
+    drop f2
+    drop f3
+    drop wantNeural
+    return 0
+  }
+}
+
+pub fn vowelSpanCount(isRef: bool) -> usize {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    let n = unsafe ov_vowel_span_count(if isRef { 1 } else { 0 })
+    return if n > 0 { i32.toUsize(n) } else { 0 }
+  } else {
+    drop isRef
+    return 0
+  }
+}
+
+pub fn vowelIsNeural(isRef: bool) -> bool {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    return unsafe ov_vowel_is_neural(if isRef { 1 } else { 0 }) != 0
+  } else {
+    drop isRef
+    return false
+  }
+}
+
+pub fn vowelCopySpans(
+  isRef: bool,
+  t0: &mut [f64],
+  t1: &mut [f64],
+  labelBuf: &mut [u8],
+  labelStride: usize,
+) -> usize {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    let mut cap = t0.length
+    if t1.length < cap { cap = t1.length }
+    if cap == 0 || labelStride == 0 || labelBuf.length < cap * labelStride {
+      return 0
+    }
+    let n = unsafe ov_vowel_copy_spans(
+      if isRef { 1 } else { 0 },
+      Pointer.fromMutSlice(move t0),
+      Pointer.fromMutSlice(move t1),
+      Pointer.fromMutSlice(move labelBuf),
+      usize.toI32(labelStride),
+      usize.toI32(cap),
+    )
+    return if n > 0 { i32.toUsize(n) } else { 0 }
+  } else {
+    drop isRef
+    drop t0
+    drop t1
+    drop labelBuf
+    drop labelStride
+    return 0
+  }
+}
+
+pub effect fn vowelLabelAt(buf: &[u8], idx: usize, stride: usize) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let start = idx * stride
+  if start >= buf.length || stride == 0 {
+    return String.make()
+  }
+  let mut lim = start + stride
+  if lim > buf.length {
+    lim = buf.length
+  }
+  let mut end = start
+  while end < lim && buf[end] != 0 {
+    end = end + 1
+  }
+  if end <= start {
+    return String.make()
+  }
+  return run copyUtf8Lossy(Slice.view<u8>(buf, start, end - start))
+}
+
+pub fn playFiltered(
+  isRef: bool,
+  samples: &[f32],
+  sampleRate: f64,
+  startSec: f64,
+  endSec: f64,
+  loop: bool,
+  mode: u32,
+  compact: bool,
+) -> bool {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    if samples.length == 0 {
+      return false
+    }
+    let modeI32: i32 = if mode == 1 { 1 } else if mode == 2 { 2 } else { 0 }
+    return unsafe ov_play_filtered(
+      if isRef { 1 } else { 0 },
+      Pointer.fromSlice(samples),
+      usize.toI32(samples.length),
+      sampleRate,
+      startSec,
+      endSec,
+      if loop { 1 } else { 0 },
+      modeI32,
+      if compact { 1 } else { 0 },
+    ) != 0
+  } else {
+    drop isRef
+    drop mode
+    drop compact
+    return playRange(samples, sampleRate, startSec, endSec, loop)
   }
 }

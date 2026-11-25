@@ -5,14 +5,18 @@ import audio_native { SORT_ALPHA, SORT_OVERALL, SORT_PITCH, SORT_SIZE, SORT_VOWE
 import colormap { paletteIndex, paletteName }
 import compare { HEATMAP_OVERALL, HEATMAP_PITCH, HEATMAP_SIZE, HEATMAP_VOWEL, HEATMAP_WEIGHT }
 import formants { VOWELS_FEM, VOWELS_MASC, VOWEL_MODE_BOTH, VOWEL_MODE_FEM, VOWEL_MODE_MASC }
-import overlays { AxisTick, GuideBadge, vowelX, vowelY }
+import overlays { AxisTick, GuideBadge, VowelBadge, vowelX, vowelY }
 import studio {
   AXIS_W,
   CTX_AUDIO,
   CTX_FORMANTS,
+  CTX_ISOLATE,
   CTX_LIB_SORT,
   CTX_PALETTE,
   CTX_SPEED,
+  ISOLATE_CONSONANTS,
+  ISOLATE_FULL,
+  ISOLATE_VOWELS,
   DRAG_EXPLORER_SCROLL,
   DRAG_GUIDE,
   DRAG_NONE,
@@ -380,6 +384,49 @@ fn renderToolbar(m: &Overtone, h: &Document<Message>) -> Node {
               h.onClick(Message.OpenContextMenu { kind: CTX_SPEED, x: 248.0, y: 84.0 }),
             ],
             &[txt(h, String.view(&m.readoutSpeedStr), "glint-mono text-[11px] leading-[14px] text-[#0B0B0C]")],
+          ),
+          h.box(
+            &[
+              h.testId("isolate-btn"),
+              h.class("flex items-center gap-[5px] h-[28px] px-[9px] rounded-[6px]"),
+              h.classSelect(
+                m.isolateMode != ISOLATE_FULL,
+                "bg-[#0E0E10] text-white",
+                "text-[#6B6B70] glint-btn-hover",
+              ),
+              h.cursor(Cursor.Pointer),
+              h.onClick(Message.OpenContextMenu { kind: CTX_ISOLATE, x: 290.0, y: 84.0 }),
+            ],
+            &[
+              if m.isolateMode != ISOLATE_FULL {
+                h.box(
+                  &[
+                    h.class("w-[6px] h-[6px] rounded-full shrink-0"),
+                    h.classSelect(m.isolateMode == ISOLATE_VOWELS, "bg-[#5BCEFA]", "bg-[#F5A9B8]"),
+                  ],
+                  &[],
+                )
+              } else {
+                h.empty()
+              },
+              txt(
+                h,
+                if m.isolateMode == ISOLATE_VOWELS {
+                  if m.isolateCompact { "Vowels · Stitch ▾" } else { "Vowels ▾" }
+                } else if m.isolateMode == ISOLATE_CONSONANTS {
+                  if m.isolateCompact { "Consonants · Stitch ▾" } else { "Consonants ▾" }
+                } else if (m.neuralStatusFlags & 16) != 0 {
+                  "Isolate… ▾"
+                } else {
+                  "Isolate ▾"
+                },
+                if m.isolateMode != ISOLATE_FULL {
+                  "text-[12px] leading-[16px] font-medium text-white"
+                } else {
+                  "text-[12px] leading-[16px]"
+                },
+              ),
+            ],
           ),
         ],
       ),
@@ -1362,6 +1409,21 @@ fn renderSpectrogramWell(m: &Overtone, h: &Document<Message>) -> Node {
                   h.empty()
                 },
               ),
+              // IPA vowel phoneme badges along bottom edge when Neural IPA is active
+              if (m.showVowelRegions || m.isolateMode != ISOLATE_FULL) && m.vowelBadges.length() > 0 {
+                h.each<VowelBadge>(
+                  m.vowelBadges.asSlice(),
+                  |vb| h.box(
+                    &[
+                      h.class("absolute bottom-[5px] px-[4px] py-[1px] rounded-[3px] bg-[#0E0E10]/85 border border-[#5BCEFA]/40 pointer-events-none flex items-center justify-center"),
+                      h.style(&[css.left(px(vb.x)), css.minWidth(px(16.0))]),
+                    ],
+                    &[txt(h, String.view(&vb.label), "text-[10px] leading-[12px] font-medium text-[#5BCEFA]")],
+                  ),
+                )
+              } else {
+                h.empty()
+              },
               if showPlayhead {
                 h.box(
                   &[

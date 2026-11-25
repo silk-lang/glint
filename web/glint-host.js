@@ -5,6 +5,12 @@
 //   - WebGL2 3-tier spectrogram renderer (exact 1:1 port of Glint's WGSL shader)
 import { mount } from "./silk-ui-dom.js";
 import { resynthesizeVoice } from "./voice-synth.js";
+import {
+  computeAcousticVowelAnalysis,
+  refineNeuralPhonemeSpans,
+  buildIsolatedAudio,
+  mapCompactTimeToSource,
+} from "./vowel-isolator.js";
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
@@ -353,6 +359,7 @@ const audioState = {
   playEndSec: 0,
   playLoop: false,
   playPositionSec: 0,
+  playTimeMap: null,
   volume: 0.85,
   speed: 1.0,
 
@@ -480,7 +487,7 @@ function stopPlayback() {
   audioState.playing = false;
 }
 
-function startPlayback(samples, sampleRate, startSec, endSec, loop) {
+function startPlayback(samples, sampleRate, startSec, endSec, loop, timeMap = null) {
   stopPlayback();
   if (!samples || samples.length === 0 || sampleRate <= 0) return 0;
   const ctx = ensureAudioCtx();
@@ -512,13 +519,16 @@ function startPlayback(samples, sampleRate, startSec, endSec, loop) {
   audioState.playStartSec = s0;
   audioState.playEndSec = s1;
   audioState.playLoop = !!loop;
-  audioState.playPositionSec = s0;
+  audioState.playTimeMap = timeMap || null;
+  audioState.playPositionSec = timeMap ? mapCompactTimeToSource(timeMap, s0) : s0;
 
   src.onended = () => {
     if (audioState.playNode === src && !audioState.playLoop) {
       audioState.playing = false;
       audioState.finishedFlag = true;
-      audioState.playPositionSec = audioState.playEndSec;
+      audioState.playPositionSec = audioState.playTimeMap
+        ? mapCompactTimeToSource(audioState.playTimeMap, audioState.playEndSec)
+        : audioState.playEndSec;
     }
   };
 
@@ -534,12 +544,13 @@ function currentPlayPosition() {
   if (!audioState.playing || !audioCtx) return audioState.playPositionSec;
   const elapsed = (audioCtx.currentTime - audioState.playStartCtxTime) * audioState.speed;
   const span = Math.max(0.01, audioState.playEndSec - audioState.playStartSec);
+  let rawPos = audioState.playStartSec + elapsed;
   if (audioState.playLoop) {
-    return audioState.playStartSec + (elapsed % span);
+    rawPos = audioState.playStartSec + (elapsed % span);
+  } else if (rawPos >= audioState.playEndSec) {
+    rawPos = audioState.playEndSec;
   }
-  const pos = audioState.playStartSec + elapsed;
-  if (pos >= audioState.playEndSec) return audioState.playEndSec;
-  return pos;
+  return audioState.playTimeMap ? mapCompactTimeToSource(audioState.playTimeMap, rawPos) : rawPos;
 }
 
 function playScrubGrain(centerSec) {
@@ -1357,9 +1368,138 @@ const glintImports = {
     new Float32Array(memBuf(), outPtr, n).set(synthAudio.samples.subarray(0, n));
     return n;
   },
+
+  // Vowel & Consonant Isolation (Option 1 instant acoustic + Option 2 lazy Allosaurus IPA)
+  ov_phoneme_set_enabled: (enabled) => {
+    if (enabled && neuralWorker) {
+      neuralWorker.postMessage({ type: "enable_phonemes" });
+    }
+  },
+  ov_vowel_analyze: (
+    jobId,
+    isRef,
+    samplesPtr,
+    count,
+    sampleRate,
+    f0TimesPtr,
+    f0HzPtr,
+    f0ConfPtr,
+    f0Count,
+    fmtTimesPtr,
+    f1Ptr,
+    f2Ptr,
+    f3Ptr,
+    fmtCount,
+    wantNeural,
+  ) => {
+    const slot = isRef ? 1 : 0;
+    if (count < 64 || sampleRate <= 0) {
+      vowelSlots[slot] = { jobId, acoustic: null, spans: [], isNeural: false };
+      return 0;
+    }
+    const pcm = new Float32Array(count);
+    pcm.set(new Float32Array(memBuf(), samplesPtr, count));
+    const f0Times = f0Count > 0 ? new Float64Array(memBuf(), f0TimesPtr, f0Count).slice() : null;
+    const f0Hz = f0Count > 0 ? new Float64Array(memBuf(), f0HzPtr, f0Count).slice() : null;
+    const f0Conf = f0Count > 0 ? new Float64Array(memBuf(), f0ConfPtr, f0Count).slice() : null;
+    const fmtTimes = fmtCount > 0 ? new Float64Array(memBuf(), fmtTimesPtr, fmtCount).slice() : null;
+    const fmtF1 = fmtCount > 0 ? new Float64Array(memBuf(), f1Ptr, fmtCount).slice() : null;
+    const fmtF2 = fmtCount > 0 ? new Float64Array(memBuf(), f2Ptr, fmtCount).slice() : null;
+    const fmtF3 = fmtCount > 0 ? new Float64Array(memBuf(), f3Ptr, fmtCount).slice() : null;
+
+    const acoustic = computeAcousticVowelAnalysis(
+      pcm,
+      sampleRate,
+      f0Times,
+      f0Hz,
+      f0Conf,
+      fmtTimes,
+      fmtF1,
+      fmtF2,
+      fmtF3,
+    );
+    vowelSlots[slot] = {
+      jobId,
+      acoustic,
+      spans: acoustic.spans,
+      isNeural: false,
+    };
+
+    if (wantNeural && neuralWorker) {
+      const workerCopy = new Float32Array(pcm);
+      neuralWorker.postMessage(
+        { type: "analyze_phonemes", jobId, isRef: slot, samples: workerCopy, sampleRate },
+        [workerCopy.buffer],
+      );
+    }
+    return acoustic.spans.length;
+  },
+  ov_vowel_span_count: (isRef) => {
+    const st = vowelSlots[isRef ? 1 : 0];
+    return st && st.spans ? st.spans.length : 0;
+  },
+  ov_vowel_is_neural: (isRef) => {
+    const st = vowelSlots[isRef ? 1 : 0];
+    return st && st.isNeural ? 1 : 0;
+  },
+  ov_vowel_copy_spans: (isRef, t0Ptr, t1Ptr, labelBufPtr, labelStride, maxCount) => {
+    const st = vowelSlots[isRef ? 1 : 0];
+    if (!st || !st.spans || st.spans.length === 0) return 0;
+    const n = Math.min(maxCount, st.spans.length);
+    const outT0 = new Float64Array(memBuf(), t0Ptr, n);
+    const outT1 = new Float64Array(memBuf(), t1Ptr, n);
+    const labelMem = labelBufPtr && labelStride > 0 ? new Uint8Array(memBuf(), labelBufPtr, n * labelStride) : null;
+    if (labelMem) labelMem.fill(0);
+    for (let i = 0; i < n; i++) {
+      const sp = st.spans[i];
+      outT0[i] = sp.t0;
+      outT1[i] = sp.t1;
+      if (labelMem && sp.label) {
+        const bytes = encoder.encode(sp.label);
+        const len = Math.min(labelStride - 1, bytes.length);
+        labelMem.set(bytes.subarray(0, len), i * labelStride);
+      }
+    }
+    return n;
+  },
+  ov_play_filtered: (isRef, samplesPtr, count, sampleRate, startSec, endSec, loop, mode, compact) => {
+    if (count < 64 || sampleRate <= 0) return 0;
+    const pcm = readF32Copy(samplesPtr, count);
+    if (mode === 0) {
+      return startPlayback(pcm, sampleRate, startSec, endSec, loop !== 0, null);
+    }
+    const slot = isRef ? 1 : 0;
+    let st = vowelSlots[slot];
+    if (!st || !st.acoustic || Math.abs(st.acoustic.durationSec - count / sampleRate) > 0.08) {
+      const ac = computeAcousticVowelAnalysis(pcm, sampleRate);
+      st = { jobId: 0, acoustic: ac, spans: ac.spans, isNeural: false };
+      vowelSlots[slot] = st;
+    }
+    const iso = buildIsolatedAudio(
+      pcm,
+      sampleRate,
+      st.spans,
+      mode,
+      compact !== 0,
+      startSec,
+      endSec,
+    );
+    return startPlayback(
+      iso.samples,
+      iso.sampleRate,
+      iso.startSec,
+      iso.endSec,
+      loop !== 0,
+      iso.timeMap,
+    );
+  },
 };
 
 let synthAudio = null;
+const vowelSlots = [
+  { jobId: 0, acoustic: null, spans: [], isNeural: false },
+  { jobId: 0, acoustic: null, spans: [], isNeural: false },
+];
 
 let neuralWorker = null;
 let neuralResult = null;
@@ -1387,6 +1527,20 @@ function initNeuralWorker() {
           mountedPage.post("neural_ready", payload);
         } else {
           pendingNeuralPosts.push(["neural_ready", payload]);
+        }
+      } else if (msg.type === "phonemes_result") {
+        const slot = msg.isRef ? 1 : 0;
+        const cur = vowelSlots[slot];
+        if (cur && cur.jobId === msg.jobId && cur.acoustic) {
+          const refined = refineNeuralPhonemeSpans(msg.phones || [], cur.acoustic);
+          cur.spans = refined;
+          cur.isNeural = true;
+          const payload = `${msg.jobId}|${slot}|${refined.length}`;
+          if (mountedPage) {
+            mountedPage.post("phonemes_ready", payload);
+          } else {
+            pendingNeuralPosts.push(["phonemes_ready", payload]);
+          }
         }
       }
     });

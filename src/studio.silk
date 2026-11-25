@@ -73,6 +73,8 @@ import overlays {
   AxisTick,
   GuideBadge,
   OverlayOptions,
+  VowelBadge,
+  VowelSpan,
   appendFixed,
   buildLtasDrawing,
   buildMetricsLaneDrawing,
@@ -86,6 +88,7 @@ import overlays {
   computeFreqTicks,
   computeGuideBadges,
   computeTimeTicks,
+  computeVowelBadges,
   formatCents,
   formatDb,
   formatHz,
@@ -179,6 +182,12 @@ pub const CTX_EXPLORER_DIR: u32 = 6
 pub const CTX_EXPLORER_ROOT: u32 = 7
 pub const CTX_LIB_SORT: u32 = 8
 pub const CTX_FORMANTS: u32 = 9
+pub const CTX_ISOLATE: u32 = 10
+
+// Vowel / consonant audio isolation modes
+pub const ISOLATE_FULL: u32 = 0
+pub const ISOLATE_VOWELS: u32 = 1
+pub const ISOLATE_CONSONANTS: u32 = 2
 
 // Virtualized Explorer row layout metrics (Glint 26px crisp single-line rows)
 pub const EXPLORER_ROW_H: f32 = 26.0
@@ -381,6 +390,13 @@ pub union Message {
   ToggleNeural,
   NeuralReady { pub jobId: i32, pub isRef: bool, pub hasPitch: bool, pub hasFormants: bool },
   NeuralStatus { pub flags: i32 },
+  // Vowel / consonant isolation & lazy Allosaurus neural IPA upgrade
+  SetIsolateMode { pub mode: u32 },
+  SetIsolateCompact { pub compact: bool },
+  SetNeuralPhonemes { pub enabled: bool },
+  ToggleNeuralPhonemes,
+  ToggleVowelOverlay,
+  PhonemesReady { pub jobId: i32, pub isRef: bool },
   // Hear in your voice (source-filter preview resynthesis)
   ToggleVoicePreview,
   PlaySynthAdjusted,
@@ -720,6 +736,19 @@ pub struct Overtone {
   pub takeNeuralGen: i32,
   pub refNeuralGen: i32,
   pub neuralStatusFlags: i32,
+
+  // Vowel / consonant isolation (Option 1 instant acoustic + Option 2 lazy Allosaurus IPA)
+  pub isolateMode: u32,
+  pub isolateCompact: bool,
+  pub useNeuralPhonemes: bool,
+  pub showVowelRegions: bool,
+  pub takePhoneGen: i32,
+  pub refPhoneGen: i32,
+  pub takeVowelIsNeural: bool,
+  pub refVowelIsNeural: bool,
+  pub takeVowelSpans: List<VowelSpan>,
+  pub refVowelSpans: List<VowelSpan>,
+  pub vowelBadges: List<VowelBadge>,
 
   // Hear in your voice (Pitch / Size / Weight preview resynthesis)
   pub showVoicePreview: bool,
@@ -1064,6 +1093,18 @@ impl Overtone {
       takeNeuralGen: 0,
       refNeuralGen: 0,
       neuralStatusFlags: 0,
+
+      isolateMode: ISOLATE_FULL,
+      isolateCompact: false,
+      useNeuralPhonemes: false,
+      showVowelRegions: false,
+      takePhoneGen: 0,
+      refPhoneGen: 0,
+      takeVowelIsNeural: false,
+      refVowelIsNeural: false,
+      takeVowelSpans: List<VowelSpan>.make(),
+      refVowelSpans: List<VowelSpan>.make(),
+      vowelBadges: List<VowelBadge>.make(),
 
       showVoicePreview: false,
       enablePinchZoom: false,
@@ -2466,6 +2507,160 @@ impl Overtone {
     run self.voiceMetrics.finalizeSummary(self.samples.asSlice(), self.sampleRate)
     run self.recomputeCompare()
     self.requestNeuralForTake()
+    run self.refreshVowelAnalysis(false)
+  }
+
+  effect fn pullVowelSpansFromHost(self: &mut Self, isRef: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let n = audio_native.vowelSpanCount(isRef)
+    let isNeural = audio_native.vowelIsNeural(isRef)
+    let mut spans = List<VowelSpan>.make()
+    if n > 0 {
+      let stride: usize = 16
+      let mut t0s = List<f64>.make()
+      let mut t1s = List<f64>.make()
+      let mut lbuf = List<u8>.make()
+      run t0s.appendRepeated(0.0, n)
+      run t1s.appendRepeated(0.0, n)
+      run lbuf.appendRepeated(0, n * stride)
+      let got = audio_native.vowelCopySpans(isRef, t0s.asMutSlice(), t1s.asMutSlice(), lbuf.asMutSlice(), stride)
+      let t0sl = t0s.asSlice()
+      let t1sl = t1s.asSlice()
+      let lbsl = lbuf.asSlice()
+      let mut i: usize = 0
+      while i < got {
+        let lbl = run audio_native.vowelLabelAt(lbsl, i, stride)
+        run spans.append(VowelSpan { t0: t0sl[i], t1: t1sl[i], label: move lbl })
+        i = i + 1
+      }
+    }
+    if isRef {
+      self.refVowelSpans = move spans
+      self.refVowelIsNeural = isNeural
+    } else {
+      self.takeVowelSpans = move spans
+      self.takeVowelIsNeural = isNeural
+    }
+  }
+
+  effect fn refreshVowelAnalysis(self: &mut Self, isRef: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if isRef {
+      if !self.refClip.active || self.refClip.samples.length() < 64 {
+        self.refVowelSpans.clear()
+        self.refVowelIsNeural = false
+        return ()
+      }
+      self.refPhoneGen = self.refPhoneGen + 1
+      let pframes = self.refClip.pitchFrames.asSlice()
+      let fframes = self.refClip.formantFrames.asSlice()
+      let mut pTs = List<f64>.make()
+      let mut pHz = List<f64>.make()
+      let mut pCf = List<f64>.make()
+      let mut i: usize = 0
+      while i < pframes.length {
+        run pTs.append(pframes[i].time)
+        run pHz.append(if pframes[i].voiced { pframes[i].frequency } else { 0.0 })
+        run pCf.append(pframes[i].clarity)
+        i = i + 1
+      }
+      let mut fTs = List<f64>.make()
+      let mut f1 = List<f64>.make()
+      let mut f2 = List<f64>.make()
+      let mut f3 = List<f64>.make()
+      i = 0
+      while i < fframes.length {
+        run fTs.append(fframes[i].time)
+        run f1.append(fframes[i].f1)
+        run f2.append(fframes[i].f2)
+        run f3.append(fframes[i].f3)
+        i = i + 1
+      }
+      drop audio_native.vowelAnalyze(
+        self.refPhoneGen,
+        true,
+        self.refClip.samples.asSlice(),
+        self.refClip.sampleRate,
+        pTs.asSlice(),
+        pHz.asSlice(),
+        pCf.asSlice(),
+        fTs.asSlice(),
+        f1.asSlice(),
+        f2.asSlice(),
+        f3.asSlice(),
+        self.useNeuralPhonemes,
+      )
+      run self.pullVowelSpansFromHost(true)
+      return ()
+    }
+
+    if self.recording || self.samples.length() < 64 {
+      self.takeVowelSpans.clear()
+      self.takeVowelIsNeural = false
+      return ()
+    }
+    self.takePhoneGen = self.takePhoneGen + 1
+    let pframes = self.pitchTrack.frames.asSlice()
+    let fframes = self.formantTrack.frames.asSlice()
+    let mut pTs = List<f64>.make()
+    let mut pHz = List<f64>.make()
+    let mut pCf = List<f64>.make()
+    let mut i: usize = 0
+    while i < pframes.length {
+      run pTs.append(pframes[i].time)
+      run pHz.append(if pframes[i].voiced { pframes[i].frequency } else { 0.0 })
+      run pCf.append(pframes[i].clarity)
+      i = i + 1
+    }
+    let mut fTs = List<f64>.make()
+    let mut f1 = List<f64>.make()
+    let mut f2 = List<f64>.make()
+    let mut f3 = List<f64>.make()
+    i = 0
+    while i < fframes.length {
+      run fTs.append(fframes[i].time)
+      run f1.append(fframes[i].f1)
+      run f2.append(fframes[i].f2)
+      run f3.append(fframes[i].f3)
+      i = i + 1
+    }
+    drop audio_native.vowelAnalyze(
+      self.takePhoneGen,
+      false,
+      self.samples.asSlice(),
+      self.sampleRate,
+      pTs.asSlice(),
+      pHz.asSlice(),
+      pCf.asSlice(),
+      fTs.asSlice(),
+      f1.asSlice(),
+      f2.asSlice(),
+      f3.asSlice(),
+      self.useNeuralPhonemes,
+    )
+    run self.pullVowelSpansFromHost(false)
+  }
+
+  effect fn applyPhonemesReady(self: &mut Self, jobId: i32, isRef: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.useNeuralPhonemes {
+      return ()
+    }
+    if isRef {
+      if !self.refClip.active || jobId != self.refPhoneGen {
+        return ()
+      }
+      run self.pullVowelSpansFromHost(true)
+    } else {
+      if self.recording || jobId != self.takePhoneGen {
+        return ()
+      }
+      run self.pullVowelSpansFromHost(false)
+    }
+    run self.updateViewportDrawings()
   }
 
   fn requestNeuralForTake(self: &mut Self) -> () {
@@ -2571,6 +2766,7 @@ impl Overtone {
       self.refClip.ltas = vm.ltas
       self.refClip.hasLtas = vm.hasLtas
       run self.recomputeCompare()
+      run self.refreshVowelAnalysis(true)
       run self.rebuildDrawings(true)
       return ()
     }
@@ -2637,6 +2833,7 @@ impl Overtone {
     )
     run self.voiceMetrics.finalizeSummary(self.samples.asSlice(), self.sampleRate)
     run self.recomputeCompare()
+    run self.refreshVowelAnalysis(false)
     run self.rebuildDrawings(true)
   }
 
@@ -2843,6 +3040,7 @@ impl Overtone {
     self.refClip.ltas = vm.ltas
     self.refClip.hasLtas = vm.hasLtas
     self.requestNeuralForRef()
+    run self.refreshVowelAnalysis(true)
   }
 
   effect fn reanalyzeFormants(self: &mut Self) -> ()
@@ -2906,6 +3104,7 @@ impl Overtone {
     run self.reloadTree(false)
     run self.startBgScoring(false)
     self.requestNeuralForRef()
+    run self.refreshVowelAnalysis(true)
   }
 
   effect fn pinCurrentAsReference(self: &mut Self) -> ()
@@ -3649,7 +3848,13 @@ impl Overtone {
       startSec = 0.0
     }
     let sr = self.gpuSampleRate()
-    if audio_native.playRange(self.gpuSamples(), sr, startSec, endSec, self.loopSelection) {
+    let onRef = self.isPlottingOnRef()
+    let started = if self.isolateMode != ISOLATE_FULL {
+      audio_native.playFiltered(onRef, self.gpuSamples(), sr, startSec, endSec, self.loopSelection, self.isolateMode, self.isolateCompact)
+    } else {
+      audio_native.playRange(self.gpuSamples(), sr, startSec, endSec, self.loopSelection)
+    }
+    if started {
       self.cursorSec = startSec
       run self.updateCursorFast(true)
     } else {
@@ -3664,7 +3869,12 @@ impl Overtone {
       run self.sendTransport(TransportEvent.PlayFailed)
       return ()
     }
-    if !audio_native.playRange(self.refClip.samples.asSlice(), self.refClip.sampleRate, 0.0, self.refClip.durationSec, false) {
+    let started = if self.isolateMode != ISOLATE_FULL {
+      audio_native.playFiltered(true, self.refClip.samples.asSlice(), self.refClip.sampleRate, 0.0, self.refClip.durationSec, false, self.isolateMode, self.isolateCompact)
+    } else {
+      audio_native.playRange(self.refClip.samples.asSlice(), self.refClip.sampleRate, 0.0, self.refClip.durationSec, false)
+    }
+    if !started {
       run self.sendTransport(TransportEvent.PlayFailed)
     }
   }
@@ -4092,6 +4302,8 @@ impl Overtone {
       heatmapMetric: self.heatmapMetric,
       useDtwAlign: self.useDtwAlign,
       plotOnRef: onRef,
+      showVowelRegions: self.showVowelRegions,
+      isolateMode: self.isolateMode,
       displayClarity: self.displayClarity,
       cursorSec: self.cursorSec,
       hasSelection: self.hasSelection,
@@ -4104,6 +4316,7 @@ impl Overtone {
       hoverX: self.hoverX,
       hoverY: self.hoverY,
     }
+    let activeVowels = if onRef { self.refVowelSpans.asSlice() } else { self.takeVowelSpans.asSlice() }
     self.overlayDrawing = run buildSpectrogramOverlay(
       &self.vp,
       sw,
@@ -4114,8 +4327,10 @@ impl Overtone {
       self.refClip.samples.asSlice(),
       self.refClip.sampleRate,
       self.guides.asSlice(),
+      activeVowels,
       opts,
     )
+    self.vowelBadges = run computeVowelBadges(activeVowels, &self.vp, sw)
     self.metricsLaneDrawing = run buildMetricsLaneDrawing(
       &self.vp,
       sw,
@@ -4179,6 +4394,8 @@ impl Overtone {
       heatmapMetric: self.heatmapMetric,
       useDtwAlign: self.useDtwAlign,
       plotOnRef: onRef,
+      showVowelRegions: self.showVowelRegions,
+      isolateMode: self.isolateMode,
       displayClarity: self.displayClarity,
       cursorSec: self.cursorSec,
       hasSelection: self.hasSelection,
@@ -4192,6 +4409,7 @@ impl Overtone {
       hoverY: self.hoverY,
     }
 
+    let activeVowels = if onRef { self.refVowelSpans.asSlice() } else { self.takeVowelSpans.asSlice() }
     self.overlayDrawing = run buildSpectrogramOverlay(
       &self.vp,
       sw,
@@ -4202,8 +4420,10 @@ impl Overtone {
       self.refClip.samples.asSlice(),
       self.refClip.sampleRate,
       self.guides.asSlice(),
+      activeVowels,
       opts,
     )
+    self.vowelBadges = run computeVowelBadges(activeVowels, &self.vp, sw)
     self.metricsLaneDrawing = run buildMetricsLaneDrawing(
       &self.vp,
       sw,
@@ -4691,13 +4911,26 @@ impl Overtone {
             run self.sendTransport(TransportEvent.StopAll)
           }
           audio_native.playStop()
-          drop audio_native.playRange(
-            self.refClip.samples.asSlice(),
-            self.refClip.sampleRate,
-            self.selCompare.refStart,
-            self.selCompare.refEnd,
-            false,
-          )
+          if self.isolateMode != ISOLATE_FULL {
+            drop audio_native.playFiltered(
+              true,
+              self.refClip.samples.asSlice(),
+              self.refClip.sampleRate,
+              self.selCompare.refStart,
+              self.selCompare.refEnd,
+              false,
+              self.isolateMode,
+              self.isolateCompact,
+            )
+          } else {
+            drop audio_native.playRange(
+              self.refClip.samples.asSlice(),
+              self.refClip.sampleRate,
+              self.selCompare.refStart,
+              self.selCompare.refEnd,
+              false,
+            )
+          }
         }
       }
 
@@ -5889,6 +6122,62 @@ impl Overtone {
 
       Message.NeuralStatus { flags } => {
         self.neuralStatusFlags = flags
+      }
+
+      Message.SetIsolateMode { mode } => {
+        self.isolateMode = mode
+        if self.playing {
+          if self.playingRefOnly {
+            run self.doStartRefPlayback()
+          } else {
+            run self.doStartPlayback()
+          }
+        }
+        run self.updateViewportDrawings()
+      }
+
+      Message.SetIsolateCompact { compact } => {
+        if self.isolateCompact != compact {
+          self.isolateCompact = compact
+          if self.playing && self.isolateMode != ISOLATE_FULL {
+            if self.playingRefOnly {
+              run self.doStartRefPlayback()
+            } else {
+              run self.doStartPlayback()
+            }
+          }
+        }
+      }
+
+      Message.SetNeuralPhonemes { enabled } => {
+        if self.useNeuralPhonemes != enabled {
+          self.useNeuralPhonemes = enabled
+          audio_native.phonemeSetEnabled(self.useNeuralPhonemes)
+          run self.refreshVowelAnalysis(false)
+          if self.refClip.active {
+            run self.refreshVowelAnalysis(true)
+          }
+          run self.updateViewportDrawings()
+        }
+      }
+
+      Message.ToggleNeuralPhonemes => {
+        self.useNeuralPhonemes = !self.useNeuralPhonemes
+        audio_native.phonemeSetEnabled(self.useNeuralPhonemes)
+        run self.refreshVowelAnalysis(false)
+        if self.refClip.active {
+          run self.refreshVowelAnalysis(true)
+        }
+        run self.updateViewportDrawings()
+      }
+
+      Message.ToggleVowelOverlay => {
+        self.showVowelRegions = !self.showVowelRegions
+        run self.updateViewportDrawings()
+      }
+
+      Message.PhonemesReady { jobId, isRef } => {
+        run self.applyPhonemesReady(jobId, isRef)
       }
 
       Message.ToggleVoicePreview => {

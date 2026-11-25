@@ -9,11 +9,15 @@ import studio {
   CTX_EXPLORER_FILE,
   CTX_EXPLORER_ROOT,
   CTX_FORMANTS,
+  CTX_ISOLATE,
   CTX_LIB_SORT,
   CTX_NONE,
   CTX_PALETTE,
   CTX_SPEC,
   CTX_SPEED,
+  ISOLATE_CONSONANTS,
+  ISOLATE_FULL,
+  ISOLATE_VOWELS,
   Message,
   Overtone,
   SET_ANALYZER,
@@ -796,6 +800,41 @@ pub fn renderContextMenu(m: &Overtone, h: &Document<Message>) -> Node {
         menuItem(h, !on || fm == 0, "Hide formants", "", false, false, Message.SetFormantMask { mask: 0 }),
       ],
     )
+  } else if m.ctxMenuKind == CTX_ISOLATE {
+    let menuX = clampMenuX(m.ctxMenuX, 272.0)
+    let menuY = clampMenuY(m.ctxMenuY, 340.0)
+    let ipaReady = (m.neuralStatusFlags & 8) != 0
+    let ipaBusy = (m.neuralStatusFlags & 16) != 0
+    let ipaTag = if ipaBusy {
+      "Loading…"
+    } else if ipaReady {
+      "Ready"
+    } else {
+      "~11 MB"
+    }
+    h.column(
+      &[
+        h.testId("isolate-menu"),
+        h.class("absolute z-10 w-[268px] p-[4px] glint-menu"),
+        h.style(&[css.left(px(menuX)), css.top(px(menuY))]),
+      ],
+      &[
+        menuHeader(h, "Playback filter · take & ref"),
+        menuItem(h, m.isolateMode == ISOLATE_FULL, "Full audio", "", false, false, Message.SetIsolateMode { mode: ISOLATE_FULL }),
+        menuItem(h, m.isolateMode == ISOLATE_VOWELS, "Vowels only", "Resonance", false, false, Message.SetIsolateMode { mode: ISOLATE_VOWELS }),
+        menuItem(h, m.isolateMode == ISOLATE_CONSONANTS, "Consonants only", "Sibilants", false, false, Message.SetIsolateMode { mode: ISOLATE_CONSONANTS }),
+        menuSep(h),
+        menuHeader(h, "Listening timing"),
+        menuItem(h, !m.isolateCompact, "Keep timing (in-place)", "", false, false, Message.SetIsolateCompact { compact: false }),
+        menuItem(h, m.isolateCompact, "Compact (stitch vowels)", "Continuous", false, false, Message.SetIsolateCompact { compact: true }),
+        menuSep(h),
+        menuHeader(h, "Detector"),
+        menuItem(h, !m.useNeuralPhonemes, "Acoustic + Formants", "Instant", false, false, Message.SetNeuralPhonemes { enabled: false }),
+        menuItem(h, m.useNeuralPhonemes, "Neural IPA · Allosaurus", ipaTag, false, false, Message.SetNeuralPhonemes { enabled: true }),
+        menuSep(h),
+        menuItem(h, m.showVowelRegions || m.isolateMode != ISOLATE_FULL, "Highlight vowel regions", "", false, false, Message.ToggleVowelOverlay),
+      ],
+    )
   } else {
     h.empty()
   }
@@ -1225,7 +1264,7 @@ fn renderSettingsAnalysis(m: &Overtone, h: &Document<Message>) -> Node {
         ],
       ),
       h.row(
-        &[h.class("items-center gap-[16px] py-[9px]")],
+        &[h.class("items-center gap-[16px] py-[9px] border-b border-[#F0F0F2]")],
         &[
           txt(h, "Click a vowel", "w-[180px] shrink-0 text-[13px] leading-[16px] text-[#0B0B0C]"),
           h.row(
@@ -1235,6 +1274,45 @@ fn renderSettingsAnalysis(m: &Overtone, h: &Document<Message>) -> Node {
               txt(h, "Adds F1 / F2 / F3 guide lines", "text-[12px] leading-[16px] text-[#3A3A3F]"),
             ],
           ),
+        ],
+      ),
+      settingsSection(h, "Vowel & consonant isolation"),
+      h.row(
+        &[h.class("items-center gap-[16px] py-[9px] border-b border-[#F0F0F2]")],
+        &[
+          h.column(
+            &[h.class("w-[180px] shrink-0 gap-[1px]")],
+            &[
+              txt(h, "Neural IPA model", "text-[13px] leading-[16px] text-[#0B0B0C]"),
+              txt(h, "Allosaurus W8 (~11 MB, lazy)", "text-[11px] leading-[14px] text-[#8A8A90]"),
+            ],
+          ),
+          h.row(
+            &[h.class("items-center gap-[8px]")],
+            &[
+              toggleSwitch(h, m.useNeuralPhonemes, true, Message.ToggleNeuralPhonemes),
+              txt(
+                h,
+                if (m.neuralStatusFlags & 16) != 0 {
+                  "Loading Allosaurus…"
+                } else if m.useNeuralPhonemes && (m.neuralStatusFlags & 8) != 0 {
+                  "Active · IPA vowel labels enabled"
+                } else if m.useNeuralPhonemes {
+                  "Enabled · waiting for clip"
+                } else {
+                  "Using instant Acoustic + Formants detector"
+                },
+                "text-[12px] leading-[16px] text-[#3A3A3F]",
+              ),
+            ],
+          ),
+        ],
+      ),
+      h.row(
+        &[h.class("items-center gap-[16px] py-[9px]")],
+        &[
+          txt(h, "Show vowel shading", "w-[180px] shrink-0 text-[13px] leading-[16px] text-[#0B0B0C]"),
+          toggleSwitch(h, m.showVowelRegions, true, Message.ToggleVowelOverlay),
         ],
       ),
     ],

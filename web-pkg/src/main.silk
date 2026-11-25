@@ -344,6 +344,36 @@ effect fn callInner(token: ?*mut u8, op: u32, a: f64, b: f64, c: f64) -> f64
       })
       run drain<Overtone, Message, Command, OutOfMemoryError, Dom, &mut Allocator>(&mut page.host, &mut page.dom)
       run page.syncSpec()
+    } else if ns == "phonemes_ready" {
+      // payload format: "<jobId>|<isRef>|<count>"
+      let ps = String.view(&payload)
+      let bytes = String.utf8Bytes(ps)
+      let mut parts: [u32; 3] = [0; 3]
+      let mut pIdx: usize = 0
+      let mut cur: u32 = 0
+      let mut k: usize = 0
+      while k < bytes.length {
+        let b = bytes[k]
+        if b == 124 {
+          if pIdx < 3 {
+            parts[pIdx] = cur
+            pIdx = pIdx + 1
+          }
+          cur = 0
+        } else if b >= 48 && b <= 57 {
+          cur = cur * 10 + u8.toU32(b - 48)
+        }
+        k = k + 1
+      }
+      if pIdx < 3 {
+        parts[pIdx] = cur
+      }
+      page.host.send(Message.PhonemesReady {
+        jobId: u32.toI32(parts[0]),
+        isRef: parts[1] != 0,
+      })
+      run drain<Overtone, Message, Command, OutOfMemoryError, Dom, &mut Allocator>(&mut page.host, &mut page.dom)
+      run page.syncSpec()
     }
   } else if op == CALL_SCRATCH {
     return usize.toF64(run page.dom.reserve(f64.toUsize(a)))

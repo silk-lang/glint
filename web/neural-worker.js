@@ -17,22 +17,59 @@ const FT_BIN_RES = (SWIFT_SR / 2) / FT_BINS;
 
 let pitchSession = null;
 let formantSession = null;
+let phonemeSession = null;
 let formantBackend = "none";
 let initPromise = null;
+let phonemeInitPromise = null;
 let busyCount = 0;
+let phonemeBusyCount = 0;
 
 // Latest job id per target (0 = take, 1 = ref) so stale queued work is dropped immediately
 const latestJobId = new Map();
+const latestPhoneJobId = new Map();
 // Simple LRU cache keyed by clip fingerprint -> { f0Times, f0Hz, f0Conf, fmtTimes, fmtF1, fmtF2, fmtF3 }
 const resultCache = new Map();
+const phoneCache = new Map();
 const MAX_CACHE = 48;
+
+// Allosaurus uni2005 230-unit IPA table (index 0 = CTC blank, 1..229 = universal phones)
+const ALLO_PHONES = ["","I","a","aː","ã","ă","b","bʲ","bʲj","bʷ","bʼ","bː","b̞","b̤","b̥","c","d","dʒ","dʲ","dː","d̚","d̥","d̪","d̯","d͡z","d͡ʑ","d͡ʒ","d͡ʒː","d͡ʒ̤","e","eː","e̞","f","fʲ","fʷ","fː","g","gʲ","gʲj","gʷ","gː","h","hʷ","i","ij","iː","i̞","i̥","i̯","j","k","kx","kʰ","kʲ","kʲj","kʷ","kʷʼ","kʼ","kː","k̟ʲ","k̟̚","k͡p̚","l","lʲ","lː","l̪","m","mʲ","mʲj","mʷ","mː","n","nj","nʲ","nː","n̪","n̺","o","oː","o̞","o̥","p","pf","pʰ","pʲ","pʲj","pʷ","pʷʼ","pʼ","pː","p̚","q","r","rː","s","sʲ","sʼ","sː","s̪","t","ts","tsʰ","tɕ","tɕʰ","tʂ","tʂʰ","tʃ","tʰ","tʲ","tʷʼ","tʼ","tː","t̚","t̪","t̪ʰ","t̪̚","t͡s","t͡sʼ","t͡ɕ","t͡ɬ","t͡ʃ","t͡ʃʲ","t͡ʃʼ","t͡ʃː","u","uə","uː","u͡w","v","vʲ","vʷ","vː","v̞","v̞ʲ","w","x","x̟ʲ","y","z","zj","zʲ","z̪","ä","æ","ç","çj","ð","ø","ŋ","ŋ̟","ŋ͡m","œ","œ̃","ɐ","ɐ̞","ɑ","ɑ̱","ɒ","ɓ","ɔ","ɔ̃","ɕ","ɕː","ɖ̤","ɗ","ə","ɛ","ɛ̃","ɟ","ɡ","ɡʲ","ɡ̤","ɡ̥","ɣ","ɣj","ɤ","ɤɐ̞","ɤ̆","ɥ","ɦ","ɨ","ɪ","ɫ","ɯ","ɯ̟","ɯ̥","ɰ","ɱ","ɲ","ɳ","ɴ","ɵ","ɸ","ɹ","ɹ̩","ɻ","ɻ̩","ɽ","ɾ","ɾj","ɾʲ","ɾ̠","ʀ","ʁ","ʁ̝","ʂ","ʃ","ʃʲː","ʃ͡ɣ","ʈ","ʉ̞","ʊ","ʋ","ʋʲ","ʌ","ʎ","ʏ","ʐ","ʑ","ʒ","ʒ͡ɣ","ʔ","ʝ","ː","β","β̞","θ","χ","ә","ḁ"];
+const ALLO_IS_VOWEL = new Uint8Array([0,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,0,0,0,0,0,0,0,0,0,1,0,0,0,0,1,1,0,0,0,1,0,0,0,1,1,1,1,1,1,1,0,1,1,0,0,0,0,1,1,1,0,0,0,0,0,0,0,1,1,1,0,0,1,1,0,1,1,1,0,0,0,0,0,1,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,1,1]);
 
 function postStatus() {
   const flags =
     (pitchSession ? 1 : 0) |
     (formantSession ? 2 : 0) |
-    (busyCount > 0 ? 4 : 0);
+    (busyCount > 0 ? 4 : 0) |
+    (phonemeSession ? 8 : 0) |
+    (phonemeBusyCount > 0 ? 16 : 0);
   self.postMessage({ type: "status", flags, backend: formantBackend });
+}
+
+async function ensurePhonemeModel() {
+  if (phonemeSession) return phonemeSession;
+  if (phonemeInitPromise) return phonemeInitPromise;
+  phonemeBusyCount++;
+  postStatus();
+  phonemeInitPromise = (async () => {
+    try {
+      const resp = await fetch("./models/allosaurus_uni2005_q8.onnx");
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const buf = await resp.arrayBuffer();
+      phonemeSession = await ort.InferenceSession.create(buf, {
+        executionProviders: ["wasm"],
+      });
+      return phonemeSession;
+    } catch (err) {
+      console.warn("[Prism Neural] Allosaurus IPA load failed:", err);
+      phonemeInitPromise = null;
+      return null;
+    } finally {
+      phonemeBusyCount = Math.max(0, phonemeBusyCount - 1);
+      postStatus();
+    }
+  })();
+  return phonemeInitPromise;
 }
 
 async function ensureModels() {
@@ -424,6 +461,268 @@ async function handleAnalyze(msg) {
   }
 }
 
+// ============================================================================
+// Allosaurus uni2005 (8 kHz Kaldi 40-MFCC + 3-frame stack stride 3 -> 30 ms)
+// ============================================================================
+
+const ALLO_SR = 8000;
+const ALLO_WIN = 200; // 25 ms at 8 kHz
+const ALLO_HOP = 80;  // 10 ms at 8 kHz
+const ALLO_NFFT = 256;
+const ALLO_BINS = 129;
+const ALLO_MELS = 40;
+const ALLO_CEP = 40;
+
+const ALLO_POVEY = new Float64Array(ALLO_WIN);
+const ALLO_BIT_REV = new Uint16Array(ALLO_NFFT);
+const ALLO_COS = new Float64Array(ALLO_NFFT / 2);
+const ALLO_SIN = new Float64Array(ALLO_NFFT / 2);
+const ALLO_FB = new Float64Array(ALLO_MELS * ALLO_BINS);
+const ALLO_DCT = new Float64Array(ALLO_CEP * ALLO_MELS);
+const ALLO_LIFTER = new Float64Array(ALLO_CEP);
+{
+  for (let i = 0; i < ALLO_WIN; i++) {
+    ALLO_POVEY[i] = Math.pow(0.5 - 0.5 * Math.cos((2.0 * Math.PI * i) / (ALLO_WIN - 1)), 0.85);
+  }
+  for (let i = 0; i < ALLO_NFFT; i++) {
+    let r = 0;
+    let v = i;
+    for (let b = 0; b < 8; b++) {
+      r = (r << 1) | (v & 1);
+      v >>= 1;
+    }
+    ALLO_BIT_REV[i] = r;
+  }
+  for (let i = 0; i < ALLO_NFFT / 2; i++) {
+    const a = (-2.0 * Math.PI * i) / ALLO_NFFT;
+    ALLO_COS[i] = Math.cos(a);
+    ALLO_SIN[i] = Math.sin(a);
+  }
+  const hz2mel = (f) => 1127.0 * Math.log(1.0 + f / 700.0);
+  const melLo = hz2mel(40.0);
+  const melHi = hz2mel(3800.0);
+  const melPts = new Float64Array(ALLO_MELS + 2);
+  for (let m = 0; m < ALLO_MELS + 2; m++) {
+    melPts[m] = melLo + ((melHi - melLo) * m) / (ALLO_MELS + 1);
+  }
+  for (let m = 0; m < ALLO_MELS; m++) {
+    const l = melPts[m];
+    const c = melPts[m + 1];
+    const r = melPts[m + 2];
+    for (let k = 0; k < ALLO_BINS; k++) {
+      const bm = hz2mel((k * ALLO_SR) / ALLO_NFFT);
+      const w = Math.max(0.0, Math.min((bm - l) / (c - l), (r - bm) / (r - c)));
+      ALLO_FB[m * ALLO_BINS + k] = w;
+    }
+  }
+  for (let k = 0; k < ALLO_CEP; k++) {
+    const sc = k === 0 ? Math.sqrt(1.0 / ALLO_MELS) : Math.sqrt(2.0 / ALLO_MELS);
+    ALLO_LIFTER[k] = 1.0 + 0.5 * 22.0 * Math.sin((Math.PI * k) / 22.0);
+    for (let m = 0; m < ALLO_MELS; m++) {
+      ALLO_DCT[k * ALLO_MELS + m] = sc * Math.cos((Math.PI * k * (m + 0.5)) / ALLO_MELS);
+    }
+  }
+}
+
+function resampleToRate(src, srcRate, dstRate) {
+  if (!src || src.length === 0) return new Float32Array(0);
+  if (Math.abs(srcRate - dstRate) < 1.0) {
+    return src instanceof Float32Array ? src : new Float32Array(src);
+  }
+  const ratio = srcRate / dstRate;
+  const outLen = Math.max(1, Math.round(src.length / ratio));
+  const out = new Float32Array(outLen);
+  const cutoff = Math.min(1.0, (dstRate / srcRate) * 0.92);
+  const halfTaps = 6;
+  const srcLen = src.length;
+  for (let i = 0; i < outLen; i++) {
+    const center = i * ratio;
+    const cIdx = Math.floor(center);
+    let acc = 0.0;
+    let wSum = 0.0;
+    const j0 = Math.max(0, cIdx - halfTaps);
+    const j1 = Math.min(srcLen - 1, cIdx + halfTaps);
+    for (let j = j0; j <= j1; j++) {
+      const dx = j - center;
+      const u = dx / (halfTaps + 1);
+      const win = 0.54 + 0.46 * Math.cos(Math.PI * u);
+      const x = Math.PI * cutoff * dx;
+      const sinc = Math.abs(x) < 1e-6 ? 1.0 : Math.sin(x) / x;
+      const w = win * sinc;
+      acc += src[j] * w;
+      wSum += w;
+    }
+    out[i] = wSum > 1e-8 ? acc / wSum : 0.0;
+  }
+  return out;
+}
+
+function computeAllosaurusFeats(samples, sampleRate) {
+  const wav8k = resampleToRate(samples, sampleRate, ALLO_SR);
+  // Cap at 16s for snappy WASM BiLSTM latency
+  const maxSamp = Math.min(wav8k.length, ALLO_SR * 16);
+  if (maxSamp < ALLO_WIN) return null;
+  const numFrames = 1 + Math.floor((maxSamp - ALLO_WIN) / ALLO_HOP);
+  const mfcc = new Float32Array(numFrames * ALLO_CEP);
+
+  const re = new Float64Array(ALLO_NFFT);
+  const im = new Float64Array(ALLO_NFFT);
+  const pow = new Float64Array(ALLO_BINS);
+  const logMel = new Float64Array(ALLO_MELS);
+  const emph = new Float64Array(ALLO_WIN);
+
+  for (let t = 0; t < numFrames; t++) {
+    const base = t * ALLO_HOP;
+    let mean = 0.0;
+    for (let i = 0; i < ALLO_WIN; i++) mean += wav8k[base + i] * 32768.0;
+    mean /= ALLO_WIN;
+
+    let prev = wav8k[base] * 32768.0 - mean;
+    emph[0] = (prev - 0.97 * prev) * ALLO_POVEY[0];
+    for (let i = 1; i < ALLO_WIN; i++) {
+      const cur = wav8k[base + i] * 32768.0 - mean;
+      emph[i] = (cur - 0.97 * prev) * ALLO_POVEY[i];
+      prev = cur;
+    }
+
+    re.fill(0.0);
+    im.fill(0.0);
+    for (let i = 0; i < ALLO_WIN; i++) re[ALLO_BIT_REV[i]] = emph[i];
+    for (let size = 2; size <= ALLO_NFFT; size <<= 1) {
+      const half = size >> 1;
+      const step = ALLO_NFFT / size;
+      for (let i = 0; i < ALLO_NFFT; i += size) {
+        let tw = 0;
+        for (let j = 0; j < half; j++) {
+          const wr = ALLO_COS[tw];
+          const wi = ALLO_SIN[tw];
+          tw += step;
+          const a = i + j;
+          const b = a + half;
+          const tr = wr * re[b] - wi * im[b];
+          const ti = wr * im[b] + wi * re[b];
+          re[b] = re[a] - tr;
+          im[b] = im[a] - ti;
+          re[a] += tr;
+          im[a] += ti;
+        }
+      }
+    }
+    for (let k = 0; k < ALLO_BINS; k++) pow[k] = re[k] * re[k] + im[k] * im[k];
+
+    for (let m = 0; m < ALLO_MELS; m++) {
+      let acc = 0.0;
+      const off = m * ALLO_BINS;
+      for (let k = 0; k < ALLO_BINS; k++) acc += ALLO_FB[off + k] * pow[k];
+      logMel[m] = Math.log(acc > 1e-10 ? acc : 1e-10);
+    }
+
+    const row = t * ALLO_CEP;
+    for (let c = 0; c < ALLO_CEP; c++) {
+      let acc = 0.0;
+      const off = c * ALLO_MELS;
+      for (let m = 0; m < ALLO_MELS; m++) acc += ALLO_DCT[off + m] * logMel[m];
+      mfcc[row + c] = acc * ALLO_LIFTER[c];
+    }
+  }
+
+  // Utterance CMVN
+  for (let c = 0; c < ALLO_CEP; c++) {
+    let sum = 0.0;
+    for (let t = 0; t < numFrames; t++) sum += mfcc[t * ALLO_CEP + c];
+    const mu = sum / numFrames;
+    let sq = 0.0;
+    for (let t = 0; t < numFrames; t++) {
+      const d = mfcc[t * ALLO_CEP + c] - mu;
+      sq += d * d;
+    }
+    const invStd = 1.0 / (Math.sqrt(sq / numFrames) + 1e-8);
+    for (let t = 0; t < numFrames; t++) {
+      mfcc[t * ALLO_CEP + c] = (mfcc[t * ALLO_CEP + c] - mu) * invStd;
+    }
+  }
+
+  // Stack (t-1, t, t+1) wrapped + subsample every 3rd frame -> (1, outT, 120)
+  const outT = Math.ceil(numFrames / 3);
+  const feats = new Float32Array(outT * 120);
+  for (let i = 0; i < outT; i++) {
+    const t = i * 3;
+    const t0 = (t - 1 + numFrames) % numFrames;
+    const t1 = t;
+    const t2 = (t + 1) % numFrames;
+    const dst = i * 120;
+    feats.set(mfcc.subarray(t0 * ALLO_CEP, (t0 + 1) * ALLO_CEP), dst);
+    feats.set(mfcc.subarray(t1 * ALLO_CEP, (t1 + 1) * ALLO_CEP), dst + 40);
+    feats.set(mfcc.subarray(t2 * ALLO_CEP, (t2 + 1) * ALLO_CEP), dst + 80);
+  }
+  return { feats, outT };
+}
+
+async function handleAnalyzePhonemes(msg) {
+  const { jobId, isRef, samples, sampleRate } = msg;
+  if (latestPhoneJobId.get(isRef) !== jobId) return;
+
+  const key = fingerprintClip(samples, sampleRate, 0, 0);
+  const cached = phoneCache.get(key);
+  if (cached) {
+    self.postMessage({ type: "phonemes_result", jobId, isRef, phones: cached });
+    return;
+  }
+
+  const sess = await ensurePhonemeModel();
+  if (!sess || latestPhoneJobId.get(isRef) !== jobId) return;
+
+  phonemeBusyCount++;
+  postStatus();
+  try {
+    const prep = computeAllosaurusFeats(samples, sampleRate);
+    if (!prep || prep.outT < 2) {
+      self.postMessage({ type: "phonemes_result", jobId, isRef, phones: [] });
+      return;
+    }
+    const out = await sess.run({
+      feats: new ort.Tensor("float32", prep.feats, [1, prep.outT, 120]),
+    });
+    if (latestPhoneJobId.get(isRef) !== jobId) return;
+    const logits = out.logits.data;
+    const numUnits = 230;
+    const phones = [];
+    let prevUnit = 0;
+    for (let i = 0; i < prep.outT; i++) {
+      const row = i * numUnits;
+      let bestU = 0;
+      let bestV = logits[row];
+      for (let u = 1; u < numUnits; u++) {
+        const v = logits[row + u];
+        if (v > bestV) {
+          bestV = v;
+          bestU = u;
+        }
+      }
+      if (bestU !== 0 && bestU !== prevUnit) {
+        phones.push({
+          t: (i * 3 * ALLO_HOP + ALLO_WIN * 0.5) / ALLO_SR,
+          unit: bestU,
+          label: ALLO_PHONES[bestU] || "",
+          isVowel: ALLO_IS_VOWEL[bestU] === 1,
+        });
+      }
+      prevUnit = bestU;
+    }
+    if (phoneCache.has(key)) phoneCache.delete(key);
+    phoneCache.set(key, phones);
+    if (phoneCache.size > MAX_CACHE) {
+      phoneCache.delete(phoneCache.keys().next().value);
+    }
+    self.postMessage({ type: "phonemes_result", jobId, isRef, phones });
+  } catch (err) {
+    console.warn("[Prism Neural] Phoneme inference failed:", err);
+  } finally {
+    phonemeBusyCount = Math.max(0, phonemeBusyCount - 1);
+    postStatus();
+  }
+}
+
 self.addEventListener("message", (ev) => {
   const msg = ev.data;
   if (!msg) return;
@@ -431,8 +730,17 @@ self.addEventListener("message", (ev) => {
     ensureModels();
     return;
   }
+  if (msg.type === "enable_phonemes") {
+    ensurePhonemeModel();
+    return;
+  }
   if (msg.type === "analyze") {
     latestJobId.set(msg.isRef, msg.jobId);
     queueTail = queueTail.then(() => handleAnalyze(msg));
+    return;
+  }
+  if (msg.type === "analyze_phonemes") {
+    latestPhoneJobId.set(msg.isRef, msg.jobId);
+    queueTail = queueTail.then(() => handleAnalyzePhonemes(msg));
   }
 });
