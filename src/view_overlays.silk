@@ -1,10 +1,12 @@
 //! Glint floating overlays: Guides popover, all 8 Context Menus, Settings Modal (7 tabs), and Drag Ghost.
 import audio_native { AudioDeviceInfo, SORT_ALPHA, SORT_OVERALL, SORT_PITCH, SORT_SIZE, SORT_VOWEL, SORT_WEIGHT }
+import coach { TARGET_BALANCED, TARGET_CUSTOM, TARGET_FULL_HEAVY, TARGET_LIGHT_SMALL, TARGET_NEUTRAL }
 import colormap { paletteIndex }
 import formants { VOWEL_MODE_BOTH, VOWEL_MODE_FEM, VOWEL_MODE_MASC }
 import overlays { GuideBadge }
 import studio {
   CTX_AUDIO,
+  CTX_COACH_TARGET,
   CTX_EXPLORER_DIR,
   CTX_EXPLORER_FILE,
   CTX_EXPLORER_ROOT,
@@ -446,6 +448,26 @@ pub fn renderContextMenu(m: &Overtone, h: &Document<Message>) -> Node {
         menuItem(h, m.libSortMode == SORT_VOWEL, "Vowels · LTAS ↓", "", false, false, Message.SetLibSortMode { mode: SORT_VOWEL }),
         menuSep(h),
         menuItem(h, false, "Re-score all visible", "", false, false, Message.RescoreVisibleClips),
+      ],
+    )
+  } else if m.ctxMenuKind == CTX_COACH_TARGET {
+    h.column(
+      &[
+        h.class("absolute right-[16px] top-[116px] w-[236px] p-[4px] glint-menu"),
+      ],
+      &[
+        menuHeader(h, "Coach target preset"),
+        menuItem(h, m.coachTarget == TARGET_LIGHT_SMALL, "Light & small", "180–245 Hz", false, false, Message.SetCoachTarget { target: TARGET_LIGHT_SMALL }),
+        menuItem(h, m.coachTarget == TARGET_BALANCED, "Balanced", "145–192 Hz", false, false, Message.SetCoachTarget { target: TARGET_BALANCED }),
+        menuItem(h, m.coachTarget == TARGET_FULL_HEAVY, "Full & heavy", "95–148 Hz", false, false, Message.SetCoachTarget { target: TARGET_FULL_HEAVY }),
+        menuItem(h, m.coachTarget == TARGET_NEUTRAL, "Neutral · technique", "no pitch", false, false, Message.SetCoachTarget { target: TARGET_NEUTRAL }),
+        if m.coachTarget == TARGET_CUSTOM {
+          menuItem(h, true, "Custom pad point", "active", false, false, Message.CloseContextMenu)
+        } else {
+          h.empty()
+        },
+        menuSep(h),
+        menuItem(h, false, "Pin current take as ref", "P", false, false, Message.PinReference),
       ],
     )
   } else {

@@ -35,6 +35,13 @@ import colormap {
   nextPalette,
   paletteFromIndex
 }
+import coach {
+  CoachReport,
+  TARGET_CUSTOM,
+  TARGET_LIGHT_SMALL,
+  analyzeCoach,
+  targetSpec
+}
 import compare {
   CompareAlignment,
   MatchScore,
@@ -166,6 +173,7 @@ pub const CTX_EXPLORER_FILE: u32 = 5
 pub const CTX_EXPLORER_DIR: u32 = 6
 pub const CTX_EXPLORER_ROOT: u32 = 7
 pub const CTX_LIB_SORT: u32 = 8
+pub const CTX_COACH_TARGET: u32 = 9
 
 // Virtualized Explorer row layout metrics (Glint 26px crisp single-line rows)
 pub const EXPLORER_ROW_H: f32 = 26.0
@@ -356,6 +364,12 @@ pub union Message {
   SetPitchRangePreset { pub floorHz: f64, pub ceilHz: f64 },
   // Comparison Weight presets
   SetMatchWeightsPreset { pub pitch: f64, pub size: f64, pub weight: f64, pub vowel: f64 },
+  // Reference-free acoustic coach
+  SetCoachTarget { pub target: u32 },
+  SetCoachViewMode { pub coach: bool },
+  SetCustomCoachPoint { pub x: f32, pub y: f32 },
+  PadLayout { pub rect: Rect<f32> },
+  FocusCoachSpan { pub t0: f64, pub t1: f64 },
   // Hillenbrand (1995) Gendered Vowel Space mode + click vowel -> F1/F2/F3 guides
   SetVowelMode { pub mode: u32 },
   ApplyVowelGuides { pub idx: usize, pub useMasc: bool },
@@ -500,6 +514,14 @@ pub struct Overtone {
   pub refClip: ReferenceClip,
   pub compare: CompareAlignment,
   pub selCompare: SelectionCompare,
+
+  // Reference-free Acoustic Coach (target preset + clickable timestamped tips)
+  pub coachTarget: u32,
+  pub coachCustomSize: f64,
+  pub coachCustomLight: f64,
+  pub coachPreferView: bool,
+  pub coachReport: CoachReport,
+  pub padRect: Rect<f32>,
 
   // IDE-style Explorer Tree (~/Documents/Overtone Library/)
   pub expandedDirs: List<String>,
@@ -826,6 +848,13 @@ impl Overtone {
       refClip: ReferenceClip.empty(),
       compare: CompareAlignment.empty(),
       selCompare: SelectionCompare.empty(),
+
+      coachTarget: TARGET_LIGHT_SMALL,
+      coachCustomSize: 0.72,
+      coachCustomLight: 0.74,
+      coachPreferView: false,
+      coachReport: CoachReport.empty(),
+      padRect: Rect<f32>.new(0.0, 0.0, PAD_W, PAD_H),
 
       expandedDirs: move expandedDirs,
       selectedFolderRel: String.make(),
@@ -2321,6 +2350,21 @@ impl Overtone {
       self.readoutBgScore.clear()
       run self.syncMatchReadoutStrings()
     }
+    run self.recomputeCoach()
+  }
+
+  effect fn recomputeCoach(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.coachReport = run analyzeCoach(
+      &self.voiceMetrics,
+      self.coachTarget,
+      self.coachCustomSize,
+      self.coachCustomLight,
+      false,
+      0.0,
+      0.0,
+    )
   }
 
   effect fn analyzeAll(self: &mut Self) -> ()
@@ -3478,6 +3522,8 @@ impl Overtone {
 
     if doSlice {
       let rightPlotW = f32.max(180.0, self.readoutsWidth - 32.0)
+      let padHasRef = self.refClip.active && !self.coachPreferView
+      let cSpec = targetSpec(self.coachTarget, self.coachCustomSize, self.coachCustomLight)
       self.sizeWeightDrawing = run buildSizeWeightPadDrawing(
         rightPlotW,
         PAD_H,
@@ -3486,7 +3532,10 @@ impl Overtone {
         vfOpt,
         self.refClip.voiceFrames.asSlice(),
         self.refClip.summary,
-        self.refClip.active,
+        padHasRef,
+        !padHasRef && cSpec.hasTargetPoint,
+        cSpec.sizeCenter,
+        cSpec.lightCenter,
       )
       self.sliceDrawing = run buildSpectrumSliceDrawing(
         &self.vp,
@@ -3643,6 +3692,8 @@ impl Overtone {
       self.cursorSec,
     )
     let rightPlotW = f32.max(180.0, self.readoutsWidth - 32.0)
+    let padHasRef = self.refClip.active && !self.coachPreferView
+    let cSpec = targetSpec(self.coachTarget, self.coachCustomSize, self.coachCustomLight)
     self.pianoDrawing = run buildPianoDrawing(&self.vp, PIANO_W, sh, activeMidi, hasActivePitch)
     self.sizeWeightDrawing = run buildSizeWeightPadDrawing(
       rightPlotW,
@@ -3652,7 +3703,10 @@ impl Overtone {
       vfOpt,
       self.refClip.voiceFrames.asSlice(),
       self.refClip.summary,
-      self.refClip.active,
+      padHasRef,
+      !padHasRef && cSpec.hasTargetPoint,
+      cSpec.sizeCenter,
+      cSpec.lightCenter,
     )
     self.sliceDrawing = run buildSpectrumSliceDrawing(
       &self.vp,
@@ -5230,6 +5284,60 @@ impl Overtone {
         self.matchWeights = MatchWeights { pitch: pitch, size: size, weight: weight, vowel: vowel }
         run self.updateWeightReadouts()
         run self.recomputeCompare()
+      }
+
+      Message.SetCoachTarget { target } => {
+        self.coachTarget = target
+        self.ctxMenuKind = CTX_NONE
+        run self.recomputeCoach()
+        run self.rebuildDrawings(true)
+      }
+
+      Message.SetCoachViewMode { coach } => {
+        self.coachPreferView = coach
+        run self.rebuildDrawings(true)
+      }
+
+      Message.PadLayout { rect } => {
+        self.padRect = rect
+      }
+
+      Message.SetCustomCoachPoint { x, y } => {
+        if !self.refClip.active || self.coachPreferView {
+          let pad: f32 = 8.0
+          let iw = f32.max(4.0, self.padRect.width() - pad * 2.0)
+          let ih = f32.max(4.0, self.padRect.height() - pad * 2.0)
+          let sx = f32.toF64((x - self.padRect.xMin - pad) / iw)
+          let ly = 1.0 - f32.toF64((y - self.padRect.yMin - pad) / ih)
+          self.coachCustomSize = f64.max(0.05, f64.min(0.95, sx))
+          self.coachCustomLight = f64.max(0.05, f64.min(0.95, ly))
+          self.coachTarget = TARGET_CUSTOM
+          run self.recomputeCoach()
+          run self.rebuildDrawings(true)
+        }
+      }
+
+      Message.FocusCoachSpan { t0, t1 } => {
+        let dur = self.gpuDuration()
+        let lo = f64.max(0.0, f64.min(dur, t0))
+        let hi = f64.max(lo + 0.05, f64.min(dur, t1))
+        self.hasSelection = true
+        self.selStart = lo
+        self.selEnd = hi
+        self.cursorSec = lo
+        if lo < self.vp.t0 || hi > self.vp.t1 {
+          let span = f64.max(hi - lo, 0.4)
+          let pad = span * 0.6
+          let nt0 = f64.max(0.0, lo - pad)
+          let nt1 = f64.min(f64.max(dur, 0.25), hi + pad)
+          self.vp.setTimeRange(nt0, nt1)
+          self.gpuNeedRedraw = true
+          self.gpuNeedSharp = true
+          self.sharpDueTime = 0.0
+          run self.updateViewportDrawings()
+        }
+        run self.updateSelectionReadout()
+        run self.updateCursorFast(true)
       }
 
       Message.SetVowelMode { mode } => {

@@ -1,0 +1,1073 @@
+//! Reference-free acoustic voice coach & feature extractor.
+//!
+//! Computes clip/selection-level `CoachFeatures` (ready for a future tiny MLP) and runs
+//! 6 deterministic, timestamped acoustic detectors over `VoiceMetricsTrack`:
+//!   1. Size x Weight balance (Hollow vs. Overfull)
+//!   2. Phrase-end drop (tail resonance / weight / pitch slip)
+//!   3. Vowel-specific resonance slip (front vs. back/open VTL gap)
+//!   4. Clarity: airy/breathy vs. pressed/strained (HNR + H1-H2)
+//!   5. Intonation range (IQR in semitones) & pitch floor dips
+//!   6. Biggest target-preset lever (Pitch, Size, Weight)
+import overlays { appendFixed, formatSecShort }
+import voice_metrics {
+  H1H2_HEAVY_DB,
+  H1H2_LIGHT_DB,
+  LTAS_BINS,
+  VTL_BIG_CM,
+  VTL_SMALL_CM,
+  VoiceFrame,
+  VoiceMetricsTrack
+}
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String }
+
+// Target aesthetic presets
+pub const TARGET_LIGHT_SMALL: u32 = 0
+pub const TARGET_BALANCED: u32 = 1
+pub const TARGET_FULL_HEAVY: u32 = 2
+pub const TARGET_NEUTRAL: u32 = 3
+pub const TARGET_CUSTOM: u32 = 4
+
+// Tip categories
+pub const TIP_HOLLOW: u32 = 1
+pub const TIP_OVERFULL: u32 = 2
+pub const TIP_PHRASE_DROP: u32 = 3
+pub const TIP_VOWEL_SLIP: u32 = 4
+pub const TIP_BREATHY: u32 = 5
+pub const TIP_PRESSED: u32 = 6
+pub const TIP_MONOTONE: u32 = 7
+pub const TIP_PITCH_DIP: u32 = 8
+pub const TIP_TARGET_SIZE: u32 = 9
+pub const TIP_TARGET_WEIGHT: u32 = 10
+pub const TIP_TARGET_PITCH: u32 = 11
+
+pub struct TargetSpec {
+  pub f0Lo: f64,
+  pub f0Hi: f64,
+  pub sizeLo: f64,
+  pub sizeHi: f64,
+  pub sizeCenter: f64,
+  pub lightLo: f64,
+  pub lightHi: f64,
+  pub lightCenter: f64,
+  pub hasTargetPoint: bool,
+  pub hasPitchTarget: bool,
+}
+
+impl Copy for TargetSpec {}
+
+pub fn targetLabel(target: u32) -> string<'static> {
+  if target == TARGET_LIGHT_SMALL {
+    return "Light & small"
+  }
+  if target == TARGET_BALANCED {
+    return "Balanced"
+  }
+  if target == TARGET_FULL_HEAVY {
+    return "Full & heavy"
+  }
+  if target == TARGET_NEUTRAL {
+    return "Neutral"
+  }
+  return "Custom"
+}
+
+pub fn targetSpec(target: u32, customSize: f64, customLight: f64) -> TargetSpec {
+  if target == TARGET_LIGHT_SMALL {
+    return TargetSpec {
+      f0Lo: 180.0,
+      f0Hi: 245.0,
+      sizeLo: 0.60,
+      sizeHi: 0.84,
+      sizeCenter: 0.72,
+      lightLo: 0.58,
+      lightHi: 0.85,
+      lightCenter: 0.72,
+      hasTargetPoint: true,
+      hasPitchTarget: true,
+    }
+  }
+  if target == TARGET_BALANCED {
+    return TargetSpec {
+      f0Lo: 145.0,
+      f0Hi: 192.0,
+      sizeLo: 0.38,
+      sizeHi: 0.62,
+      sizeCenter: 0.50,
+      lightLo: 0.40,
+      lightHi: 0.65,
+      lightCenter: 0.52,
+      hasTargetPoint: true,
+      hasPitchTarget: true,
+    }
+  }
+  if target == TARGET_FULL_HEAVY {
+    return TargetSpec {
+      f0Lo: 95.0,
+      f0Hi: 148.0,
+      sizeLo: 0.12,
+      sizeHi: 0.38,
+      sizeCenter: 0.25,
+      lightLo: 0.15,
+      lightHi: 0.44,
+      lightCenter: 0.28,
+      hasTargetPoint: true,
+      hasPitchTarget: true,
+    }
+  }
+  if target == TARGET_CUSTOM {
+    let cs = f64.max(0.05, f64.min(0.95, customSize))
+    let cl = f64.max(0.05, f64.min(0.95, customLight))
+    // Derive a natural compatible pitch band from the pad's (size + lightness) average
+    let avg = 0.5 * (cs + cl)
+    let f0Center = 105.0 + avg * 135.0
+    return TargetSpec {
+      f0Lo: f64.max(75.0, f0Center * 0.84),
+      f0Hi: f64.min(340.0, f0Center * 1.18),
+      sizeLo: f64.max(0.0, cs - 0.12),
+      sizeHi: f64.min(1.0, cs + 0.12),
+      sizeCenter: cs,
+      lightLo: f64.max(0.0, cl - 0.13),
+      lightHi: f64.min(1.0, cl + 0.13),
+      lightCenter: cl,
+      hasTargetPoint: true,
+      hasPitchTarget: false,
+    }
+  }
+  // TARGET_NEUTRAL: technique-only coaching (no gender/pitch preset)
+  return TargetSpec {
+    f0Lo: 85.0,
+    f0Hi: 280.0,
+    sizeLo: 0.15,
+    sizeHi: 0.85,
+    sizeCenter: 0.50,
+    lightLo: 0.15,
+    lightHi: 0.85,
+    lightCenter: 0.50,
+    hasTargetPoint: false,
+    hasPitchTarget: false,
+  }
+}
+
+/// Compact acoustic feature vector extracted per clip/selection (shared foundation for future tiny MLP).
+pub struct CoachFeatures {
+  pub voicedCount: usize,
+  pub voicedSec: f64,
+  pub medianF0: f64,
+  pub f0P10: f64,
+  pub f0P25: f64,
+  pub f0P75: f64,
+  pub f0IqrSt: f64,
+  pub medianVtlCm: f64,
+  pub medianSizeNorm: f64,
+  pub medianH1H2Db: f64,
+  pub medianWeightLight: f64,
+  pub medianHnrDb: f64,
+  pub balanceOffset: f64,
+  pub phraseEndDeltaVtlCm: f64,
+  pub phraseEndDeltaLight: f64,
+  pub phraseEndDeltaSt: f64,
+  pub frontVtlCm: f64,
+  pub backVtlCm: f64,
+  pub vowelSplitCm: f64,
+  pub ltasSlopeDb: f64,
+}
+
+impl Copy for CoachFeatures {}
+
+impl CoachFeatures {
+  pub fn empty() -> CoachFeatures {
+    return CoachFeatures {
+      voicedCount: 0,
+      voicedSec: 0.0,
+      medianF0: 0.0,
+      f0P10: 0.0,
+      f0P25: 0.0,
+      f0P75: 0.0,
+      f0IqrSt: 0.0,
+      medianVtlCm: 0.0,
+      medianSizeNorm: 0.5,
+      medianH1H2Db: 0.0,
+      medianWeightLight: 0.5,
+      medianHnrDb: 0.0,
+      balanceOffset: 0.0,
+      phraseEndDeltaVtlCm: 0.0,
+      phraseEndDeltaLight: 0.0,
+      phraseEndDeltaSt: 0.0,
+      frontVtlCm: 0.0,
+      backVtlCm: 0.0,
+      vowelSplitCm: 0.0,
+      ltasSlopeDb: 0.0,
+    }
+  }
+}
+
+pub struct CoachTip {
+  pub kind: u32,
+  pub severity: f64,
+  pub isPrimary: bool,
+  pub title: String,
+  pub detail: String,
+  pub hasSpan: bool,
+  pub t0: f64,
+  pub t1: f64,
+  pub spanLabel: String,
+}
+
+pub struct CoachReport {
+  pub valid: bool,
+  pub isNeutral: bool,
+  pub overall: u32,
+  pub bar1: u32,
+  pub bar2: u32,
+  pub bar3: u32,
+  pub bar4: u32,
+  pub weakestMetric: u32,
+  pub summaryLine: String,
+  pub features: CoachFeatures,
+  pub tips: List<CoachTip>,
+}
+
+impl CoachReport {
+  pub fn empty() -> CoachReport {
+    return CoachReport {
+      valid: false,
+      isNeutral: false,
+      overall: 0,
+      bar1: 0,
+      bar2: 0,
+      bar3: 0,
+      bar4: 0,
+      weakestMetric: 0,
+      summaryLine: String.make(),
+      features: CoachFeatures.empty(),
+      tips: List<CoachTip>.make(),
+    }
+  }
+}
+
+fn sortF64(vals: &mut [f64]) -> () {
+  let n = vals.length
+  let mut i: usize = 1
+  while i < n {
+    let key = vals[i]
+    let mut j = i
+    while j > 0 && vals[j - 1] > key {
+      vals[j] = vals[j - 1]
+      j = j - 1
+    }
+    vals[j] = key
+    i = i + 1
+  }
+}
+
+fn quantileSorted(vals: &[f64], q: f64) -> f64 {
+  if vals.length == 0 {
+    return 0.0
+  }
+  if vals.length == 1 {
+    return vals[0]
+  }
+  let pos = f64.max(0.0, f64.min(1.0, q)) * usize.toF64(vals.length - 1)
+  let lo = f64.toUsize(f64.floor(pos))
+  let hi = if lo + 1 < vals.length { lo + 1 } else { lo }
+  let frac = pos - usize.toF64(lo)
+  return vals[lo] * (1.0 - frac) + vals[hi] * frac
+}
+
+fn clampScore(v: f64) -> u32 {
+  if v <= 0.0 {
+    return 0
+  }
+  if v >= 100.0 {
+    return 100
+  }
+  return f64.toU32(f64.round(v))
+}
+
+fn bandScore(val: f64, lo: f64, hi: f64, scale: f64) -> u32 {
+  if val >= lo && val <= hi {
+    return 100
+  }
+  let dist = if val < lo { lo - val } else { val - hi }
+  return clampScore(100.0 * f64.exp(-(dist / scale) * (dist / scale) * 0.9))
+}
+
+fn semitonesBetween(a: f64, b: f64) -> f64 {
+  if a <= 1.0 || b <= 1.0 {
+    return 0.0
+  }
+  return 12.0 * f64.log2(a / b)
+}
+
+fn sizeNormToVtlCm(s: f64) -> f64 {
+  return VTL_BIG_CM - f64.max(0.0, f64.min(1.0, s)) * (VTL_BIG_CM - VTL_SMALL_CM)
+}
+
+fn lightNormToH1H2Db(l: f64) -> f64 {
+  return H1H2_HEAVY_DB + f64.max(0.0, f64.min(1.0, l)) * (H1H2_LIGHT_DB - H1H2_HEAVY_DB)
+}
+
+effect fn formatSpan(t0: f64, t1: f64) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let a = run formatSecShort(t0)
+  let b = run formatSecShort(t1)
+  let mut s = String.make()
+  run s.append(String.view(&a))
+  run s.append("–")
+  run s.append(String.view(&b))
+  return move s
+}
+
+effect fn pushTip(
+  tips: &mut List<CoachTip>,
+  kind: u32,
+  severity: f64,
+  title: string,
+  detail: String,
+  hasSpan: bool,
+  t0: f64,
+  t1: f64,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let titleCopy = run String.copy(title)
+  let spanLabel = if hasSpan && t1 > t0 + 0.02 {
+    run formatSpan(t0, t1)
+  } else {
+    String.make()
+  }
+  run tips.append(
+    CoachTip {
+      kind: kind,
+      severity: severity,
+      isPrimary: false,
+      title: move titleCopy,
+      detail: move detail,
+      hasSpan: hasSpan && t1 > t0 + 0.02,
+      t0: t0,
+      t1: t1,
+      spanLabel: move spanLabel,
+    },
+  )
+}
+
+pub effect fn analyzeCoach(
+  track: &VoiceMetricsTrack,
+  target: u32,
+  customSize: f64,
+  customLight: f64,
+  useSel: bool,
+  selT0: f64,
+  selT1: f64,
+) -> CoachReport
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let all = track.frames.asSlice()
+  let mut voiced = List<VoiceFrame>.make()
+  let mut i: usize = 0
+  while i < all.length {
+    let fr = all[i]
+    if fr.voiced && fr.f0 > 40.0 {
+      if !useSel || (fr.time >= selT0 && fr.time <= selT1) {
+        run voiced.append(fr)
+      }
+    }
+    i = i + 1
+  }
+
+  let vf = voiced.asSlice()
+  if vf.length < 6 {
+    return CoachReport.empty()
+  }
+
+  let spec = targetSpec(target, customSize, customLight)
+  let isNeutral = target == TARGET_NEUTRAL
+
+  // 1. Collect distributions
+  let mut f0s = List<f64>.make()
+  let mut vtls = List<f64>.make()
+  let mut sizes = List<f64>.make()
+  let mut h1h2s = List<f64>.make()
+  let mut lights = List<f64>.make()
+  let mut hnrs = List<f64>.make()
+
+  let mut voicedSec: f64 = 0.0
+  i = 0
+  while i < vf.length {
+    let fr = vf[i]
+    run f0s.append(fr.f0)
+    if fr.vtlCm > 1.0 {
+      run vtls.append(fr.vtlCm)
+    }
+    run sizes.append(fr.sizeNorm)
+    run h1h2s.append(fr.h1h2Db)
+    run lights.append(fr.weightLightNorm)
+    run hnrs.append(fr.hnrDb)
+    if i + 1 < vf.length {
+      let dt = vf[i + 1].time - fr.time
+      if dt > 0.0 && dt < 0.08 {
+        voicedSec = voicedSec + dt
+      } else {
+        voicedSec = voicedSec + 0.015
+      }
+    }
+    i = i + 1
+  }
+
+  sortF64(f0s.asMutSlice())
+  sortF64(vtls.asMutSlice())
+  sortF64(sizes.asMutSlice())
+  sortF64(h1h2s.asMutSlice())
+  sortF64(lights.asMutSlice())
+  sortF64(hnrs.asMutSlice())
+
+  let medF0 = quantileSorted(f0s.asSlice(), 0.50)
+  let f0P10 = quantileSorted(f0s.asSlice(), 0.10)
+  let f0P25 = quantileSorted(f0s.asSlice(), 0.25)
+  let f0P75 = quantileSorted(f0s.asSlice(), 0.75)
+  let f0IqrSt = semitonesBetween(f0P75, f0P25)
+  let medVtl = if vtls.length() > 0 { quantileSorted(vtls.asSlice(), 0.50) } else { 15.8 }
+  let medSize = quantileSorted(sizes.asSlice(), 0.50)
+  let medH1H2 = quantileSorted(h1h2s.asSlice(), 0.50)
+  let medLight = quantileSorted(lights.asSlice(), 0.50)
+  let medHnr = quantileSorted(hnrs.asSlice(), 0.50)
+  let balanceOffset = medLight - medSize
+
+  // LTAS spectral tilt (high 1.5-4 kHz vs low 120-600 Hz)
+  let mut ltasSlope: f64 = 0.0
+  if track.hasLtas {
+    let mut loSum: f64 = 0.0
+    let mut loN: f64 = 0.0
+    let mut hiSum: f64 = 0.0
+    let mut hiN: f64 = 0.0
+    let mut b: usize = 0
+    while b < LTAS_BINS {
+      if b >= 10 && b <= 32 {
+        loSum = loSum + f32.toF64(track.ltas[b])
+        loN = loN + 1.0
+      } else if b >= 45 && b <= 58 {
+        hiSum = hiSum + f32.toF64(track.ltas[b])
+        hiN = hiN + 1.0
+      }
+      b = b + 1
+    }
+    if loN > 0.0 && hiN > 0.0 {
+      ltasSlope = (hiSum / hiN) - (loSum / loN)
+    }
+  }
+
+  let mut rawTips = List<CoachTip>.make()
+
+  // =========================================================================
+  // Detector 1: Size x Weight Balance (Hollow vs. Overfull)
+  // =========================================================================
+  let mut worstHollow: f64 = 0.0
+  let mut hollowT0: f64 = 0.0
+  let mut hollowT1: f64 = 0.0
+  let mut worstOver: f64 = 0.0
+  let mut overT0: f64 = 0.0
+  let mut overT1: f64 = 0.0
+
+  i = 0
+  while i < vf.length {
+    let tStart = vf[i].time
+    let mut j = i
+    let mut balSum: f64 = 0.0
+    let mut cnt: usize = 0
+    while j < vf.length && vf[j].time - tStart <= 0.45 {
+      if j > i && vf[j].time - vf[j - 1].time > 0.16 {
+        break
+      }
+      balSum = balSum + (vf[j].weightLightNorm - vf[j].sizeNorm)
+      cnt = cnt + 1
+      j = j + 1
+    }
+    if cnt >= 6 {
+      let meanBal = balSum / usize.toF64(cnt)
+      let tEnd = vf[j - 1].time
+      if meanBal > worstHollow {
+        worstHollow = meanBal
+        hollowT0 = tStart
+        hollowT1 = tEnd
+      }
+      if -meanBal > worstOver {
+        worstOver = -meanBal
+        overT0 = tStart
+        overT1 = tEnd
+      }
+    }
+    i = i + 2
+  }
+
+  if balanceOffset > 0.19 || worstHollow > 0.28 {
+    let sev = f64.min(1.0, 0.45 + f64.max(balanceOffset, worstHollow * 0.85) * 1.4)
+    let mut d = String.make()
+    run d.append("Light weight (")
+    if medH1H2 >= 0.0 { run d.append("+") }
+    run appendFixed(&mut d, medH1H2, 1)
+    run d.append(" dB) with larger resonance (")
+    run appendFixed(&mut d, medVtl, 1)
+    run d.append(" cm) — brighten vowels to sound less hollow.")
+    run pushTip(&mut rawTips, TIP_HOLLOW, sev, "Hollow balance", move d, true, hollowT0, hollowT1)
+  } else if balanceOffset < -0.19 || worstOver > 0.28 {
+    let sev = f64.min(1.0, 0.45 + f64.max(-balanceOffset, worstOver * 0.85) * 1.4)
+    let mut d = String.make()
+    run d.append("Small resonance (")
+    run appendFixed(&mut d, medVtl, 1)
+    run d.append(" cm) with heavy weight (")
+    if medH1H2 >= 0.0 { run d.append("+") }
+    run appendFixed(&mut d, medH1H2, 1)
+    run d.append(" dB) — lighten vocal fold closure for a smoother tone.")
+    run pushTip(&mut rawTips, TIP_OVERFULL, sev, "Overfull / buzzed", move d, true, overT0, overT1)
+  }
+
+  // =========================================================================
+  // Detector 2: Phrase-End Drop (Tail Drift across active utterances)
+  // =========================================================================
+  let mut worstPhraseDrop: f64 = 0.0
+  let mut worstDeltaVtl: f64 = 0.0
+  let mut worstDeltaLight: f64 = 0.0
+  let mut worstDeltaSt: f64 = 0.0
+  let mut phraseT0: f64 = 0.0
+  let mut phraseT1: f64 = 0.0
+
+  let mut pStart: usize = 0
+  while pStart < vf.length {
+    let mut pEnd = pStart
+    while pEnd + 1 < vf.length && vf[pEnd + 1].time - vf[pEnd].time <= 0.28 {
+      pEnd = pEnd + 1
+    }
+    let count = pEnd - pStart + 1
+    let pDur = vf[pEnd].time - vf[pStart].time
+    if count >= 14 && pDur >= 0.65 {
+      let headEnd = pStart + (count * 3) / 5
+      let tailStart = pStart + (count * 3) / 4
+      if headEnd > pStart + 3 && pEnd > tailStart + 2 {
+        let mut hVtl: f64 = 0.0
+        let mut hVtlN: f64 = 0.0
+        let mut hLight: f64 = 0.0
+        let mut hF0: f64 = 0.0
+        let mut k = pStart
+        while k < headEnd {
+          if vf[k].vtlCm > 1.0 {
+            hVtl = hVtl + vf[k].vtlCm
+            hVtlN = hVtlN + 1.0
+          }
+          hLight = hLight + vf[k].weightLightNorm
+          hF0 = hF0 + vf[k].f0
+          k = k + 1
+        }
+        let headCnt = usize.toF64(headEnd - pStart)
+        let headVtlAvg = if hVtlN > 0.0 { hVtl / hVtlN } else { medVtl }
+        let headLightAvg = hLight / headCnt
+        let headF0Avg = hF0 / headCnt
+
+        let mut tVtl: f64 = 0.0
+        let mut tVtlN: f64 = 0.0
+        let mut tLight: f64 = 0.0
+        let mut tF0: f64 = 0.0
+        k = tailStart
+        while k <= pEnd {
+          if vf[k].vtlCm > 1.0 {
+            tVtl = tVtl + vf[k].vtlCm
+            tVtlN = tVtlN + 1.0
+          }
+          tLight = tLight + vf[k].weightLightNorm
+          tF0 = tF0 + vf[k].f0
+          k = k + 1
+        }
+        let tailCnt = usize.toF64(pEnd - tailStart + 1)
+        let tailVtlAvg = if tVtlN > 0.0 { tVtl / tVtlN } else { medVtl }
+        let tailLightAvg = tLight / tailCnt
+        let tailF0Avg = tF0 / tailCnt
+
+        let dVtl = tailVtlAvg - headVtlAvg
+        let dLight = tailLightAvg - headLightAvg
+        let dSt = semitonesBetween(tailF0Avg, headF0Avg)
+
+        let dropMetric = f64.max(0.0, dVtl / 1.0) * 0.50
+          + f64.max(0.0, -dLight / 0.22) * 0.35
+          + f64.max(0.0, (-dSt - 1.2) / 4.0) * 0.25
+        if dropMetric > worstPhraseDrop {
+          worstPhraseDrop = dropMetric
+          worstDeltaVtl = dVtl
+          worstDeltaLight = dLight
+          worstDeltaSt = dSt
+          phraseT0 = vf[tailStart].time
+          phraseT1 = vf[pEnd].time
+        }
+      }
+    }
+    pStart = pEnd + 1
+  }
+
+  if target != TARGET_FULL_HEAVY && (worstDeltaVtl > 0.55 || worstDeltaLight < -0.14 || worstDeltaSt < -3.0) {
+    let sev = f64.min(0.95, 0.38 + worstPhraseDrop * 0.55)
+    let mut d = String.make()
+    if worstDeltaVtl > 0.55 {
+      run d.append("Resonance darkens +")
+      run appendFixed(&mut d, worstDeltaVtl, 1)
+      run d.append(" cm at the end of the phrase — keep the last words bright and supported.")
+    } else if worstDeltaLight < -0.14 {
+      run d.append("Weight gets heavier at the end of the phrase — keep airflow steady through the final words.")
+    } else {
+      run d.append("Pitch drops ")
+      run appendFixed(&mut d, -worstDeltaSt, 1)
+      run d.append(" st on the phrase tail — stay gently lifted on final syllables.")
+    }
+    run pushTip(&mut rawTips, TIP_PHRASE_DROP, sev, "Phrase-end drop", move d, true, phraseT0, phraseT1)
+  }
+
+  // =========================================================================
+  // Detector 3: Vowel-Specific Resonance Slip (Front vs. Back/Open VTL)
+  // =========================================================================
+  let mut frontVtls = List<f64>.make()
+  let mut backVtls = List<f64>.make()
+  let mut worstBackVtl: f64 = 0.0
+  let mut backT0: f64 = 0.0
+  let mut backT1: f64 = 0.0
+
+  i = 0
+  while i < vf.length {
+    let fr = vf[i]
+    if fr.hasFormants && fr.vtlCm > 1.0 {
+      if fr.f2 >= 1800.0 {
+        run frontVtls.append(fr.vtlCm)
+      } else if fr.f2 > 600.0 && fr.f2 <= 1400.0 {
+        run backVtls.append(fr.vtlCm)
+        // Track peak open/back vowel cluster
+        if fr.vtlCm > worstBackVtl {
+          worstBackVtl = fr.vtlCm
+          backT0 = f64.max(vf[0].time, fr.time - 0.14)
+          backT1 = f64.min(vf[vf.length - 1].time, fr.time + 0.16)
+        }
+      }
+    }
+    i = i + 1
+  }
+
+  let mut frontMedVtl: f64 = 0.0
+  let mut backMedVtl: f64 = 0.0
+  let mut vowelSplit: f64 = 0.0
+  if frontVtls.length() >= 4 && backVtls.length() >= 4 {
+    sortF64(frontVtls.asMutSlice())
+    sortF64(backVtls.asMutSlice())
+    frontMedVtl = quantileSorted(frontVtls.asSlice(), 0.50)
+    backMedVtl = quantileSorted(backVtls.asSlice(), 0.50)
+    vowelSplit = backMedVtl - frontMedVtl
+    if target != TARGET_FULL_HEAVY && vowelSplit > 0.80 {
+      let sev = f64.min(0.90, 0.35 + (vowelSplit - 0.50) * 0.45)
+      let mut d = String.make()
+      run d.append("Front vowels (/i, e/) sit at ")
+      run appendFixed(&mut d, frontMedVtl, 1)
+      run d.append(" cm, but open/back vowels drop to ")
+      run appendFixed(&mut d, backMedVtl, 1)
+      run d.append(" cm — keep brighter forward resonance on /ɑ, o/.")
+      run pushTip(&mut rawTips, TIP_VOWEL_SLIP, sev, "Open vowels drop back", move d, true, backT0, backT1)
+    }
+  }
+
+  // =========================================================================
+  // Detector 4: Clarity (Airy/Breathy vs. Pressed/Strained)
+  // =========================================================================
+  let mut minHnrWin: f64 = 99.0
+  let mut minHnrH1H2: f64 = 0.0
+  let mut hnrT0: f64 = 0.0
+  let mut hnrT1: f64 = 0.0
+
+  i = 0
+  while i < vf.length {
+    let tStart = vf[i].time
+    let mut j = i
+    let mut hnrSum: f64 = 0.0
+    let mut h12Sum: f64 = 0.0
+    let mut cnt: usize = 0
+    while j < vf.length && vf[j].time - tStart <= 0.40 {
+      if j > i && vf[j].time - vf[j - 1].time > 0.16 {
+        break
+      }
+      hnrSum = hnrSum + vf[j].hnrDb
+      h12Sum = h12Sum + vf[j].h1h2Db
+      cnt = cnt + 1
+      j = j + 1
+    }
+    if cnt >= 6 {
+      let avgHnr = hnrSum / usize.toF64(cnt)
+      if avgHnr < minHnrWin {
+        minHnrWin = avgHnr
+        minHnrH1H2 = h12Sum / usize.toF64(cnt)
+        hnrT0 = tStart
+        hnrT1 = vf[j - 1].time
+      }
+    }
+    i = i + 2
+  }
+
+  if medHnr < 13.5 || minHnrWin < 10.5 {
+    let refHnr = if medHnr < 13.5 { medHnr } else { minHnrWin }
+    let refH12 = if medHnr < 13.5 { medH1H2 } else { minHnrH1H2 }
+    if refH12 >= 6.0 {
+      let sev = f64.min(0.90, 0.40 + (14.0 - refHnr) * 0.08)
+      let mut d = String.make()
+      run d.append("HNR dips to ")
+      run appendFixed(&mut d, refHnr, 1)
+      run d.append(" dB with very light weight — slightly firmer fold closure adds clarity without heaviness.")
+      run pushTip(&mut rawTips, TIP_BREATHY, sev, "Airy / breathy", move d, true, hnrT0, hnrT1)
+    } else if refH12 <= 1.0 {
+      let sev = f64.min(0.92, 0.42 + (14.5 - refHnr) * 0.08)
+      let mut d = String.make()
+      run d.append("HNR dips to ")
+      run appendFixed(&mut d, refHnr, 1)
+      run d.append(" dB with heavy weight — ease throat tension and reduce vocal push slightly.")
+      run pushTip(&mut rawTips, TIP_PRESSED, sev, "Pressed / tense", move d, true, hnrT0, hnrT1)
+    }
+  }
+
+  // =========================================================================
+  // Detector 5: Intonation Expressiveness & Pitch Floor Dips
+  // =========================================================================
+  if voicedSec >= 1.1 && f0IqrSt < 2.0 {
+    let sev = f64.min(0.75, 0.30 + (2.0 - f0IqrSt) * 0.25)
+    let mut d = String.make()
+    run d.append("Pitch stays within ")
+    run appendFixed(&mut d, f0IqrSt, 1)
+    run d.append(" st across the phrase — add gentle upward inflection on stressed words.")
+    run pushTip(&mut rawTips, TIP_MONOTONE, sev, "Flat intonation", move d, true, vf[0].time, vf[vf.length - 1].time)
+  }
+
+  if spec.hasPitchTarget && f0P10 < spec.f0Lo * 0.84 && medF0 >= spec.f0Lo * 0.90 {
+    // Locate lowest F0 cluster
+    let mut minF0: f64 = 9999.0
+    let mut dipT: f64 = vf[0].time
+    i = 0
+    while i < vf.length {
+      if vf[i].f0 < minF0 {
+        minF0 = vf[i].f0
+        dipT = vf[i].time
+      }
+      i = i + 1
+    }
+    let dipT0 = f64.max(vf[0].time, dipT - 0.16)
+    let dipT1 = f64.min(vf[vf.length - 1].time, dipT + 0.18)
+    let sev = f64.min(0.80, 0.34 + semitonesBetween(spec.f0Lo, f0P10) * 0.08)
+    let mut d = String.make()
+    run d.append("Median pitch is on target, but occasional lows dip to ")
+    run appendFixed(&mut d, f0P10, 0)
+    run d.append(" Hz.")
+    run pushTip(&mut rawTips, TIP_PITCH_DIP, sev, "Pitch floor dips", move d, true, dipT0, dipT1)
+  }
+
+  // =========================================================================
+  // Detector 6: Target Preset Scores & Biggest Lever
+  // =========================================================================
+  let balanceScore = clampScore(100.0 - f64.abs(balanceOffset) * 190.0)
+  let clarityScore = clampScore(100.0 * f64.min(1.0, f64.max(0.0, (medHnr - 6.0) / 14.0)))
+  let stabilityScore = clampScore(100.0 - worstPhraseDrop * 55.0)
+  let flowScore = bandScore(f0IqrSt, 2.4, 8.5, 2.5)
+
+  let mut bar1: u32 = 0
+  let mut bar2: u32 = 0
+  let mut bar3: u32 = 0
+  let mut bar4: u32 = 0
+  let mut overall: u32 = 0
+  let mut weakest: u32 = 0
+
+  if isNeutral {
+    bar1 = balanceScore
+    bar2 = clarityScore
+    bar3 = stabilityScore
+    bar4 = flowScore
+    overall = clampScore(
+      u32.toF64(bar1) * 0.35 + u32.toF64(bar2) * 0.30 + u32.toF64(bar3) * 0.20 + u32.toF64(bar4) * 0.15,
+    )
+    let mut minS = bar1
+    weakest = 1
+    if bar2 < minS {
+      minS = bar2
+      weakest = 2
+    }
+    if bar3 < minS {
+      minS = bar3
+      weakest = 3
+    }
+    if bar4 < minS {
+      minS = bar4
+      weakest = 4
+    }
+    if minS >= 85 {
+      weakest = 0
+    }
+  } else {
+    let pitchScore = if spec.hasPitchTarget {
+      let loSt = semitonesBetween(spec.f0Lo, medF0)
+      let hiSt = semitonesBetween(medF0, spec.f0Hi)
+      if medF0 >= spec.f0Lo && medF0 <= spec.f0Hi {
+        100
+      } else {
+        let distSt = if medF0 < spec.f0Lo { loSt } else { hiSt }
+        clampScore(100.0 * f64.exp(-(distSt / 5.0) * (distSt / 5.0) * 0.85))
+      }
+    } else {
+      // Custom pad point: pitch is soft-guided so Size & Weight dominate
+      let loSt = semitonesBetween(spec.f0Lo, medF0)
+      let hiSt = semitonesBetween(medF0, spec.f0Hi)
+      if medF0 >= spec.f0Lo && medF0 <= spec.f0Hi {
+        100
+      } else {
+        let distSt = if medF0 < spec.f0Lo { loSt } else { hiSt }
+        clampScore(100.0 * f64.exp(-(distSt / 7.5) * (distSt / 7.5) * 0.7))
+      }
+    }
+    let sizeScore = bandScore(medSize, spec.sizeLo, spec.sizeHi, 0.28)
+    let weightScore = bandScore(medLight, spec.lightLo, spec.lightHi, 0.28)
+
+    bar1 = pitchScore
+    bar2 = sizeScore
+    bar3 = weightScore
+    bar4 = balanceScore
+
+    overall = if spec.hasPitchTarget {
+      clampScore(
+        u32.toF64(pitchScore) * 0.22 + u32.toF64(sizeScore) * 0.34 + u32.toF64(weightScore) * 0.28 + u32.toF64(balanceScore) * 0.16,
+      )
+    } else {
+      clampScore(
+        u32.toF64(pitchScore) * 0.10 + u32.toF64(sizeScore) * 0.42 + u32.toF64(weightScore) * 0.34 + u32.toF64(balanceScore) * 0.14,
+      )
+    }
+
+    let mut minS = pitchScore
+    weakest = 1
+    if sizeScore < minS {
+      minS = sizeScore
+      weakest = 2
+    }
+    if weightScore < minS {
+      minS = weightScore
+      weakest = 3
+    }
+    if balanceScore < minS {
+      minS = balanceScore
+      weakest = 4
+    }
+    if minS >= 85 {
+      weakest = 0
+    }
+
+    // Emit actionable target lever tips when outside band
+    if sizeScore < 82 {
+      let targetVtl = sizeNormToVtlCm(spec.sizeCenter)
+      let sev = f64.min(0.98, 0.45 + u32.toF64(100 - sizeScore) * 0.008)
+      // Locate peak off-target resonance moment
+      let wantSmaller = medSize < spec.sizeLo
+      let mut bestDist: f64 = -1.0
+      let mut bestT: f64 = vf[0].time
+      i = 0
+      while i < vf.length {
+        let dist = if wantSmaller { spec.sizeLo - vf[i].sizeNorm } else { vf[i].sizeNorm - spec.sizeHi }
+        if dist > bestDist {
+          bestDist = dist
+          bestT = vf[i].time
+        }
+        i = i + 1
+      }
+      let t0 = f64.max(vf[0].time, bestT - 0.18)
+      let t1 = f64.min(vf[vf.length - 1].time, bestT + 0.22)
+      let mut d = String.make()
+      run d.append("VTL averages ")
+      run appendFixed(&mut d, medVtl, 1)
+      run d.append(" cm (target ~")
+      run appendFixed(&mut d, targetVtl, 1)
+      run d.append(" cm) — ")
+      if wantSmaller {
+        run d.append("brighten resonance by raising tongue/smiling slightly on vowels.")
+      } else {
+        run d.append("open throat space slightly for warmer, darker resonance.")
+      }
+      run pushTip(
+        &mut rawTips,
+        TIP_TARGET_SIZE,
+        sev,
+        if wantSmaller { "Brighten resonance" } else { "Darken resonance" },
+        move d,
+        true,
+        t0,
+        t1,
+      )
+    }
+
+    if weightScore < 82 {
+      let targetDb = lightNormToH1H2Db(spec.lightCenter)
+      let sev = f64.min(0.96, 0.43 + u32.toF64(100 - weightScore) * 0.008)
+      let wantLighter = medLight < spec.lightLo
+      let mut bestDist: f64 = -1.0
+      let mut bestT: f64 = vf[0].time
+      i = 0
+      while i < vf.length {
+        let dist = if wantLighter { spec.lightLo - vf[i].weightLightNorm } else { vf[i].weightLightNorm - spec.lightHi }
+        if dist > bestDist {
+          bestDist = dist
+          bestT = vf[i].time
+        }
+        i = i + 1
+      }
+      let t0 = f64.max(vf[0].time, bestT - 0.18)
+      let t1 = f64.min(vf[vf.length - 1].time, bestT + 0.22)
+      let mut d = String.make()
+      run d.append("H1–H2 is ")
+      if medH1H2 >= 0.0 { run d.append("+") }
+      run appendFixed(&mut d, medH1H2, 1)
+      run d.append(" dB (target ~")
+      if targetDb >= 0.0 { run d.append("+") }
+      run appendFixed(&mut d, targetDb, 0)
+      run d.append(" dB) — ")
+      if wantLighter {
+        run d.append("speak softer and thinner to lighten vocal weight.")
+      } else {
+        run d.append("add firmer vocal fold closure for fuller weight.")
+      }
+      run pushTip(
+        &mut rawTips,
+        TIP_TARGET_WEIGHT,
+        sev,
+        if wantLighter { "Lighten vocal weight" } else { "Add vocal weight" },
+        move d,
+        true,
+        t0,
+        t1,
+      )
+    }
+
+    if spec.hasPitchTarget && pitchScore < 80 {
+      let sev = f64.min(0.90, 0.36 + u32.toF64(100 - pitchScore) * 0.007)
+      let wantHigher = medF0 < spec.f0Lo
+      let mut d = String.make()
+      run d.append("Median F0 is ")
+      run appendFixed(&mut d, medF0, 0)
+      run d.append(" Hz (target ")
+      run appendFixed(&mut d, spec.f0Lo, 0)
+      run d.append("–")
+      run appendFixed(&mut d, spec.f0Hi, 0)
+      run d.append(" Hz) — ")
+      if wantHigher {
+        run d.append("lift baseline pitch slightly while keeping weight easy.")
+      } else {
+        run d.append("relax baseline pitch slightly lower.")
+      }
+      run pushTip(
+        &mut rawTips,
+        TIP_TARGET_PITCH,
+        sev,
+        if wantHigher { "Lift baseline pitch" } else { "Lower baseline pitch" },
+        move d,
+        false,
+        0.0,
+        0.0,
+      )
+    }
+  }
+
+  // Pick top 3 tips sorted by severity descending (selection pass avoids moving non-Copy structs in-place)
+  let mut topTips = List<CoachTip>.make()
+  let mut used = List<bool>.make()
+  let nTips = rawTips.length()
+  i = 0
+  while i < nTips {
+    run used.append(false)
+    i = i + 1
+  }
+
+  let rawSlice = rawTips.asSlice()
+  let mut picked: usize = 0
+  while picked < 3 && picked < nTips {
+    let mut bestIdx: usize = nTips
+    let mut bestSev: f64 = -1.0
+    i = 0
+    while i < nTips {
+      if !used.asSlice()[i] && rawSlice[i].severity > bestSev {
+        bestSev = rawSlice[i].severity
+        bestIdx = i
+      }
+      i = i + 1
+    }
+    if bestIdx >= nTips {
+      break
+    }
+    let usedMut = used.asMutSlice()
+    usedMut[bestIdx] = true
+    let src = &rawSlice[bestIdx]
+    let tTitle = run String.copy(String.view(&src.title))
+    let tDetail = run String.copy(String.view(&src.detail))
+    let tSpan = run String.copy(String.view(&src.spanLabel))
+    run topTips.append(
+      CoachTip {
+        kind: src.kind,
+        severity: src.severity,
+        isPrimary: picked == 0,
+        title: move tTitle,
+        detail: move tDetail,
+        hasSpan: src.hasSpan,
+        t0: src.t0,
+        t1: src.t1,
+        spanLabel: move tSpan,
+      },
+    )
+    picked = picked + 1
+  }
+
+  let mut summary = String.make()
+  if topTips.length() == 0 {
+    if isNeutral {
+      run summary.append("Well-balanced resonance, weight, clarity, and phrasing.")
+    } else {
+      run summary.append("Right in the sweet spot for ")
+      run summary.append(targetLabel(target))
+      run summary.append(" — balanced fullness and clarity.")
+    }
+  }
+
+  let features = CoachFeatures {
+    voicedCount: vf.length,
+    voicedSec: voicedSec,
+    medianF0: medF0,
+    f0P10: f0P10,
+    f0P25: f0P25,
+    f0P75: f0P75,
+    f0IqrSt: f0IqrSt,
+    medianVtlCm: medVtl,
+    medianSizeNorm: medSize,
+    medianH1H2Db: medH1H2,
+    medianWeightLight: medLight,
+    medianHnrDb: medHnr,
+    balanceOffset: balanceOffset,
+    phraseEndDeltaVtlCm: worstDeltaVtl,
+    phraseEndDeltaLight: worstDeltaLight,
+    phraseEndDeltaSt: worstDeltaSt,
+    frontVtlCm: frontMedVtl,
+    backVtlCm: backMedVtl,
+    vowelSplitCm: vowelSplit,
+    ltasSlopeDb: ltasSlope,
+  }
+
+  return CoachReport {
+    valid: true,
+    isNeutral: isNeutral,
+    overall: overall,
+    bar1: bar1,
+    bar2: bar2,
+    bar3: bar3,
+    bar4: bar4,
+    weakestMetric: weakest,
+    summaryLine: move summary,
+    features: features,
+    tips: move topTips,
+  }
+}

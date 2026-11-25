@@ -2,12 +2,14 @@
 //!
 //! Muted light-chrome studio + darkroom spectrogram well.
 import audio_native { SORT_ALPHA, SORT_OVERALL, SORT_PITCH, SORT_SIZE, SORT_VOWEL, SORT_WEIGHT }
+import coach { CoachTip, targetLabel }
 import colormap { paletteIndex, paletteName }
 import formants { VOWELS_FEM, VOWELS_MASC, VOWEL_MODE_BOTH, VOWEL_MODE_FEM, VOWEL_MODE_MASC }
 import overlays { AxisTick, GuideBadge, vowelX, vowelY }
 import studio {
   AXIS_W,
   CTX_AUDIO,
+  CTX_COACH_TARGET,
   CTX_LIB_SORT,
   CTX_PALETTE,
   CTX_SPEED,
@@ -1560,6 +1562,11 @@ fn renderReadoutsRail(m: &Overtone, h: &Document<Message>) -> Node {
 }
 
 fn renderMatchCard(m: &Overtone, h: &Document<Message>) -> Node {
+  let showCoach = !m.refClip.active || m.coachPreferView
+  if showCoach {
+    return renderCoachCard(m, h)
+  }
+
   let useSel = m.hasSelection && m.selCompare.valid
   let sc = if useSel { m.selCompare.score } else { m.compare.score }
   let valid = m.refClip.active && sc.valid
@@ -1569,23 +1576,35 @@ fn renderMatchCard(m: &Overtone, h: &Document<Message>) -> Node {
     &[h.class("px-[16px] pt-[12px] pb-[12px] gap-[10px] border-b border-[#E6E6E8] shrink-0")],
     &[
       h.row(
-        &[h.class("items-center justify-between")],
+        &[h.class("items-center justify-between gap-[6px]")],
         &[
-          txt(
-            h,
-            if useSel { "Match vs ref · sel" } else { "Match vs ref" },
-            "text-[11px] leading-[14px] font-semibold tracking-[0.06em] uppercase text-[#6B6B70]",
+          h.row(
+            &[h.class("items-center gap-[6px]")],
+            &[
+              txt(
+                h,
+                if useSel { "Match vs ref · sel" } else { "Match vs ref" },
+                "text-[11px] leading-[14px] font-semibold tracking-[0.06em] uppercase text-[#6B6B70]",
+              ),
+              h.row(
+                &[h.class("gap-[2px]")],
+                &[
+                  miniTabBtn(h, "Ref", true, Message.SetCoachViewMode { coach: false }),
+                  miniTabBtn(h, "Coach", false, Message.SetCoachViewMode { coach: true }),
+                ],
+              ),
+            ],
           ),
           h.row(
-            &[h.class("items-center gap-[8px]")],
+            &[h.class("items-center gap-[6px]")],
             &[
               txtA(
                 h,
-                if m.refClip.active { "Weights ▾" } else { "Pin ref" },
+                "Weights ▾",
                 &[
                   h.class("text-[11px] leading-[14px] text-[#6B6B70] hover:text-[#0B0B0C]"),
                   h.cursor(Cursor.Pointer),
-                  h.onClick(if m.refClip.active { Message.OpenSettingsTab { tab: SET_COMPARE } } else { Message.PinReference }),
+                  h.onClick(Message.OpenSettingsTab { tab: SET_COMPARE }),
                 ],
               ),
               railHeaderBtn(h, "›", false, Message.ToggleReadouts),
@@ -1624,6 +1643,146 @@ fn renderMatchCard(m: &Overtone, h: &Document<Message>) -> Node {
       },
       if valid && String.byteLength(String.view(&m.readoutCoachHint)) > 0 {
         txt(h, String.view(&m.readoutCoachHint), "text-[12px] leading-[16px] text-[#3A3A40]")
+      } else {
+        h.empty()
+      },
+    ],
+  )
+}
+
+fn renderCoachCard(m: &Overtone, h: &Document<Message>) -> Node {
+  let cr = &m.coachReport
+  let valid = cr.valid
+  let overallNum = if valid { pctDigits(u32.toI32(cr.overall)) } else { "—" }
+  let b1Label = if cr.isNeutral { "Balance" } else { "Pitch" }
+  let b2Label = if cr.isNeutral { "Clarity" } else { "Size" }
+  let b3Label = if cr.isNeutral { "Steady" } else { "Weight" }
+  let b4Label = if cr.isNeutral { "Flow" } else { "Balance" }
+  let tips = cr.tips.asSlice()
+
+  return h.column(
+    &[h.class("px-[16px] pt-[12px] pb-[12px] gap-[10px] border-b border-[#E6E6E8] shrink-0")],
+    &[
+      h.row(
+        &[h.class("items-center justify-between gap-[6px]")],
+        &[
+          h.row(
+            &[h.class("items-center gap-[6px]")],
+            &[
+              txt(h, "Coach", "text-[11px] leading-[14px] font-semibold tracking-[0.06em] uppercase text-[#6B6B70]"),
+              if m.refClip.active {
+                h.row(
+                  &[h.class("gap-[2px]")],
+                  &[
+                    miniTabBtn(h, "Ref", false, Message.SetCoachViewMode { coach: false }),
+                    miniTabBtn(h, "Coach", true, Message.SetCoachViewMode { coach: true }),
+                  ],
+                )
+              } else {
+                h.empty()
+              },
+            ],
+          ),
+          h.row(
+            &[h.class("items-center gap-[6px]")],
+            &[
+              h.row(
+                &[
+                  h.class("items-center gap-[3px] px-[6px] py-[2px] rounded-[4px] border border-[#E2E2E5] bg-white glint-btn-hover"),
+                  h.cursor(Cursor.Pointer),
+                  h.onClick(Message.OpenContextMenu { kind: CTX_COACH_TARGET, x: 1180.0, y: 116.0 }),
+                ],
+                &[
+                  txt(h, targetLabel(m.coachTarget), "text-[11px] leading-[14px] text-[#0B0B0C] font-medium"),
+                  txt(h, "▾", "text-[10px] text-[#8A8A90]"),
+                ],
+              ),
+              railHeaderBtn(h, "›", false, Message.ToggleReadouts),
+            ],
+          ),
+        ],
+      ),
+      if valid {
+        h.row(
+          &[h.class("items-center gap-[16px]")],
+          &[
+            h.row(
+              &[h.class("items-baseline gap-[2px] shrink-0")],
+              &[
+                txt(h, overallNum, "text-[46px] leading-[44px] font-extrabold tracking-[-0.05em] text-[#0B0B0C]"),
+                txt(h, "%", "text-[16px] font-semibold text-[#6B6B70]"),
+              ],
+            ),
+            h.column(
+              &[h.class("flex-1 gap-[5px]")],
+              &[
+                scoreBarRow(h, b1Label, u32.toI32(cr.bar1), cr.weakestMetric == 1),
+                scoreBarRow(h, b2Label, u32.toI32(cr.bar2), cr.weakestMetric == 2),
+                scoreBarRow(h, b3Label, u32.toI32(cr.bar3), cr.weakestMetric == 3),
+                scoreBarRow(h, b4Label, u32.toI32(cr.bar4), cr.weakestMetric == 4),
+              ],
+            ),
+          ],
+        )
+      } else {
+        txt(
+          h,
+          "Record or open a voiced take to get real-time resonance, weight, clarity, and phrasing tips.",
+          "text-[12px] leading-[17px] text-[#6B6B70]",
+        )
+      },
+      if valid && tips.length > 0 {
+        h.column(
+          &[h.class("w-full gap-[6px]")],
+          &[
+            h.each<CoachTip>(
+              tips,
+              |tip| h.column(
+                &[
+                  h.class("w-full px-[8px] py-[6px] rounded-[5px] gap-[3px] border"),
+                  h.classSelect(
+                    tip.isPrimary,
+                    "bg-[#FDF6F4] border-[#F3D5CE]",
+                    "bg-[#F8F8F9] border-[#ECECEE]",
+                  ),
+                  if tip.hasSpan { h.cursor(Cursor.Pointer) } else { h.none() },
+                  if tip.hasSpan {
+                    h.onClick(Message.FocusCoachSpan { t0: tip.t0, t1: tip.t1 })
+                  } else {
+                    h.none()
+                  },
+                ],
+                &[
+                  h.row(
+                    &[h.class("w-full items-center justify-between gap-[6px]")],
+                    &[
+                      txtA(
+                        h,
+                        String.view(&tip.title),
+                        &[
+                          h.class("text-[11px] leading-[14px] font-semibold"),
+                          h.classSelect(tip.isPrimary, "text-[#D9381E]", "text-[#0B0B0C]"),
+                        ],
+                      ),
+                      if tip.hasSpan {
+                        txt(
+                          h,
+                          String.view(&tip.spanLabel),
+                          "px-[5px] py-[1px] rounded-[3px] bg-white border border-[#E2E2E5] glint-mono text-[9px] leading-[12px] text-[#6B6B70] shrink-0",
+                        )
+                      } else {
+                        h.empty()
+                      },
+                    ],
+                  ),
+                  txt(h, String.view(&tip.detail), "text-[11px] leading-[15px] text-[#3A3A40]"),
+                ],
+              ),
+            ),
+          ],
+        )
+      } else if valid && String.byteLength(String.view(&cr.summaryLine)) > 0 {
+        txt(h, String.view(&cr.summaryLine), "text-[12px] leading-[16px] text-[#3A3A40]")
       } else {
         h.empty()
       },
@@ -1762,6 +1921,7 @@ fn renderPitchTuner(m: &Overtone, h: &Document<Message>) -> Node {
 }
 
 fn renderSizeWeightPad(m: &Overtone, h: &Document<Message>) -> Node {
+  let coachMode = !m.refClip.active || m.coachPreferView
   return h.column(
     &[h.class("px-[16px] py-[10px] gap-[6px] border-b border-[#E6E6E8] shrink-0")],
     &[
@@ -1769,7 +1929,11 @@ fn renderSizeWeightPad(m: &Overtone, h: &Document<Message>) -> Node {
         &[h.class("items-center justify-between")],
         &[
           txt(h, "Size × weight", "text-[11px] leading-[14px] font-semibold tracking-[0.06em] uppercase text-[#6B6B70]"),
-          txt(h, "● you ○ ref", "text-[10px] leading-[12px] text-[#6B6B70]"),
+          txt(
+            h,
+            if coachMode { "● you ○ target (click)" } else { "● you ○ ref" },
+            "text-[10px] leading-[12px] text-[#6B6B70]",
+          ),
         ],
       ),
       h.column(
@@ -1781,10 +1945,18 @@ fn renderSizeWeightPad(m: &Overtone, h: &Document<Message>) -> Node {
           ),
           h.box(
             &[
+              h.testId("size-weight-pad"),
               h.class("w-full rounded-[4px] bg-[#F7F7F8] overflow-hidden"),
               h.style(&[css.height(px(PAD_H))]),
+              if coachMode { h.cursor(Cursor.Crosshair) } else { h.none() },
+              h.onLayout(|r| Message.PadLayout { rect: r }),
+              if coachMode {
+                h.onPointerDown(|e| Reply<Message>.EmitAndStop { message: Message.SetCustomCoachPoint { x: e.x, y: e.y } })
+              } else {
+                h.none()
+              },
             ],
-            &[h.drawing(&m.sizeWeightDrawing, &[h.class("w-full h-full")])],
+            &[h.drawing(&m.sizeWeightDrawing, &[h.class("w-full h-full pointer-events-none")])],
           ),
           h.row(
             &[h.class("w-full justify-between text-[9px] leading-[11px] text-[#9A9AA0]")],

@@ -1818,6 +1818,9 @@ pub effect fn buildSizeWeightPadDrawing(
   refFrames: &[VoiceFrame],
   refSummary: VoiceSummary,
   hasRef: bool,
+  showTarget: bool,
+  targetSize: f64,
+  targetLight: f64,
 ) -> Drawing
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -1922,7 +1925,43 @@ pub effect fn buildSizeWeightPadDrawing(
     }
   }
 
-  // Your Take cloud (#0B0B0C 18%) & solid dot (#0B0B0C) + vermilion delta line to Ref
+  // Coach target ring & sweet-spot halo when no Reference is shown
+  if showTarget && !hasRef {
+    let gx = pad + f64.toF32(targetSize) * iw
+    let gy = pad + (1.0 - f64.toF32(targetLight)) * ih
+    run cmds.append(
+      CanvasCommand.FillRect {
+        x: gx - 14.0,
+        y: gy - 14.0,
+        width: 28.0,
+        height: 28.0,
+        radius: 14.0,
+        color: Rgba<f32> { r: 0.851, g: 0.220, b: 0.118, a: 0.09 },
+      },
+    )
+    run cmds.append(
+      CanvasCommand.FillRect {
+        x: gx - 5.5,
+        y: gy - 5.5,
+        width: 11.0,
+        height: 11.0,
+        radius: 5.5,
+        color: COL_VERMILION,
+      },
+    )
+    run cmds.append(
+      CanvasCommand.FillRect {
+        x: gx - 3.7,
+        y: gy - 3.7,
+        width: 7.4,
+        height: 7.4,
+        radius: 3.7,
+        color: Rgba<f32> { r: 0.969, g: 0.969, b: 0.973, a: 1.0 },
+      },
+    )
+  }
+
+  // Your Take cloud (#0B0B0C 18%) & solid dot (#0B0B0C) + vermilion delta line to Ref or Target
   if takeFrames.length > 0 {
     let step = if takeFrames.length > 140 { takeFrames.length / 140 } else { 1 }
     let mut k: usize = 0
@@ -1953,6 +1992,12 @@ pub effect fn buildSizeWeightPadDrawing(
         run cmds.append(CanvasCommand.MoveTo { x: tx, y: ty })
         run cmds.append(CanvasCommand.LineTo { x: rx, y: ry })
         run cmds.append(CanvasCommand.Stroke { color: COL_VERMILION, width: 1.5 })
+      } else if showTarget {
+        let gx = pad + f64.toF32(targetSize) * iw
+        let gy = pad + (1.0 - f64.toF32(targetLight)) * ih
+        run cmds.append(CanvasCommand.MoveTo { x: tx, y: ty })
+        run cmds.append(CanvasCommand.LineTo { x: gx, y: gy })
+        run cmds.append(CanvasCommand.Stroke { color: Rgba<f32> { r: 0.851, g: 0.220, b: 0.118, a: 0.65 }, width: 1.3 })
       }
       run cmds.append(
         CanvasCommand.FillRect {
