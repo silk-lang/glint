@@ -12,6 +12,7 @@ import {
   mapCompactTimeToSource,
 } from "./vowel-isolator.js";
 import { synthesizeKlattVowel, applyVoiceLabTransform } from "./voice-lab.js";
+import { WebGLSpectrogram } from "./gpu-spec.js";
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
@@ -783,179 +784,11 @@ async function decodeBrowserFile(file) {
 }
 
 // ============================================================================
-// 3. WebGL2 3-Tier Spectrogram Renderer (1:1 GLSL ES 3.00 port of SPECTROGRAM_WGSL)
+// 3. GPU-Native WebGL2 Spectrogram Engine (imported from ./gpu-spec.js)
 // ============================================================================
 
-const VS_SRC = `#version 300 es
-out vec2 vUv;
-void main() {
-  vec2 pos = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);
-  gl_Position = vec4(pos, 0.0, 1.0);
-  vUv = (pos + 1.0) * 0.5;
-}`;
-
-const FS_SRC = `#version 300 es
-precision highp float;
-in vec2 vUv;
-out vec4 outColor;
-uniform float u[25];
-uniform sampler2D coarseTex;
-uniform sampler2D sharpTex;
-uniform sampler2D lutTex;
-uniform sampler2D liveTex;
-
-float normToFreq(float norm) {
-  if (u[13] > 0.5) {
-    float lo = log(max(u[2], u[18]));
-    float hi = log(max(u[3], u[18] * 2.0));
-    return exp(lo + norm * (hi - lo));
-  }
-  return u[2] + norm * (u[3] - u[2]);
-}
-
-vec2 sampleTier(sampler2D tex, float time, float freq, float tierT0, float tierT1, float tierMaxHz, float uScale, float uOffset) {
-  float span = tierT1 - tierT0;
-  float x = span > 0.0 ? (time - tierT0) / span : 0.0;
-  float y = freq / max(tierMaxHz, 1.0);
-  ivec2 sz = textureSize(tex, 0);
-  float halfTexel = 0.5 / max(float(sz.y), 1.0);
-  float uTex = clamp(x, 0.0, 1.0) * uScale + uOffset;
-  float vTex = clamp(1.0 - y - halfTexel, halfTexel, 1.0 - halfTexel);
-  float v = texture(tex, vec2(uTex, vTex)).r;
-  bool inside = span > 0.0 && time >= tierT0 && time <= tierT1 && y <= 1.0 && y >= 0.0;
-  return vec2(v, inside ? 1.0 : 0.0);
-}
-
-void main() {
-  float time = u[0] + vUv.x * (u[1] - u[0]);
-  float freq = normToFreq(vUv.y);
-  vec2 s = sampleTier(sharpTex, time, freq, u[8], u[9], u[12], u[23], u[24]);
-  vec2 l = sampleTier(liveTex, time, freq, u[6], u[7], u[11], u[21], u[22]);
-  vec2 c = sampleTier(coarseTex, time, freq, u[4], u[5], u[10], u[19], u[20]);
-  bool useSharp = u[15] > 0.5 && s.y > 0.5;
-  bool useLive = !useSharp && u[14] > 0.5 && l.y > 0.5;
-  float val = c.x;
-  float have = c.y;
-  if (useLive) { val = l.x; have = 1.0; }
-  if (useSharp) { val = s.x; have = 1.0; }
-  float v = clamp((val + u[16]) * u[17], 0.0, 1.0);
-  vec3 rgb = texture(lutTex, vec2(v, 0.5)).rgb;
-  outColor = vec4(rgb * step(0.5, have), 1.0);
-}`;
-
-class WebGLSpectrogram {
-  constructor() {
-    this.canvas = document.createElement("canvas");
-    this.canvas.style.cssText = "position:absolute;inset:0;width:100%;height:100%;display:block;pointer-events:none;";
-    this.gl = this.canvas.getContext("webgl2", { alpha: false, antialias: false, preserveDrawingBuffer: true });
-    this.lastUniforms = null;
-    this.pendingLut = null;
-    this.tiers = [null, null, null];
-    this.lutTex = null;
-    if (this.gl) this.initGl();
-  }
-
-  initGl() {
-    const gl = this.gl;
-    const compile = (type, src) => {
-      const sh = gl.createShader(type);
-      gl.shaderSource(sh, src);
-      gl.compileShader(sh);
-      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
-        console.error("Glint WebGL2 shader error:", gl.getShaderInfoLog(sh));
-      }
-      return sh;
-    };
-    const prog = gl.createProgram();
-    gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS_SRC));
-    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS_SRC));
-    gl.linkProgram(prog);
-    this.prog = prog;
-    this.uLoc = gl.getUniformLocation(prog, "u[0]");
-    this.coarseLoc = gl.getUniformLocation(prog, "coarseTex");
-    this.sharpLoc = gl.getUniformLocation(prog, "sharpTex");
-    this.lutLoc = gl.getUniformLocation(prog, "lutTex");
-    this.liveLoc = gl.getUniformLocation(prog, "liveTex");
-    this.vao = gl.createVertexArray();
-
-    const makeTex = () => {
-      const t = gl.createTexture();
-      gl.bindTexture(gl.TEXTURE_2D, t);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
-      return t;
-    };
-    this.tiers = [makeTex(), makeTex(), makeTex()];
-    this.lutTex = makeTex();
-  }
-
-  attachToHost() {
-    const host = document.querySelector('[data-testid="spectrogram-stage"]');
-    if (!host) return false;
-    if (this.canvas.parentElement !== host) {
-      host.appendChild(this.canvas);
-    }
-    const rect = host.getBoundingClientRect();
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const w = Math.max(2, Math.round(rect.width * dpr));
-    const h = Math.max(2, Math.round(rect.height * dpr));
-    if (this.canvas.width !== w || this.canvas.height !== h) {
-      this.canvas.width = w;
-      this.canvas.height = h;
-    }
-    return true;
-  }
-
-  setLut(bytes) {
-    if (!this.gl) return;
-    const gl = this.gl;
-    gl.bindTexture(gl.TEXTURE_2D, this.lutTex);
-    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, bytes.length / 4, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, bytes);
-  }
-
-  allocTier(tier, w, h) {
-    if (!this.gl || tier > 2) return;
-    const gl = this.gl;
-    gl.bindTexture(gl.TEXTURE_2D, this.tiers[tier]);
-    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, Math.max(1, w), Math.max(1, h), 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-  }
-
-  writeTier(tier, x, w, h, bytes) {
-    if (!this.gl || tier > 2 || w <= 0 || h <= 0) return;
-    const gl = this.gl;
-    gl.bindTexture(gl.TEXTURE_2D, this.tiers[tier]);
-    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, x, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, bytes);
-  }
-
-  clearTier(tier) {
-    if (!this.gl || tier > 2) return;
-    const gl = this.gl;
-    gl.bindTexture(gl.TEXTURE_2D, this.tiers[tier]);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
-  }
-
-  draw(uniforms) {
-    this.lastUniforms = new Float32Array(uniforms);
-    if (!this.gl) return;
-    this.attachToHost();
-    const gl = this.gl;
-    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
-    gl.useProgram(this.prog);
-    gl.bindVertexArray(this.vao);
-    gl.uniform1fv(this.uLoc, this.lastUniforms);
-    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.tiers[0]); gl.uniform1i(this.coarseLoc, 0);
-    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.tiers[2]); gl.uniform1i(this.sharpLoc, 1);
-    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, this.lutTex); gl.uniform1i(this.lutLoc, 2);
-    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, this.tiers[1]); gl.uniform1i(this.liveLoc, 3);
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
-  }
-}
+const specGl = new WebGLSpectrogram();
+window.__prismSpecGl = specGl;
 
 // ============================================================================
 // 4. WASM Memory Helpers & `glint#*` Import Table
@@ -963,7 +796,6 @@ class WebGLSpectrogram {
 
 let mountedPage = null;
 let wasmMemory = null;
-const specGl = new WebGLSpectrogram();
 
 function memBuf() {
   return (wasmMemory || mountedPage.exports.memory).buffer;
@@ -1427,9 +1259,17 @@ const glintImports = {
     return 1;
   },
 
-  // WebGL2 Spectrogram hooks
+  // WebGL2 GPU-Native Spectrogram hooks
   spec_set_lut: (ptr, len) => {
     specGl.setLut(new Uint8Array(memBuf(), ptr, len));
+  },
+  spec_upload_pcm: (samplesPtr, count, sampleRate) => {
+    if (count < 64 || sampleRate <= 0) {
+      specGl.clearTier(0);
+      return;
+    }
+    const pcm = new Float32Array(memBuf(), samplesPtr, count);
+    specGl.uploadPcmAndCompute(pcm, sampleRate);
   },
   spec_alloc_tier: (tier, w, h) => {
     specGl.allocTier(tier, w, h);

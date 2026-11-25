@@ -4612,7 +4612,9 @@ impl Overtone {
       let nextFloor = f32.round(-140.0 + t * 90.0)
       if nextFloor < self.displayCeilingDb - 10.0 && nextFloor != self.displayFloorDb {
         self.displayFloorDb = nextFloor
-        self.gpuNeedFullReload = true
+        static if Intrinsic.targetArchitecture() != "wasm32" {
+          self.gpuNeedFullReload = true
+        }
         self.gpuNeedRedraw = true
         run self.rebuildDrawings(false)
       }
@@ -4620,7 +4622,9 @@ impl Overtone {
       let nextCeil = f32.round(-60.0 + t * 60.0)
       if nextCeil > self.displayFloorDb + 10.0 && nextCeil != self.displayCeilingDb {
         self.displayCeilingDb = nextCeil
-        self.gpuNeedFullReload = true
+        static if Intrinsic.targetArchitecture() != "wasm32" {
+          self.gpuNeedFullReload = true
+        }
         self.gpuNeedRedraw = true
         run self.rebuildDrawings(false)
       }

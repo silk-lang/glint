@@ -20,6 +20,7 @@ pub const LIVE_TEXTURE_COLUMNS: usize = 8192
 
 static if Intrinsic.targetArchitecture() == "wasm32" {
   unsafe extern "C" fn js_spec_set_lut(rgba: ?[*]const u8, len: usize) -> () as "glint#spec_set_lut"
+  unsafe extern "C" fn js_spec_upload_pcm(samples: ?[*]const f32, count: i32, sampleRate: f64) -> () as "glint#spec_upload_pcm"
   unsafe extern "C" fn js_spec_alloc_tier(tier: u32, w: u32, h: u32) -> () as "glint#spec_alloc_tier"
   unsafe extern "C" fn js_spec_write_tier(
     tier: u32,
@@ -364,8 +365,22 @@ impl WasmSpectrogram {
       && self.sharpStepSec >= desiredStepSec * loMult
   }
 
+  pub fn uploadPcm(self: &mut Self, samples: &[f32], sampleRate: f64) -> () {
+    self.clearSharpTier()
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      if samples.length > 0 && sampleRate > 0.0 {
+        unsafe js_spec_upload_pcm(Pointer.fromSlice(samples), usize.toI32(samples.length), sampleRate)
+      } else {
+        unsafe js_spec_clear_tier(TIER_COARSE)
+      }
+    } else {
+      drop samples
+      drop sampleRate
+    }
+  }
+
   pub fn draw(self: &Self, vp: &Viewport) -> () {
-    let uniforms: [f32; 25] = [
+    let uniforms: [f32; 28] = [
       f64.toF32(vp.t0),
       f64.toF32(vp.t1),
       f64.toF32(vp.f0),
@@ -389,11 +404,14 @@ impl WasmSpectrogram {
       self.coarse.uOffset,
       self.live.uScale,
       self.live.uOffset,
-      self.sharp.uScale,
-      self.sharp.uOffset,
+      self.displayFloorDb,
+      self.displayCeilingDb,
+      0.0,
+      0.0,
+      0.0,
     ]
     static if Intrinsic.targetArchitecture() == "wasm32" {
-      unsafe js_spec_draw(Pointer.fromSlice(&uniforms), 25)
+      unsafe js_spec_draw(Pointer.fromSlice(&uniforms), 28)
     } else {
       drop uniforms
     }

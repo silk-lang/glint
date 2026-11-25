@@ -54,14 +54,11 @@ struct GlintPage {
   dom: Dom,
   spec: WasmSpectrogram,
   lastTime: f64,
-  lastSharpComputeTime: f64,
-  sharpRefineDueTime: f64,
-  sharpIsDraft: bool,
   root: Unrooted | Root,
 }
 
 impl GlintPage {
-  effect fn syncSpec(self: &mut Self, interactive: bool) -> ()
+  effect fn syncSpec(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
     let model = &mut self.host.model
@@ -119,112 +116,22 @@ impl GlintPage {
       }
     }
 
+    // Full-clip GPU upload: upload entire PCM once into GPU memory and compute full 4096-pt
+    // spectrogram directly on the GPU — zero LOD tiers, zero zoom/pan recomputes, zero popping!
     if model.gpuNeedFullReload {
       model.gpuNeedFullReload = false
-      self.sharpIsDraft = false
+      model.gpuNeedSharp = false
       g.clearLiveTier()
       g.clearSharpTier()
-      let dur = model.gpuDuration()
       let sr = model.gpuSampleRate()
-      if dur > 0.0 {
-        let hopF = f64.max(320.0, f64.ceil((dur * sr) / 860.0))
-        let baseHop = f64.toUsize(hopF)
-        let baseMaxHz = f64.min(sr * 0.5, f64.max(10000.0, model.vp.f1 * 1.25))
-        let coarseCols = run computeColumns(
-          model.gpuSamples(),
-          sr,
-          0.0,
-          dur,
-          0,
-          &model.coarseWin,
-          baseMaxHz,
-          baseHop,
-        )
-        run g.setCoarseTier(&coarseCols)
-        model.gpuNeedRedraw = true
-      }
+      g.uploadPcm(model.gpuSamples(), sr)
+      model.gpuNeedRedraw = true
     }
 
-    let now = self.lastTime
-    let wantRefine = self.sharpIsDraft && !interactive && now >= self.sharpRefineDueTime
-    if (model.gpuNeedSharp || wantRefine) && !model.recording {
-      let dur = model.gpuDuration()
-      let sr = model.gpuSampleRate()
-      let hasSamples = model.gpuSamples().length > 0
-      if dur > 0.0 && hasSamples {
-        let span = f64.max(model.vp.t1 - model.vp.t0, 0.005)
-        let zoomRatio = dur / span
-        let baseCssW = f32.max(240.0, f32.min(820.0, model.specRect.width()))
-        let lodScale: f64 = if zoomRatio > 6.0 { 1.0 } else if zoomRatio > 2.0 { 0.85 } else { 0.72 }
-        let fullCols = f64.toUsize(f64.max(200.0, f64.min(720.0, f32.toF64(baseCssW) * lodScale)))
-        let fullStepSec = span / usize.toF64(fullCols)
-        let desiredHzPerBin = sr / usize.toF64(model.sharpWin.size)
-
-        if g.coarseCovers(&model.vp, fullStepSec, desiredHzPerBin) {
-          model.gpuNeedSharp = false
-          self.sharpIsDraft = false
-          g.clearSharpTier()
-          model.gpuNeedRedraw = true
-        } else if interactive {
-          model.gpuNeedSharp = false
-          self.sharpRefineDueTime = now + 0.090
-          let fastCols: usize = 200
-          let fastStepSec = span / usize.toF64(fastCols)
-          if !g.sharpCovers(&model.vp, fastStepSec, true) {
-            if (now - self.lastSharpComputeTime) >= 0.035 {
-              let margin = span * 0.50
-              let t0 = f64.max(0.0, model.vp.t0 - margin)
-              let t1 = f64.min(dur, model.vp.t1 + margin)
-              let rawCols = f64.toUsize(f64.round(usize.toF64(fastCols) * ((t1 - t0) / span)))
-              let targetCols = if rawCols < 64 { 64 } else if rawCols > 320 { 320 } else { rawCols }
-              let culledMaxHz = f64.min(sr * 0.5, f64.max(model.vp.f1 * 1.15, 2200.0))
-              let draftCols = run computeColumns(
-                model.gpuSamples(),
-                sr,
-                t0,
-                t1,
-                targetCols,
-                &model.coarseWin,
-                culledMaxHz,
-                0,
-              )
-              run g.setSharpTier(&draftCols)
-              self.lastSharpComputeTime = now
-              model.gpuNeedRedraw = true
-            }
-            self.sharpIsDraft = true
-          } else if !g.sharpCovers(&model.vp, fullStepSec, false) {
-            self.sharpIsDraft = true
-          }
-        } else {
-          model.gpuNeedSharp = false
-          self.sharpIsDraft = false
-          if wantRefine || !g.sharpCovers(&model.vp, fullStepSec, false) {
-            let margin = span * 0.35
-            let t0 = f64.max(0.0, model.vp.t0 - margin)
-            let t1 = f64.min(dur, model.vp.t1 + margin)
-            let rawCols = f64.toUsize(f64.round(usize.toF64(fullCols) * ((t1 - t0) / span)))
-            let targetCols = if rawCols < 96 { 96 } else if rawCols > 760 { 760 } else { rawCols }
-            let culledMaxHz = f64.min(sr * 0.5, f64.max(model.vp.f1 * 1.18, 2200.0))
-            let sharpCols = run computeColumns(
-              model.gpuSamples(),
-              sr,
-              t0,
-              t1,
-              targetCols,
-              &model.sharpWin,
-              culledMaxHz,
-              0,
-            )
-            run g.setSharpTier(&sharpCols)
-            self.lastSharpComputeTime = now
-            model.gpuNeedRedraw = true
-          }
-        }
-      } else {
-        model.gpuNeedSharp = false
-        self.sharpIsDraft = false
-      }
+    // No sharp LOD tier needed — the full high-res spectrogram lives on the GPU!
+    if model.gpuNeedSharp {
+      model.gpuNeedSharp = false
+      model.gpuNeedRedraw = true
     }
 
     if model.gpuNeedRedraw || model.gpuNeedResize {
@@ -271,9 +178,6 @@ effect fn openInner() -> ?*mut u8
       dom: Dom.make(),
       spec: move spec,
       lastTime: 0.0,
-      lastSharpComputeTime: -10.0,
-      sharpRefineDueTime: 0.0,
-      sharpIsDraft: false,
       root: Unrooted {},
     },
   )
@@ -326,7 +230,7 @@ effect fn callInner(token: ?*mut u8, op: u32, a: f64, b: f64, c: f64) -> f64
     run page.host.start(&mut page.dom, c)
     run drain<Overtone, Message, Command, OutOfMemoryError, Dom, &mut Allocator>(&mut page.host, &mut page.dom)
     page.dom.cloning = true
-    run page.syncSpec(false)
+    run page.syncSpec()
   } else if op == CALL_LOCATION {
     drop a
   } else if op == CALL_POST {
@@ -336,7 +240,7 @@ effect fn callInner(token: ?*mut u8, op: u32, a: f64, b: f64, c: f64) -> f64
     if ns == "file_chosen" {
       page.host.send(Message.FileChosen { path: move payload })
       run drain<Overtone, Message, Command, OutOfMemoryError, Dom, &mut Allocator>(&mut page.host, &mut page.dom)
-      run page.syncSpec(false)
+      run page.syncSpec()
     } else if ns == "global_key" {
       // payload format: "<mods>|<key>"
       let ps = String.view(&payload)
@@ -352,7 +256,7 @@ effect fn callInner(token: ?*mut u8, op: u32, a: f64, b: f64, c: f64) -> f64
           let kCopy = run String.copy(kStr)
           page.host.send(Message.GlobalKeyDown { key: move kCopy, modifiers: mods })
           run drain<Overtone, Message, Command, OutOfMemoryError, Dom, &mut Allocator>(&mut page.host, &mut page.dom)
-          run page.syncSpec(true)
+          run page.syncSpec()
           return 1.0
         }
       }
@@ -361,7 +265,7 @@ effect fn callInner(token: ?*mut u8, op: u32, a: f64, b: f64, c: f64) -> f64
       run drain<Overtone, Message, Command, OutOfMemoryError, Dom, &mut Allocator>(&mut page.host, &mut page.dom)
     } else if ns == "redraw_spec" {
       page.host.model.gpuNeedRedraw = true
-      run page.syncSpec(false)
+      run page.syncSpec()
     } else if ns == "neural_status" {
       let flags = u32.toI32(parseUint(String.view(&payload)))
       page.host.send(Message.NeuralStatus { flags: flags })
@@ -397,7 +301,7 @@ effect fn callInner(token: ?*mut u8, op: u32, a: f64, b: f64, c: f64) -> f64
         hasFormants: parts[3] != 0,
       })
       run drain<Overtone, Message, Command, OutOfMemoryError, Dom, &mut Allocator>(&mut page.host, &mut page.dom)
-      run page.syncSpec(false)
+      run page.syncSpec()
     } else if ns == "phonemes_ready" {
       // payload format: "<jobId>|<isRef>|<count>"
       let ps = String.view(&payload)
@@ -427,7 +331,7 @@ effect fn callInner(token: ?*mut u8, op: u32, a: f64, b: f64, c: f64) -> f64
         isRef: parts[1] != 0,
       })
       run drain<Overtone, Message, Command, OutOfMemoryError, Dom, &mut Allocator>(&mut page.host, &mut page.dom)
-      run page.syncSpec(false)
+      run page.syncSpec()
     }
   } else if op == CALL_SCRATCH {
     return usize.toF64(run page.dom.reserve(f64.toUsize(a)))
@@ -437,7 +341,7 @@ effect fn callInner(token: ?*mut u8, op: u32, a: f64, b: f64, c: f64) -> f64
     page.host.model.nowTime = b
     run page.dom.receive(f64.toUsize(a))
     drop run pump<Overtone, Message, Command, OutOfMemoryError, Dom, &mut Allocator>(&mut page.host, &mut page.dom)
-    run page.syncSpec(true)
+    run page.syncSpec()
     if page.host.takePrevented() {
       return 1.0
     }
@@ -450,7 +354,7 @@ effect fn callInner(token: ?*mut u8, op: u32, a: f64, b: f64, c: f64) -> f64
       a,
       b != 0.0,
     )
-    run page.syncSpec(false)
+    run page.syncSpec()
   } else if op == CALL_RESIZE {
     page.dom.setViewport(f64.toF32(a), f64.toF32(b))
     run resize<Overtone, Message, Command, OutOfMemoryError, Dom, &mut Allocator>(
@@ -460,7 +364,7 @@ effect fn callInner(token: ?*mut u8, op: u32, a: f64, b: f64, c: f64) -> f64
       f64.toF32(b),
     )
     page.host.model.gpuNeedRedraw = true
-    run page.syncSpec(true)
+    run page.syncSpec()
   } else if op == CALL_VIRTUAL {
     if run page.dom.reportVirtual(f64.toUsize(a)) {
       drop run page.host.syncVirtual(&mut page.dom)
@@ -469,7 +373,7 @@ effect fn callInner(token: ?*mut u8, op: u32, a: f64, b: f64, c: f64) -> f64
   } else if op == CALL_DEADLINE {
     return page.host.nextDeadline().unwrapOr(-1.0)
   } else if op == CALL_FRAMES {
-    if page.host.wantsFrames() || page.sharpIsDraft {
+    if page.host.wantsFrames() {
       return 1.0
     }
   }
