@@ -2405,7 +2405,7 @@ fn renderMetricsRow(m: &Overtone, h: &Document<Message>) -> Node {
     &[
       metricCol(h, "F0", String.view(&m.readoutHz), String.view(&m.readoutDeltaPitch), m.readoutWeakestMetric == 1),
       metricCol(h, "VTL", String.view(&m.readoutVtl), String.view(&m.readoutDeltaVtl), m.readoutWeakestMetric == 2),
-      metricCol(h, "H1–H2", String.view(&m.readoutH1H2), String.view(&m.readoutDeltaWeight), m.readoutWeakestMetric == 3),
+      metricCol(h, "H1*–H2*", String.view(&m.readoutH1H2), String.view(&m.readoutDeltaWeight), m.readoutWeakestMetric == 3),
       metricCol(h, "HNR", String.view(&m.readoutHnr), if m.readoutVoiced { "ok" } else { "—" }, false),
     ],
   )

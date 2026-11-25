@@ -1,7 +1,9 @@
 //! Voice training acoustic metrics:
 //!   - Vocal Size / Resonance (Apparent Vocal Tract Length in cm from F1..F4 weighted toward F2-F4,
 //!     plus normalized Size score 0=big/dark .. 1=small/bright)
-//!   - Vocal Weight (exact Hann-windowed Goertzel H1-H2 in dB, normalized 0=heavy .. 1=light/thin)
+//!   - Vocal Weight (Iseli-Shue-Alwan F1/F2-corrected H1*-H2* + upper-harmonic spectral tilt
+//!     across 500–3600 Hz, soft-sigmoid normalized 0=heavy/buzzy .. 1=light/thin so it never
+//!     clips flat on close vowels or light voices)
 //!   - Breathiness / Clarity (Praat Boersma HNR = 10*log10(r / (1 - r)) in dB)
 //!   - Whole-clip summary (medians, F1/F2 vowel cloud centroid, active speech bounds)
 //!   - Long-Term Average Spectrum (LTAS, 64 log-spaced bins from 60 Hz .. 6000 Hz)
@@ -12,7 +14,9 @@ import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
 import silk.num.f64
+import silk.num.i32
 import silk.num.usize
 
 /// Speed of sound in warm vocal tract air (cm/s).
@@ -39,8 +43,10 @@ pub struct VoiceFrame {
   pub vtlCm: f64,
   /// Normalized resonance/size in [0, 1] (0 = big/dark, 1 = small/bright), EMA-smoothed.
   pub sizeNorm: f64,
-  /// Raw H1 - H2 harmonic amplitude difference (dB). Higher = lighter/thinner weight.
+  /// Formant-corrected H1* - H2* harmonic difference (dB). Higher = lighter/thinner weight.
   pub h1h2Db: f64,
+  /// Formant-corrected upper-harmonic spectral tilt (H1* vs 500–3600 Hz harmonics, dB).
+  pub tiltDb: f64,
   /// Normalized vocal lightness in [0, 1] (0 = heavy/thick, 1 = light/thin), EMA-smoothed.
   pub weightLightNorm: f64,
   /// Harmonics-to-Noise Ratio (dB) from Boersma autocorrelation peak.
@@ -65,6 +71,7 @@ impl VoiceFrame {
       vtlCm: 0.0,
       sizeNorm: 0.5,
       h1h2Db: 0.0,
+      tiltDb: 15.0,
       weightLightNorm: 0.5,
       hnrDb: 0.0,
       f1: 0.0,
@@ -121,8 +128,194 @@ pub fn vtlToSizeNorm(vtlCm: f64) -> f64 {
 }
 
 pub fn h1h2ToLightNorm(h1h2Db: f64) -> f64 {
-  let t = (h1h2Db - H1H2_HEAVY_DB) / (H1H2_LIGHT_DB - H1H2_HEAVY_DB)
-  return f64.max(0.0, f64.min(1.0, t))
+  let z = (h1h2Db - 6.0) / 9.5
+  let s = 0.5 + 0.48 * (z / (1.0 + 0.42 * f64.abs(z)))
+  return f64.max(0.02, f64.min(0.98, s))
+}
+
+/// Combines F1/F2-corrected `H1* - H2*` and Hanson-style `H1* - A1/A2/A3` spectral tilt
+/// through a soft-knee curve so sustained vowels & light voices never clip flat.
+pub fn weightTiltToLightNorm(h1h2StarDb: f64, tiltStarDb: f64) -> f64 {
+  let zH = (h1h2StarDb - 4.5) / 7.5
+  let zT = (tiltStarDb - 15.0) / 10.5
+  let z = 0.30 * zH + 0.70 * zT
+  let s = 0.5 + 0.48 * (z / (1.0 + 0.30 * f64.abs(z)))
+  return f64.max(0.02, f64.min(0.98, s))
+}
+
+/// All-pole vocal-tract resonator transfer gain (dB) at `freq` for a formant `(formantHz, bwHz)`.
+/// Used for Iseli-Shue-Alwan formant correction (`H1* - H2*` & `H1*` spectral tilt).
+fn resonatorGainDb(freq: f64, formantHz: f64, bwHz: f64) -> f64 {
+  if formantHz <= 80.0 || freq <= 20.0 {
+    return 0.0
+  }
+  let r = freq / formantHz
+  let t1 = 1.0 - r * r
+  let t2 = (freq * bwHz) / (formantHz * formantHz)
+  let denom = f64.max(1.0e-6, t1 * t1 + t2 * t2)
+  return -10.0 * f64.log(denom) / f64.log(10.0)
+}
+
+struct HarmonicWeightRaw {
+  rawH1H2: f64,
+  rawTilt: f64,
+  valid: bool,
+}
+
+fn fftRadix2Local(re: &mut [f64], im: &mut [f64], n: usize) -> () {
+  let mut j: usize = 0
+  let mut i: usize = 1
+  while i < n {
+    let mut bit = n / 2
+    while (j & bit) != 0 {
+      j = j ^ bit
+      bit = bit / 2
+    }
+    j = j ^ bit
+    if i < j {
+      let tr = re[i]
+      re[i] = re[j]
+      re[j] = tr
+      let ti = im[i]
+      im[i] = im[j]
+      im[j] = ti
+    }
+    i = i + 1
+  }
+  let mut len: usize = 2
+  while len <= n {
+    let half = len / 2
+    let ang = -2.0 * f64.PI / usize.toF64(len)
+    let wlenRe = f64.cos(ang)
+    let wlenIm = f64.sin(ang)
+    let mut base: usize = 0
+    while base < n {
+      let mut wRe: f64 = 1.0
+      let mut wIm: f64 = 0.0
+      let mut k: usize = 0
+      while k < half {
+        let uRe = re[base + k]
+        let uIm = im[base + k]
+        let vr = re[base + k + half]
+        let vi = im[base + k + half]
+        let vRe = vr * wRe - vi * wIm
+        let vIm = vr * wIm + vi * wRe
+        re[base + k] = uRe + vRe
+        im[base + k] = uIm + vIm
+        re[base + k + half] = uRe - vRe
+        im[base + k + half] = uIm - vIm
+        let nextRe = wRe * wlenRe - wIm * wlenIm
+        let nextIm = wRe * wlenIm + wIm * wlenRe
+        wRe = nextRe
+        wIm = nextIm
+        k = k + 1
+      }
+      base = base + len
+    }
+    len = len * 2
+  }
+}
+
+fn peakPowerAtHz(re: &[f64], im: &[f64], nHalf: usize, hzPerBin: f64, targetHz: f64) -> f64 {
+  let cBinF = targetHz / hzPerBin
+  let tolBinsF = f64.max(1.2, (targetHz * 0.045) / hzPerBin)
+  let lo = f64.toUsize(f64.max(1.0, f64.floor(cBinF - tolBinsF)))
+  let mut hi = f64.toUsize(f64.ceil(cBinF + tolBinsF))
+  if hi >= nHalf { hi = nHalf - 1 }
+  let mut best: f64 = 1.0e-18
+  let mut b = lo
+  while b <= hi {
+    let p = re[b] * re[b] + im[b] * im[b]
+    if p > best { best = p }
+    b = b + 1
+  }
+  return best
+}
+
+/// Measures raw `H1 - H2` and Hanson-style `H1 - A1/A2/A3` harmonic spectral tilt
+/// in a single 2048-pt Hann-windowed FFT.
+fn measureHarmonicWeight(samples: &[f32], sampleRate: f64, centreSec: f64, f0: f64) -> HarmonicWeightRaw {
+  if samples.length < 256 || sampleRate <= 0.0 || f0 < 45.0 || f0 * 2.5 >= sampleRate * 0.5 {
+    return HarmonicWeightRaw { rawH1H2: 0.0, rawTilt: 15.0, valid: false }
+  }
+  let n: usize = 2048
+  let nHalf: usize = 1024
+  let halfI = usize.toI32(nHalf)
+  let centre = f64.toI32(f64.round(centreSec * sampleRate))
+  let start = centre - halfI
+  let srcLenI = usize.toI32(samples.length)
+  let twoPi = 2.0 * f64.PI
+  let nF = usize.toF64(n)
+  let hzPerBin = sampleRate / nF
+
+  let mut re: [f64; 2048] = [0.0; 2048]
+  let mut im: [f64; 2048] = [0.0; 2048]
+  let mut k: usize = 0
+  while k < n {
+    let si = start + usize.toI32(k)
+    if si >= 0 && si < srcLenI {
+      let w = 0.5 - 0.5 * f64.cos(twoPi * usize.toF64(k) / nF)
+      re[k] = f32.toF64(samples[i32.toUsize(si)]) * w
+    }
+    k = k + 1
+  }
+  fftRadix2Local(&mut re, &mut im, n)
+
+  let invLn10 = 10.0 / f64.log(10.0)
+  let pH1 = peakPowerAtHz(&re, &im, nHalf, hzPerBin, f0)
+  let pH2 = peakPowerAtHz(&re, &im, nHalf, hzPerBin, 2.0 * f0)
+  let h1Db = invLn10 * f64.log(pH1)
+  let h2Db = invLn10 * f64.log(pH2)
+  let rawH1H2 = f64.max(-20.0, f64.min(30.0, h1Db - h2Db))
+
+  // Hanson (1997) / VoiceSauce style formant-band harmonic peaks:
+  //   A1: peak harmonic in 450..1200 Hz (lower-mid buzz)
+  //   A2: peak harmonic in 1200..2300 Hz (mid buzz)
+  //   A3: peak harmonic in 2300..3800 Hz (high buzz / glottal abruptness)
+  let nyqSafe = f64.min(3800.0, sampleRate * 0.44)
+  let mut maxP1: f64 = 0.0
+  let mut maxP2: f64 = 0.0
+  let mut maxP3: f64 = 0.0
+
+  let mut m: usize = 3
+  while m <= 32 {
+    let fh = usize.toF64(m) * f0
+    if fh > nyqSafe {
+      break
+    }
+    if fh >= 450.0 {
+      let p = peakPowerAtHz(&re, &im, nHalf, hzPerBin, fh)
+      if fh < 1200.0 {
+        if p > maxP1 { maxP1 = p }
+      } else if fh < 2300.0 {
+        if p > maxP2 { maxP2 = p }
+      } else {
+        if p > maxP3 { maxP3 = p }
+      }
+    }
+    m = m + 1
+  }
+
+  let mut wSum: f64 = 0.0
+  let mut tSum: f64 = 0.0
+  if maxP1 > 1.0e-17 {
+    let d1 = f64.max(-15.0, f64.min(50.0, h1Db - invLn10 * f64.log(maxP1)))
+    tSum = tSum + 0.30 * d1
+    wSum = wSum + 0.30
+  }
+  if maxP2 > 1.0e-17 {
+    let d2 = f64.max(-10.0, f64.min(60.0, h1Db - invLn10 * f64.log(maxP2)))
+    tSum = tSum + 0.35 * d2
+    wSum = wSum + 0.35
+  }
+  if maxP3 > 1.0e-17 {
+    let d3 = f64.max(-5.0, f64.min(70.0, h1Db - invLn10 * f64.log(maxP3)))
+    tSum = tSum + 0.35 * d3
+    wSum = wSum + 0.35
+  }
+  let rawTilt = if wSum > 0.0 { tSum / wSum } else { rawH1H2 + 16.0 }
+
+  return HarmonicWeightRaw { rawH1H2: rawH1H2, rawTilt: rawTilt, valid: true }
 }
 
 /// Estimates apparent Vocal Tract Length (cm) from Praat Burg F1..F4 using quarter-wave
@@ -258,14 +451,7 @@ impl VoiceMetricsTrack {
         run self.frames.append(VoiceFrame.unvoiced(pf.time, pf.intensityDb))
       } else {
         let hnrDb = clarityToHnrDb(pf.clarity)
-        let h1h2Db = audio_native.harmonicH1H2Native(samples, sampleRate, pf.time, pf.frequency)
-        let rawLight = h1h2ToLightNorm(h1h2Db)
-        if !self.hasSmoothLight {
-          self.smoothLight = rawLight
-          self.hasSmoothLight = true
-        } else {
-          self.smoothLight = self.smoothLight * 0.65 + rawLight * 0.35
-        }
+        let hw = measureHarmonicWeight(samples, sampleRate, pf.time, pf.frequency)
 
         let mut vtlCm: f64 = 0.0
         let mut f1: f64 = 0.0
@@ -283,6 +469,32 @@ impl VoiceMetricsTrack {
             if ff.count >= 4 && ff.f4 > ff.f3 { f4 = ff.f4 }
             hasFormants = true
           }
+        }
+
+        // Apply Iseli-Shue-Alwan F1/F2 formant gain correction so close vowels (/i/, /u/)
+        // don't artificially inflate H1 or clamp Weight flat at the ceiling!
+        let mut f1OnH1: f64 = 0.0
+        let mut f1Corr: f64 = 0.0
+        let mut f2Corr: f64 = 0.0
+        if hasFormants && f1 > 180.0 {
+          let g1H1 = resonatorGainDb(pf.frequency, f1, 80.0)
+          let g1H2 = resonatorGainDb(2.0 * pf.frequency, f1, 80.0)
+          f1OnH1 = f64.max(0.0, f64.min(10.0, g1H1))
+          f1Corr = f64.max(-12.0, f64.min(12.0, g1H1 - g1H2))
+          if f2 > f1 + 120.0 {
+            let g2H1 = resonatorGainDb(pf.frequency, f2, 110.0)
+            let g2H2 = resonatorGainDb(2.0 * pf.frequency, f2, 110.0)
+            f2Corr = f64.max(-6.0, f64.min(6.0, g2H1 - g2H2))
+          }
+        }
+        let h1h2Db = f64.max(-14.0, f64.min(26.0, hw.rawH1H2 - f1Corr - f2Corr))
+        let tiltDb = f64.max(-5.0, f64.min(65.0, hw.rawTilt - f1OnH1))
+        let rawLight = weightTiltToLightNorm(h1h2Db, tiltDb)
+        if !self.hasSmoothLight {
+          self.smoothLight = rawLight
+          self.hasSmoothLight = true
+        } else {
+          self.smoothLight = self.smoothLight * 0.62 + rawLight * 0.38
         }
         if vtlCm > 1.0 {
           let rawSize = vtlToSizeNorm(vtlCm)
@@ -302,6 +514,7 @@ impl VoiceMetricsTrack {
           vtlCm: vtlCm,
           sizeNorm: self.smoothSize,
           h1h2Db: h1h2Db,
+          tiltDb: tiltDb,
           weightLightNorm: self.smoothLight,
           hnrDb: hnrDb,
           f1: f1,
