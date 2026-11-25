@@ -339,11 +339,14 @@ const audioState = {
   selectedInputId: 1,
   selectedOutputId: 1,
 
-  // Mic capture ring
+  // Mic capture ring (hardware stream kept warm once opened to avoid CoreAudio/Bluetooth pops on repeat!)
   micRunning: false,
+  micOpening: false,
   micStream: null,
+  micStreamInputId: 0,
   micSource: null,
   micProc: null,
+  micSilentGain: null,
   micRate: 48000,
   micLevelDb: -120,
   micError: "",
@@ -402,6 +405,30 @@ async function enumerateBrowserDevices(promptPermission = false) {
   } catch {}
 }
 
+function isMicHardwareLive() {
+  if (!audioState.micStream || !audioState.micProc) return false;
+  if (audioState.micStream.active === false) return false;
+  const tracks = audioState.micStream.getAudioTracks();
+  return tracks.length > 0 && tracks.every((t) => t.readyState === "live");
+}
+
+function releaseMicHardware() {
+  audioState.micRunning = false;
+  audioState.micOpening = false;
+  audioState.micLevelDb = -120;
+  audioState.micQueue = [];
+  audioState.micQueuedSamples = 0;
+  try { audioState.micProc?.disconnect(); } catch {}
+  try { audioState.micSource?.disconnect(); } catch {}
+  try { audioState.micSilentGain?.disconnect(); } catch {}
+  try { audioState.micStream?.getTracks().forEach((t) => t.stop()); } catch {}
+  audioState.micProc = null;
+  audioState.micSource = null;
+  audioState.micSilentGain = null;
+  audioState.micStream = null;
+  audioState.micStreamInputId = 0;
+}
+
 function startMicAsync(preferredRate) {
   audioState.micError = "";
   if (!navigator.mediaDevices?.getUserMedia) {
@@ -414,10 +441,28 @@ function startMicAsync(preferredRate) {
   audioState.micQueue = [];
   audioState.micQueuedSamples = 0;
 
+  // Fast path: mic hardware is already warm for this input -> zero restart, zero pops, instant capture!
+  if (isMicHardwareLive() && audioState.micStreamInputId === audioState.selectedInputId) {
+    return 1;
+  }
+
+  // If device changed or previous stream ended, cleanly release old hardware before opening new stream
+  if (audioState.micStream && (!isMicHardwareLive() || audioState.micStreamInputId !== audioState.selectedInputId)) {
+    releaseMicHardware();
+    audioState.micRunning = true;
+  }
+
+  if (audioState.micOpening) {
+    return 1;
+  }
+  audioState.micOpening = true;
+
   const chosen = audioState.inputs.find((d) => d.id === audioState.selectedInputId);
+  const desiredDevId = chosen?.deviceId || "";
+  const openedInputId = audioState.selectedInputId;
   const constraints = {
     audio: {
-      deviceId: chosen?.deviceId ? { ideal: chosen.deviceId } : undefined,
+      deviceId: desiredDevId ? { ideal: desiredDevId } : undefined,
       echoCancellation: false,
       noiseSuppression: false,
       autoGainControl: false,
@@ -427,15 +472,19 @@ function startMicAsync(preferredRate) {
   navigator.mediaDevices
     .getUserMedia(constraints)
     .then((stream) => {
-      if (!audioState.micRunning) {
-        stream.getTracks().forEach((t) => t.stop());
-        return;
-      }
+      audioState.micOpening = false;
       audioState.micStream = stream;
+      audioState.micStreamInputId = openedInputId;
       audioState.micRate = ctx.sampleRate;
       const src = ctx.createMediaStreamSource(stream);
       const proc = ctx.createScriptProcessor(2048, 1, 1);
+      const silentGain = ctx.createGain();
+      silentGain.gain.value = 0.0;
       proc.onaudioprocess = (ev) => {
+        // Keep output strictly silent
+        const outCh = ev.outputBuffer.getChannelData(0);
+        outCh.fill(0.0);
+        // When logically stopped, simply ignore incoming frames without tearing down hardware!
         if (!audioState.micRunning) return;
         const ch = ev.inputBuffer.getChannelData(0);
         const copy = new Float32Array(ch.length);
@@ -451,14 +500,17 @@ function startMicAsync(preferredRate) {
         audioState.micQueuedSamples += copy.length;
       };
       src.connect(proc);
-      proc.connect(ctx.destination);
+      proc.connect(silentGain);
+      silentGain.connect(ctx.destination);
       audioState.micSource = src;
       audioState.micProc = proc;
+      audioState.micSilentGain = silentGain;
       enumerateBrowserDevices().then(() => {
         if (mountedPage) mountedPage.post("refresh_devices", "");
       });
     })
     .catch((err) => {
+      audioState.micOpening = false;
       audioState.micRunning = false;
       audioState.micError = err?.message || "Microphone permission denied.";
     });
@@ -466,15 +518,15 @@ function startMicAsync(preferredRate) {
 }
 
 function stopMic() {
+  // Soft-gate: ignore incoming mic audio without stopping the MediaStreamTrack,
+  // avoiding OS/Bluetooth audio restarts, pops, and silences between repeat rounds!
   audioState.micRunning = false;
   audioState.micLevelDb = -120;
-  try { audioState.micProc?.disconnect(); } catch {}
-  try { audioState.micSource?.disconnect(); } catch {}
-  try { audioState.micStream?.getTracks().forEach((t) => t.stop()); } catch {}
-  audioState.micProc = null;
-  audioState.micSource = null;
-  audioState.micStream = null;
+  audioState.micQueue = [];
+  audioState.micQueuedSamples = 0;
 }
+
+window.addEventListener("pagehide", releaseMicHardware);
 
 function stopPlayback() {
   if (audioState.playNode) {
@@ -869,7 +921,13 @@ const glintImports = {
   ov_audio_get_input_device: () => audioState.selectedInputId,
   ov_audio_get_output_device: () => audioState.selectedOutputId,
   ov_audio_set_input_device: (devId) => {
-    audioState.selectedInputId = devId >>> 0;
+    const nextId = devId >>> 0;
+    if (nextId !== audioState.selectedInputId) {
+      const wasRunning = audioState.micRunning;
+      audioState.selectedInputId = nextId;
+      releaseMicHardware();
+      if (wasRunning) startMicAsync(audioState.micRate);
+    }
     return 1;
   },
   ov_audio_set_output_device: (devId) => {
