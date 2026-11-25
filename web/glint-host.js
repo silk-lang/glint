@@ -71,6 +71,75 @@ function idbDelete(storeName, key) {
   } catch {}
 }
 
+async function seedDefaultDemosIfNeeded(seededVersion) {
+  try {
+    const resp = await fetch("./demos/manifest.json");
+    if (!resp.ok) return;
+    const manifest = await resp.json();
+    const targetVer = manifest.version || 1;
+    if (seededVersion >= targetVer) return;
+
+    const folderRel = cleanRel(manifest.folder || "Harvard Sentences");
+    const folderRec = {
+      relPath: folderRel,
+      createdAt: nowStamp(),
+      notes: manifest.notes || "",
+    };
+    if (!lib.folders.has(folderRel)) {
+      lib.folders.set(folderRel, folderRec);
+      idbPut("folders", folderRec);
+    }
+    if (!lib.rootNotes && manifest.notes) {
+      lib.rootNotes = manifest.notes;
+      idbPut("meta", { key: "rootNotes", value: manifest.notes });
+    }
+
+    const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    const decodeCtx = OfflineCtx ? new OfflineCtx(1, 1, 44100) : ensureAudioCtx();
+
+    await Promise.all(
+      (manifest.clips || []).map(async (item) => {
+        try {
+          const r = await fetch(`./demos/${encodeURIComponent(item.file)}`);
+          if (!r.ok) return;
+          const arr = await r.arrayBuffer();
+          const audioBuf = await decodeCtx.decodeAudioData(arr);
+          const mono = new Float32Array(audioBuf.length);
+          const chCount = audioBuf.numberOfChannels;
+          for (let ch = 0; ch < chCount; ch++) {
+            const data = audioBuf.getChannelData(ch);
+            for (let i = 0; i < mono.length; i++) mono[i] += data[i] / chCount;
+          }
+          const name = item.name || `${stripExt(item.file)}.wav`;
+          const fullPath = `idb://${joinRel(folderRel, name)}`;
+          if (lib.clips.has(fullPath)) return;
+          const rec = {
+            fullPath,
+            relDir: folderRel,
+            name,
+            displayName: stripExt(name),
+            samples: mono,
+            sampleRate: audioBuf.sampleRate,
+            rating: 0,
+            starred: false,
+            comment: item.comment || "",
+            scoresByRef: {},
+            modified: nowStamp(),
+          };
+          lib.clips.set(fullPath, rec);
+          idbPut("clips", rec);
+        } catch (err) {
+          console.warn("Failed to seed demo clip:", item.file, err);
+        }
+      }),
+    );
+
+    idbPut("meta", { key: "demosVersion", value: targetVer });
+  } catch (err) {
+    console.warn("Could not seed default demos:", err);
+  }
+}
+
 async function hydrateLibrary() {
   db = await openIdb();
   const [folders, clips, metas] = await Promise.all([
@@ -90,11 +159,15 @@ async function hydrateLibrary() {
       lib.clips.set(c.fullPath, c);
     }
   }
+  let demosVersion = 0;
   for (const m of metas) {
     if (m.key === "rootNotes" && typeof m.value === "string") {
       lib.rootNotes = m.value;
+    } else if (m.key === "demosVersion" && typeof m.value === "number") {
+      demosVersion = m.value;
     }
   }
+  await seedDefaultDemosIfNeeded(demosVersion);
 }
 
 function cleanRel(raw) {

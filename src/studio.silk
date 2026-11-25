@@ -990,8 +990,24 @@ impl Overtone {
     audio_native.setVolume(model.volume)
     run model.syncDeviceNames()
     run model.reloadTree(false)
-    run model.analyzeAll()
-    run model.rebuildDrawings(true)
+    let mut firstClipIdx: usize = 0
+    let mut hasFirstClip = false
+    let treeNodes = model.libTree.asSlice()
+    let mut ti: usize = 0
+    while ti < treeNodes.length {
+      if !treeNodes[ti].isDir {
+        firstClipIdx = ti
+        hasFirstClip = true
+        break
+      }
+      ti = ti + 1
+    }
+    if hasFirstClip {
+      run model.loadLibraryClip(firstClipIdx, false)
+    } else {
+      run model.analyzeAll()
+      run model.rebuildDrawings(true)
+    }
     return move model
   }
 

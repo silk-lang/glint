@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "folder": "Harvard Sentences",
+  "notes": "Harvard Sentences \u2014 List 1\n\n1. The birch canoe slid on the smooth planks.\n2. Glue the sheet to the dark blue background.\n3. It's easy to tell the depth of a well.\n4. These days a chicken leg is a rare dish.\n5. Rice is often served in round bowls.\n6. The juice of lemons makes fine punch.\n7. The box was thrown beside the parked truck.\n8. The hogs were fed chopped corn and garbage.\n9. Four hours of steady work faced us.\n10. A large size in stockings is hard to sell.",
+  "clips": [
+    {
+      "file": "01-birch-canoe.mp3",
+      "name": "01 The birch canoe.wav",
+      "comment": "The birch canoe slid on the smooth planks."
+    },
+    {
+      "file": "02-glue-the-sheet.mp3",
+      "name": "02 Glue the sheet.wav",
+      "comment": "Glue the sheet to the dark blue background."
+    },
+    {
+      "file": "03-depth-of-a-well.mp3",
+      "name": "03 Depth of a well.wav",
+      "comment": "It's easy to tell the depth of a well."
+    },
+    {
+      "file": "04-chicken-leg.mp3",
+      "name": "04 A chicken leg.wav",
+      "comment": "These days a chicken leg is a rare dish."
+    },
+    {
+      "file": "05-rice-round-bowls.mp3",
+      "name": "05 Rice in round bowls.wav",
+      "comment": "Rice is often served in round bowls."
+    },
+    {
+      "file": "06-juice-of-lemons.mp3",
+      "name": "06 Juice of lemons.wav",
+      "comment": "The juice of lemons makes fine punch."
+    },
+    {
+      "file": "07-parked-truck.mp3",
+      "name": "07 Beside the parked truck.wav",
+      "comment": "The box was thrown beside the parked truck."
+    },
+    {
+      "file": "08-chopped-corn.mp3",
+      "name": "08 Hogs and chopped corn.wav",
+      "comment": "The hogs were fed chopped corn and garbage."
+    },
+    {
+      "file": "09-steady-work.mp3",
+      "name": "09 Four hours of work.wav",
+      "comment": "Four hours of steady work faced us."
+    },
+    {
+      "file": "10-large-size-stockings.mp3",
+      "name": "10 Large size in stockings.wav",
+      "comment": "A large size in stockings is hard to sell."
+    }
+  ]
+}

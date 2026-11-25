@@ -23,6 +23,9 @@ cp "$ROOT_DIR/web/glint-host.js" "$OUT_DIR/glint-host.js"
 cp "$DOM_JS" "$OUT_DIR/silk-ui-dom.js"
 cp "$ROOT_DIR/styles/app.css" "$OUT_DIR/app.css"
 cp "$ROOT_DIR/web-pkg/build/wasm32-unknown-unknown/size/glint-web.wasm" "$OUT_DIR/glint.wasm"
+if [ -d "$ROOT_DIR/web/demos" ]; then
+  cp -R "$ROOT_DIR/web/demos" "$OUT_DIR/demos"
+fi
 
 echo "Built $OUT_DIR:"
 ls -lh "$OUT_DIR"
