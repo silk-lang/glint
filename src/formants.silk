@@ -120,6 +120,46 @@ pub const VOWELS_MASC_CORNERS: [VowelLandmark; 4] = [
   VowelLandmark { idx: 9, ipa: "u", hint: "who'd", f1: 378.0, f2: 997.0, f3: 2390.0 },
 ]
 
+/// Returns a continuously interpolated vowel landmark along the vocal-tract size / resonance
+/// continuum (`resonance = 0.0` dark/larger tract → `0.5` balanced/mid → `1.0` bright/smaller tract),
+/// using exact log-frequency (multiplicative Hz) scaling between the Hillenbrand (1995) anchors.
+pub fn vowelLandmarkAt(idx: usize, resonance: f64) -> VowelLandmark {
+  let i = if idx < VOWELS_MASC.length { idx } else { 0 }
+  let r = f64.max(0.0, f64.min(1.0, resonance))
+  let lo = VOWELS_MASC[i]
+  let hi = VOWELS_FEM[i]
+  return VowelLandmark {
+    idx: lo.idx,
+    ipa: lo.ipa,
+    hint: lo.hint,
+    f1: lo.f1 * f64.pow(hi.f1 / lo.f1, r),
+    f2: lo.f2 * f64.pow(hi.f2 / lo.f2, r),
+    f3: lo.f3 * f64.pow(hi.f3 / lo.f3, r),
+  }
+}
+
+/// Returns the nearest IPA vowel symbol for `(f1, f2)` at the given continuous resonance (`0.0..1.0`).
+pub fn estimateVowelForResonance(f1: f64, f2: f64, resonance: f64) -> string<'static> {
+  if f1 < 180.0 || f1 > 1200.0 || f2 < 550.0 || f2 > 3400.0 || f2 <= f1 {
+    return "—"
+  }
+  let mut bestIpa: string<'static> = "—"
+  let mut bestDist: f64 = 1.0e30
+  let mut i: usize = 0
+  while i < VOWELS_MASC.length {
+    let v = vowelLandmarkAt(i, resonance)
+    let d1 = f64.log2(f1 / v.f1)
+    let d2 = f64.log2(f2 / v.f2)
+    let dist = d1 * d1 + d2 * d2
+    if dist < bestDist {
+      bestDist = dist
+      bestIpa = v.ipa
+    }
+    i = i + 1
+  }
+  return bestIpa
+}
+
 /// Returns the nearest IPA vowel symbol for `(f1, f2)` using the chosen Hillenbrand (1995) reference.
 pub fn estimateVowelForMode(f1: f64, f2: f64, mode: u32) -> string<'static> {
   if f1 < 180.0 || f1 > 1200.0 || f2 < 550.0 || f2 > 3400.0 || f2 <= f1 {

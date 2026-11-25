@@ -4,7 +4,7 @@
 import audio_native { SORT_ALPHA, SORT_OVERALL, SORT_PITCH, SORT_SIZE, SORT_VOWEL, SORT_WEIGHT }
 import colormap { paletteIndex, paletteName }
 import compare { HEATMAP_OVERALL, HEATMAP_PITCH, HEATMAP_SIZE, HEATMAP_VOWEL, HEATMAP_WEIGHT }
-import formants { VOWELS_FEM, VOWELS_MASC, VOWEL_MODE_BOTH, VOWEL_MODE_FEM, VOWEL_MODE_MASC }
+import formants { vowelLandmarkAt }
 import overlays { AxisTick, GuideBadge, VowelBadge, VowelChartDot, vowelX, vowelY }
 import studio {
   AXIS_W,
@@ -42,6 +42,7 @@ import studio {
   DRAG_RESIZE_READOUTS,
   DRAG_SCRUB,
   DRAG_SELECT,
+  DRAG_SLIDER,
   DRAG_TIME_RULER,
   ExplorerRowSlot,
   FILTER_ALL,
@@ -64,6 +65,7 @@ import studio {
   SLIDER_FLOOR_DB,
   SLIDER_SPEC_OPACITY,
   SLIDER_VOLUME,
+  SLIDER_VOWEL_RESONANCE,
   VOWEL_H
 }
 import view_components {
@@ -2403,8 +2405,8 @@ fn vowelChartDotNode(h: &Document<Message>, vd: &VowelChartDot) -> Node {
   )
 }
 
-fn vowelLabelNode(h: &Document<Message>, idx: usize, useMasc: bool, plotW: f32) -> Node {
-  let v = if useMasc { VOWELS_MASC[idx] } else { VOWELS_FEM[idx] }
+fn vowelLabelNode(h: &Document<Message>, idx: usize, resonance: f32, plotW: f32) -> Node {
+  let v = vowelLandmarkAt(idx, f32.toF64(resonance))
   let vx = f32.max(4.0, f32.min(plotW - 18.0, vowelX(v.f2, plotW) - 6.0))
   let vy = f32.max(2.0, f32.min(VOWEL_H - 14.0, vowelY(v.f1, VOWEL_H) - 12.0))
   return txtA(
@@ -2414,23 +2416,26 @@ fn vowelLabelNode(h: &Document<Message>, idx: usize, useMasc: bool, plotW: f32) 
       h.class("absolute text-[10px] leading-[12px] font-semibold text-[#3A3A40] hover:text-[#D9381E]"),
       h.style(&[css.left(px(vx)), css.top(px(vy))]),
       h.cursor(Cursor.Pointer),
-      h.onPointerDown(|_| Reply<Message>.EmitAndStop { message: Message.ApplyVowelGuides { idx: idx, useMasc: useMasc } }),
+      h.onPointerDown(|_| Reply<Message>.EmitAndStop { message: Message.ApplyVowelGuides { idx: idx } }),
     ],
   )
 }
 
 fn renderVowelsCard(m: &Overtone, h: &Document<Message>) -> Node {
   let vowelAlert = m.readoutWeakestMetric == 4
-  let useMasc = m.vowelMode == VOWEL_MODE_MASC
+  let res = m.vowelResonance
+  let resPct = f32.max(0.0, f32.min(1.0, res)) * 100.0
+  let sLeft = m.sliderLeft[u32.toUsize(SLIDER_VOWEL_RESONANCE)]
+  let sWidth = m.sliderWidth[u32.toUsize(SLIDER_VOWEL_RESONANCE)]
   let plotW = f32.max(180.0, m.readoutsWidth - 32.0)
   return h.column(
     &[h.class("px-[16px] py-[10px] gap-[6px] border-b border-[#E6E6E8] shrink-0")],
     &[
       h.row(
-        &[h.class("items-center justify-between")],
+        &[h.class("items-center justify-between gap-[6px]")],
         &[
           h.row(
-            &[h.class("items-center gap-[5px]")],
+            &[h.class("items-center gap-[5px] shrink-0")],
             &[
               txt(h, "Vowels", "text-[11px] leading-[14px] font-semibold tracking-[0.06em] uppercase text-[#6B6B70]"),
               if m.readoutVowel != "—" {
@@ -2464,11 +2469,55 @@ fn renderVowelsCard(m: &Overtone, h: &Document<Message>) -> Node {
             ],
           ),
           h.row(
-            &[h.class("gap-[2px] text-[10px] text-[#6B6B70]")],
+            &[h.testId("vowel-resonance-slider"), h.class("items-center gap-[4px] shrink-0")],
             &[
-              miniTabBtn(h, "Fem", m.vowelMode == VOWEL_MODE_FEM, Message.SetVowelMode { mode: VOWEL_MODE_FEM }),
-              miniTabBtn(h, "Masc", m.vowelMode == VOWEL_MODE_MASC, Message.SetVowelMode { mode: VOWEL_MODE_MASC }),
-              miniTabBtn(h, "Both", m.vowelMode == VOWEL_MODE_BOTH, Message.SetVowelMode { mode: VOWEL_MODE_BOTH }),
+              txtA(
+                h,
+                "Dark",
+                &[
+                  h.class("text-[10px] leading-[12px]"),
+                  h.classSelect(res < 0.25, "text-[#0B0B0C] font-semibold", "text-[#8A8A90] hover:text-[#0B0B0C]"),
+                  h.cursor(Cursor.Pointer),
+                  h.onClick(Message.SetVowelResonance { value: 0.0 }),
+                ],
+              ),
+              h.box(
+                &[
+                  h.class("w-[52px] h-[16px] relative flex items-center shrink-0"),
+                  h.cursor(Cursor.ResizeHorizontal),
+                  if m.drag == DRAG_SLIDER && m.dragSlider == SLIDER_VOWEL_RESONANCE { h.capturePointer() } else { h.none() },
+                  h.onLayout(|r| Message.SliderLayout { id: SLIDER_VOWEL_RESONANCE, rect: r }),
+                  h.onPointerDown(|e| Reply<Message>.EmitAndStop { message: Message.SliderDown { id: SLIDER_VOWEL_RESONANCE, x: e.x, left: sLeft, width: sWidth } }),
+                  h.onPointerMove(|e| Reply<Message>.EmitAndStop { message: Message.SliderMove { x: e.x } }),
+                  h.onPointerUp(|_| Reply<Message>.EmitAndStop { message: Message.SliderUp }),
+                ],
+                &[
+                  h.box(
+                    &[h.class("w-full h-[3px] rounded-[2px] bg-[#E6E6E8] relative flex items-center")],
+                    &[
+                      h.box(&[h.class("absolute left-[50%] top-[-2px] w-[1px] h-[7px] bg-[#D4D4D8] pointer-events-none")], &[]),
+                      h.box(&[h.class("h-full bg-[#0B0B0C] rounded-[2px]"), h.style(&[css.width(percent(resPct))])], &[]),
+                    ],
+                  ),
+                  h.box(
+                    &[
+                      h.class("absolute w-[9px] h-[9px] rounded-[5px] bg-[#0B0B0C] border border-white pointer-events-none"),
+                      h.style(&[css.left(percent(resPct)), css.marginLeft(px(-4.5))]),
+                    ],
+                    &[],
+                  ),
+                ],
+              ),
+              txtA(
+                h,
+                "Bright",
+                &[
+                  h.class("text-[10px] leading-[12px]"),
+                  h.classSelect(res > 0.75, "text-[#0B0B0C] font-semibold", "text-[#8A8A90] hover:text-[#0B0B0C]"),
+                  h.cursor(Cursor.Pointer),
+                  h.onClick(Message.SetVowelResonance { value: 1.0 }),
+                ],
+              ),
             ],
           ),
         ],
@@ -2496,13 +2545,13 @@ fn renderVowelsCard(m: &Overtone, h: &Document<Message>) -> Node {
             m.vowelChartDots.asSlice(),
             |vd| vowelChartDotNode(h, vd),
           ),
-          vowelLabelNode(h, 0, useMasc, plotW),
-          vowelLabelNode(h, 1, useMasc, plotW),
-          vowelLabelNode(h, 3, useMasc, plotW),
-          vowelLabelNode(h, 4, useMasc, plotW),
-          vowelLabelNode(h, 5, useMasc, plotW),
-          vowelLabelNode(h, 6, useMasc, plotW),
-          vowelLabelNode(h, 9, useMasc, plotW),
+          vowelLabelNode(h, 0, res, plotW),
+          vowelLabelNode(h, 1, res, plotW),
+          vowelLabelNode(h, 3, res, plotW),
+          vowelLabelNode(h, 4, res, plotW),
+          vowelLabelNode(h, 5, res, plotW),
+          vowelLabelNode(h, 6, res, plotW),
+          vowelLabelNode(h, 9, res, plotW),
         ],
       ),
     ],

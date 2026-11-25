@@ -1,7 +1,6 @@
 //! Glint floating overlays: Guides popover, all 8 Context Menus, Settings Modal (7 tabs), and Drag Ghost.
 import audio_native { AudioDeviceInfo, SORT_ALPHA, SORT_OVERALL, SORT_PITCH, SORT_SIZE, SORT_VOWEL, SORT_WEIGHT }
 import colormap { paletteIndex }
-import formants { VOWEL_MODE_BOTH, VOWEL_MODE_FEM, VOWEL_MODE_MASC }
 import overlays { GuideBadge }
 import studio {
   CTX_AUDIO,
@@ -56,6 +55,7 @@ import studio {
   SLIDER_SYNTH_WEIGHT,
   SLIDER_VAD_THRESH,
   SLIDER_VOLUME,
+  SLIDER_VOWEL_RESONANCE,
   SLIDER_W_PITCH,
   SLIDER_W_SIZE,
   SLIDER_W_VOWEL,
@@ -1349,7 +1349,7 @@ fn renderSettingsAnalysis(m: &Overtone, h: &Document<Message>) -> Node {
             &[h.class("w-[180px] shrink-0 gap-[1px]")],
             &[
               txt(h, "Formant ceiling", "text-[13px] leading-[16px] text-[#0B0B0C]"),
-              txt(h, "5.0k masc · 5.5k fem · 6.0k bright", "text-[11px] leading-[14px] text-[#8A8A90]"),
+              txt(h, "5.0k dark · 5.5k balanced · 6.0k bright", "text-[11px] leading-[14px] text-[#8A8A90]"),
             ],
           ),
           h.row(
@@ -1364,22 +1364,42 @@ fn renderSettingsAnalysis(m: &Overtone, h: &Document<Message>) -> Node {
       ),
       settingsSliderRow(m, h, SLIDER_FORMANT_CEIL, "Fine ceiling", "", fcNorm, if fc >= 5800.0 { "6.0 kHz" } else if fc >= 5250.0 { "5.5 kHz" } else { "5.0 kHz" }, false),
       settingsSection(h, "Vowel chart"),
+      settingsSliderRow(
+        m,
+        h,
+        SLIDER_VOWEL_RESONANCE,
+        "Resonance scale",
+        "Vocal-tract size (Dark ↔ Bright)",
+        m.vowelResonance,
+        if m.vowelResonance < 0.20 {
+          "Dark"
+        } else if m.vowelResonance < 0.40 {
+          "Warm"
+        } else if m.vowelResonance <= 0.60 {
+          "Balanced"
+        } else if m.vowelResonance <= 0.80 {
+          "Light"
+        } else {
+          "Bright"
+        },
+        false,
+      ),
       h.row(
         &[h.class("items-center gap-[16px] py-[9px] border-b border-[#F0F0F2]")],
         &[
           h.column(
             &[h.class("w-[180px] shrink-0 gap-[1px]")],
             &[
-              txt(h, "Landmarks", "text-[13px] leading-[16px] text-[#0B0B0C]"),
-              txt(h, "IPA targets on F1 × F2", "text-[11px] leading-[14px] text-[#8A8A90]"),
+              txt(h, "Quick anchors", "text-[13px] leading-[16px] text-[#0B0B0C]"),
+              txt(h, "Jump along the resonance continuum", "text-[11px] leading-[14px] text-[#8A8A90]"),
             ],
           ),
           h.row(
             &[h.class("border border-[#DCDCDF] rounded-[5px] overflow-hidden")],
             &[
-              segOption(h, "Fem", "", m.vowelMode == VOWEL_MODE_FEM, false, true, Message.SetVowelMode { mode: VOWEL_MODE_FEM }),
-              segOption(h, "Masc", "", m.vowelMode == VOWEL_MODE_MASC, false, true, Message.SetVowelMode { mode: VOWEL_MODE_MASC }),
-              segOption(h, "Both", "", m.vowelMode == VOWEL_MODE_BOTH, false, false, Message.SetVowelMode { mode: VOWEL_MODE_BOTH }),
+              segOption(h, "Dark", "", m.vowelResonance < 0.15, false, true, Message.SetVowelResonance { value: 0.0 }),
+              segOption(h, "Balanced", "", m.vowelResonance >= 0.42 && m.vowelResonance <= 0.58, false, true, Message.SetVowelResonance { value: 0.5 }),
+              segOption(h, "Bright", "", m.vowelResonance > 0.85, false, false, Message.SetVowelResonance { value: 1.0 }),
             ],
           ),
         ],

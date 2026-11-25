@@ -18,10 +18,8 @@ import formants {
   FormantFrame,
   VOWELS_FEM,
   VOWELS_MASC,
-  VOWEL_MODE_BOTH,
-  VOWEL_MODE_FEM,
-  VOWEL_MODE_MASC,
-  lpcEnvelopeDb
+  lpcEnvelopeDb,
+  vowelLandmarkAt
 }
 import pitch { MAX_CONNECTED_SEMITONES, PitchFrame, frequencyToNote, midiToFrequency, noteClassName, semitonesBetween }
 import viewport { Viewport }
@@ -1637,7 +1635,7 @@ pub effect fn buildVowelChartDrawing(
   alignedRef: &[AlignedRefPoint],
   inspectSec: f64,
   hasRef: bool,
-  vowelMode: u32,
+  vowelResonance: f32,
 ) -> Drawing
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -1658,58 +1656,61 @@ pub effect fn buildVowelChartDrawing(
     },
   )
 
-  let showFem = vowelMode == VOWEL_MODE_FEM || vowelMode == VOWEL_MODE_BOTH
-  let showMasc = vowelMode == VOWEL_MODE_MASC || vowelMode == VOWEL_MODE_BOTH
-  let colFemPoly = COL_INK
-  let colMascPoly = COL_MUTED
+  let res = f64.max(0.0, f64.min(1.0, f32.toF64(vowelResonance)))
+  let colBound = Rgba<f32> { r: 0.541, g: 0.541, b: 0.565, a: 0.28 }
+  let polyIdx: [usize; 7] = [0, 1, 3, 4, 5, 6, 9]
 
-  // Hillenbrand (1995) Men's vowel polygon (muted #8A8A90)
-  if showMasc {
-    run cmds.append(CanvasCommand.MoveTo { x: vowelX(VOWELS_MASC[0].f2, width), y: vowelY(VOWELS_MASC[0].f1, height) })
-    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_MASC[1].f2, width), y: vowelY(VOWELS_MASC[1].f1, height) })
-    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_MASC[3].f2, width), y: vowelY(VOWELS_MASC[3].f1, height) })
-    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_MASC[4].f2, width), y: vowelY(VOWELS_MASC[4].f1, height) })
-    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_MASC[5].f2, width), y: vowelY(VOWELS_MASC[5].f1, height) })
-    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_MASC[6].f2, width), y: vowelY(VOWELS_MASC[6].f1, height) })
-    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_MASC[9].f2, width), y: vowelY(VOWELS_MASC[9].f1, height) })
-    run cmds.append(CanvasCommand.Close)
-    run cmds.append(CanvasCommand.Stroke { color: colMascPoly, width: 1.1 })
+  // Faint outer reference envelopes (Dark / larger tract & Bright / smaller tract) + continuum rails
+  run cmds.append(CanvasCommand.MoveTo { x: vowelX(VOWELS_MASC[0].f2, width), y: vowelY(VOWELS_MASC[0].f1, height) })
+  let mut bi: usize = 1
+  while bi < polyIdx.length {
+    let idx = polyIdx[bi]
+    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_MASC[idx].f2, width), y: vowelY(VOWELS_MASC[idx].f1, height) })
+    bi = bi + 1
   }
+  run cmds.append(CanvasCommand.Close)
+  run cmds.append(CanvasCommand.Stroke { color: colBound, width: 0.9 })
 
-  // Hillenbrand (1995) Women's vowel polygon (#0B0B0C with 4% fill)
-  if showFem {
-    run cmds.append(CanvasCommand.MoveTo { x: vowelX(VOWELS_FEM[0].f2, width), y: vowelY(VOWELS_FEM[0].f1, height) })
-    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[1].f2, width), y: vowelY(VOWELS_FEM[1].f1, height) })
-    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[3].f2, width), y: vowelY(VOWELS_FEM[3].f1, height) })
-    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[4].f2, width), y: vowelY(VOWELS_FEM[4].f1, height) })
-    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[5].f2, width), y: vowelY(VOWELS_FEM[5].f1, height) })
-    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[6].f2, width), y: vowelY(VOWELS_FEM[6].f1, height) })
-    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[9].f2, width), y: vowelY(VOWELS_FEM[9].f1, height) })
-    run cmds.append(CanvasCommand.Close)
-    run cmds.append(CanvasCommand.Fill { color: Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 0.04 } })
-    run cmds.append(CanvasCommand.MoveTo { x: vowelX(VOWELS_FEM[0].f2, width), y: vowelY(VOWELS_FEM[0].f1, height) })
-    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[1].f2, width), y: vowelY(VOWELS_FEM[1].f1, height) })
-    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[3].f2, width), y: vowelY(VOWELS_FEM[3].f1, height) })
-    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[4].f2, width), y: vowelY(VOWELS_FEM[4].f1, height) })
-    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[5].f2, width), y: vowelY(VOWELS_FEM[5].f1, height) })
-    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[6].f2, width), y: vowelY(VOWELS_FEM[6].f1, height) })
-    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[9].f2, width), y: vowelY(VOWELS_FEM[9].f1, height) })
-    run cmds.append(CanvasCommand.Close)
-    run cmds.append(CanvasCommand.Stroke { color: colFemPoly, width: 1.3 })
+  run cmds.append(CanvasCommand.MoveTo { x: vowelX(VOWELS_FEM[0].f2, width), y: vowelY(VOWELS_FEM[0].f1, height) })
+  bi = 1
+  while bi < polyIdx.length {
+    let idx = polyIdx[bi]
+    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[idx].f2, width), y: vowelY(VOWELS_FEM[idx].f1, height) })
+    bi = bi + 1
   }
+  run cmds.append(CanvasCommand.Close)
+  run cmds.append(CanvasCommand.Stroke { color: colBound, width: 0.9 })
 
-  // Subtle shift vectors from Men -> Women on cardinal vowels in Both mode
-  if showFem && showMasc {
-    let shiftIdx: [usize; 6] = [0, 3, 4, 5, 6, 9]
-    let mut s: usize = 0
-    while s < shiftIdx.length {
-      let vi = shiftIdx[s]
-      run cmds.append(CanvasCommand.MoveTo { x: vowelX(VOWELS_MASC[vi].f2, width), y: vowelY(VOWELS_MASC[vi].f1, height) })
-      run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[vi].f2, width), y: vowelY(VOWELS_FEM[vi].f1, height) })
-      s = s + 1
-    }
-    run cmds.append(CanvasCommand.Stroke { color: Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 0.14 }, width: 0.8 })
+  let shiftIdx: [usize; 6] = [0, 3, 4, 5, 6, 9]
+  let mut s: usize = 0
+  while s < shiftIdx.length {
+    let vi = shiftIdx[s]
+    run cmds.append(CanvasCommand.MoveTo { x: vowelX(VOWELS_MASC[vi].f2, width), y: vowelY(VOWELS_MASC[vi].f1, height) })
+    run cmds.append(CanvasCommand.LineTo { x: vowelX(VOWELS_FEM[vi].f2, width), y: vowelY(VOWELS_FEM[vi].f1, height) })
+    s = s + 1
   }
+  run cmds.append(CanvasCommand.Stroke { color: Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 0.12 }, width: 0.8 })
+
+  // Active continuous-resonance vowel polygon (#0B0B0C with 4% fill)
+  let v0 = vowelLandmarkAt(0, res)
+  run cmds.append(CanvasCommand.MoveTo { x: vowelX(v0.f2, width), y: vowelY(v0.f1, height) })
+  bi = 1
+  while bi < polyIdx.length {
+    let vk = vowelLandmarkAt(polyIdx[bi], res)
+    run cmds.append(CanvasCommand.LineTo { x: vowelX(vk.f2, width), y: vowelY(vk.f1, height) })
+    bi = bi + 1
+  }
+  run cmds.append(CanvasCommand.Close)
+  run cmds.append(CanvasCommand.Fill { color: Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 0.045 } })
+  run cmds.append(CanvasCommand.MoveTo { x: vowelX(v0.f2, width), y: vowelY(v0.f1, height) })
+  bi = 1
+  while bi < polyIdx.length {
+    let vk = vowelLandmarkAt(polyIdx[bi], res)
+    run cmds.append(CanvasCommand.LineTo { x: vowelX(vk.f2, width), y: vowelY(vk.f1, height) })
+    bi = bi + 1
+  }
+  run cmds.append(CanvasCommand.Close)
+  run cmds.append(CanvasCommand.Stroke { color: COL_INK, width: 1.35 })
 
   // Whole-sentence Reference vowel cloud (filtered to detected vowel cores!) + soft halo + ringed centroid
   let mut refMeanF1 = refSummary.meanF1
@@ -1840,42 +1841,23 @@ pub effect fn buildVowelChartDrawing(
     }
   }
 
-  // Reference vowel dots (subtle ink / muted)
-  if showMasc {
-    let mut i: usize = 0
-    while i < VOWELS_MASC.length {
-      let vx = vowelX(VOWELS_MASC[i].f2, width)
-      let vy = vowelY(VOWELS_MASC[i].f1, height)
-      run cmds.append(
-        CanvasCommand.FillRect {
-          x: vx - 1.8,
-          y: vy - 1.8,
-          width: 3.6,
-          height: 3.6,
-          radius: 1.8,
-          color: Rgba<f32> { r: 0.541, g: 0.541, b: 0.565, a: 0.65 },
-        },
-      )
-      i = i + 1
-    }
-  }
-  if showFem {
-    let mut i: usize = 0
-    while i < VOWELS_FEM.length {
-      let vx = vowelX(VOWELS_FEM[i].f2, width)
-      let vy = vowelY(VOWELS_FEM[i].f1, height)
-      run cmds.append(
-        CanvasCommand.FillRect {
-          x: vx - 1.8,
-          y: vy - 1.8,
-          width: 3.6,
-          height: 3.6,
-          radius: 1.8,
-          color: Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 0.55 },
-        },
-      )
-      i = i + 1
-    }
+  // Interpolated resonance vowel landmark dots
+  let mut li: usize = 0
+  while li < VOWELS_MASC.length {
+    let lv = vowelLandmarkAt(li, res)
+    let vx = vowelX(lv.f2, width)
+    let vy = vowelY(lv.f1, height)
+    run cmds.append(
+      CanvasCommand.FillRect {
+        x: vx - 1.8,
+        y: vy - 1.8,
+        width: 3.6,
+        height: 3.6,
+        radius: 1.8,
+        color: Rgba<f32> { r: 0.043, g: 0.043, b: 0.047, a: 0.60 },
+      },
+    )
+    li = li + 1
   }
 
   // Live moving dots at playhead/cursor: Reference (teal) & You (vermilion) moving together!

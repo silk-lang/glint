@@ -64,11 +64,10 @@ import formants {
   DEFAULT_FORMANT_CEILING_HZ,
   FormantFrame,
   FormantTrack,
-  VOWELS_FEM,
   VOWELS_MASC,
-  VOWEL_MODE_BOTH,
   applyNeuralFormantFrames,
-  estimateVowelForMode
+  estimateVowelForResonance,
+  vowelLandmarkAt
 }
 import overlays {
   AxisTick,
@@ -134,6 +133,7 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f32
 import silk.num.f64
 import silk.num.i32
+import silk.num.u8
 import silk.num.u32
 import silk.num.usize
 import silk.text.string { String }
@@ -160,6 +160,7 @@ pub const SLIDER_SYNTH_PITCH: u32 = 18
 pub const SLIDER_SYNTH_SIZE: u32 = 19
 pub const SLIDER_SYNTH_WEIGHT: u32 = 20
 pub const SLIDER_SYNTH_MORPH: u32 = 21
+pub const SLIDER_VOWEL_RESONANCE: u32 = 22
 
 // Pointer drag modes
 pub const DRAG_NONE: u32 = 0
@@ -461,9 +462,9 @@ pub union Message {
   SynthReset,
   SynthPreset { pub pitch: f64, pub size: f64, pub weight: f64 },
   SetSynthMorph { pub morph: f32 },
-  // Hillenbrand (1995) Gendered Vowel Space mode + click vowel -> F1/F2/F3 guides
-  SetVowelMode { pub mode: u32 },
-  ApplyVowelGuides { pub idx: usize, pub useMasc: bool },
+  // Continuous Vocal-Tract Resonance continuum (0.0 = Dark/large -> 0.5 = Balanced -> 1.0 = Bright/small)
+  SetVowelResonance { pub value: f32 },
+  ApplyVowelGuides { pub idx: usize },
   ToggleClickVowelGuides,
   ClearError,
   // VoceVista-style Settings / Preferences modal
@@ -587,7 +588,7 @@ pub struct Overtone {
   pub guides: List<f64>,
   pub guideLabels: List<GuideBadge>,
   pub snapGuidesToNote: bool,
-  pub vowelMode: u32,
+  pub vowelResonance: f32,
   pub clickVowelAddsGuides: bool,
 
   // Comparison score weights (normalized automatically)
@@ -760,8 +761,8 @@ pub struct Overtone {
   pub specRect: Rect<f32>,
   pub overviewRect: Rect<f32>,
   pub sliceHeight: f32,
-  pub sliderLeft: [f32; 22],
-  pub sliderWidth: [f32; 22],
+  pub sliderLeft: [f32; 23],
+  pub sliderWidth: [f32; 23],
 
   // Pointer & drag state
   pub drag: u32,
@@ -977,7 +978,7 @@ impl Overtone {
       guides: List<f64>.make(),
       guideLabels: List<GuideBadge>.make(),
       snapGuidesToNote: false,
-      vowelMode: VOWEL_MODE_BOTH,
+      vowelResonance: 0.5,
       clickVowelAddsGuides: true,
 
       matchWeights: MatchWeights.defaults(),
@@ -1138,8 +1139,8 @@ impl Overtone {
       specRect: Rect<f32>.new(0.0, 0.0, INIT_SPEC_W, INIT_SPEC_H),
       overviewRect: Rect<f32>.new(0.0, 0.0, INIT_SPEC_W, OVERVIEW_H),
       sliceHeight: 96.0,
-      sliderLeft: [0.0; 22],
-      sliderWidth: [70.0; 22],
+      sliderLeft: [0.0; 23],
+      sliderWidth: [70.0; 23],
 
       drag: DRAG_NONE,
       dragSlider: 0,
@@ -1359,6 +1360,9 @@ impl Overtone {
     audio_native.prefSet("palette", String.view(&palStr))
     audio_native.prefSet("fav_input", String.view(&self.favInputName))
     audio_native.prefSet("fav_output", String.view(&self.favOutputName))
+    let mut vrStr = String.make()
+    run appendInt(&mut vrStr, f32.toI32(f32.round(self.vowelResonance * 100.0)))
+    audio_native.prefSet("vowel_res", String.view(&vrStr))
   }
 
   effect fn applyFavoriteAudioDevices(self: &mut Self) -> ()
@@ -1411,6 +1415,19 @@ impl Overtone {
     else if String.view(&lm) == "2" { self.listenMode = LISTEN_BOTH }
     let nr = run audio_native.prefGet("norm_ref")
     if String.view(&nr) == "1" { self.normToRef = true }
+    let vr = run audio_native.prefGet("vowel_res")
+    let vrBytes = String.utf8Bytes(String.view(&vr))
+    if vrBytes.length > 0 {
+      let mut vrNum: i32 = 0
+      let mut vi: usize = 0
+      while vi < vrBytes.length {
+        if vrBytes[vi] >= 48 && vrBytes[vi] <= 57 {
+          vrNum = vrNum * 10 + u32.toI32(u8.toU32(vrBytes[vi] - 48))
+        }
+        vi = vi + 1
+      }
+      self.vowelResonance = f32.max(0.0, f32.min(1.0, i32.toF32(vrNum) * 0.01))
+    }
     let spitch = run audio_native.prefGet("show_pitch")
     if String.view(&spitch) == "0" { self.showPitch = false }
     let sfmt = run audio_native.prefGet("show_formants")
@@ -4775,7 +4792,7 @@ impl Overtone {
       self.readoutF2 = if ff.count >= 2 { run formatHz(ff.f2) } else { run String.copy("—") }
       self.readoutF3 = if ff.count >= 3 { run formatHz(ff.f3) } else { run String.copy("—") }
       self.readoutF4 = if ff.count >= 4 { run formatHz(ff.f4) } else { run String.copy("—") }
-      self.readoutVowel = if ff.count >= 2 { estimateVowelForMode(ff.f1, ff.f2, self.vowelMode) } else { "—" }
+      self.readoutVowel = if ff.count >= 2 { estimateVowelForResonance(ff.f1, ff.f2, f32.toF64(self.vowelResonance)) } else { "—" }
     } else {
       self.readoutF1 = run String.copy("—")
       self.readoutF2 = run String.copy("—")
@@ -5032,7 +5049,7 @@ impl Overtone {
         self.compare.points.asSlice(),
         inspectSec,
         self.refClip.active,
-        self.vowelMode,
+        self.vowelResonance,
       )
       self.vowelChartDots = run computeVowelChartDots(
         self.takeVowelSpans.asSlice(),
@@ -5344,7 +5361,7 @@ impl Overtone {
       self.compare.points.asSlice(),
       inspectSec,
       self.refClip.active,
-      self.vowelMode,
+      self.vowelResonance,
     )
     self.vowelChartDots = run computeVowelChartDots(
       self.takeVowelSpans.asSlice(),
@@ -5372,7 +5389,7 @@ impl Overtone {
     ! OutOfMemoryError
     ? &mut Allocator {
     let idx = u32.toUsize(id)
-    if idx >= 22 {
+    if idx >= 23 {
       return ()
     }
     let w = f32.max(1.0, self.sliderWidth[idx])
@@ -5487,6 +5504,13 @@ impl Overtone {
     } else if id == SLIDER_SYNTH_MORPH {
       self.synthMorph = f32.round(t * 20.0) / 20.0
       run self.syncSynthReadouts()
+    } else if id == SLIDER_VOWEL_RESONANCE {
+      let nextR = f32.round(t * 100.0) / 100.0
+      if f32.abs(nextR - self.vowelResonance) >= 0.005 {
+        self.vowelResonance = nextR
+        run self.rebuildDrawings(false)
+        run self.saveSessionPrefs()
+      }
     }
   }
 
@@ -7447,13 +7471,12 @@ impl Overtone {
         let h = f32.max(60.0, self.vowelChartRect.height())
         let f2 = vowelF2OfX(rx, w)
         let f1 = vowelF1OfY(ry, h)
-        let f3 = f64.max(f2 + 420.0, if self.vowelMode == 1 { 2520.0 } else { 2880.0 })
+        let res = f32.toF64(self.vowelResonance)
+        let f3 = f64.max(f2 + 420.0, 2520.0 * f64.pow(2880.0 / 2520.0, res))
         let f0 = if self.voiceMetrics.summary.medianF0 > 55.0 {
           self.voiceMetrics.summary.medianF0
-        } else if self.vowelMode == 1 {
-          125.0
         } else {
-          215.0
+          130.0 * f64.pow(210.0 / 130.0, res)
         }
         let tilt = self.voiceMetrics.summary.medianH1H2Db * 0.45
         drop audio_native.klattPlay(f0, f1, f2, f3, f3 + 850.0, 0.58, tilt)
@@ -7585,21 +7608,21 @@ impl Overtone {
         self.showPitchLaneTab = pitch
       }
 
-      Message.SetVowelMode { mode } => {
-        self.vowelMode = mode
+      Message.SetVowelResonance { value } => {
+        self.vowelResonance = f32.max(0.0, f32.min(1.0, value))
         run self.rebuildDrawings(false)
+        run self.saveSessionPrefs()
       }
 
-      Message.ApplyVowelGuides { idx, useMasc } => {
-        if idx < VOWELS_FEM.length {
-          let v = if useMasc { VOWELS_MASC[idx] } else { VOWELS_FEM[idx] }
-          // Always audition the clicked Hillenbrand IPA target through the Klatt formant synth!
+      Message.ApplyVowelGuides { idx } => {
+        if idx < VOWELS_MASC.length {
+          let res = f32.toF64(self.vowelResonance)
+          let v = vowelLandmarkAt(idx, res)
+          // Audition the clicked IPA vowel target through the Klatt formant synth!
           let f0 = if self.voiceMetrics.summary.medianF0 > 55.0 {
             self.voiceMetrics.summary.medianF0
-          } else if useMasc {
-            125.0
           } else {
-            215.0
+            130.0 * f64.pow(210.0 / 130.0, res)
           }
           drop audio_native.klattPlay(f0, v.f1, v.f2, v.f3, v.f3 + 850.0, 0.62, self.voiceMetrics.summary.medianH1H2Db * 0.4)
           if !self.clickVowelAddsGuides {
@@ -7610,7 +7633,7 @@ impl Overtone {
           run self.guides.append(v.f2)
           run self.guides.append(v.f3)
           let mut msg = String.make()
-          run msg.append(if useMasc { "Men's /" } else { "Women's /" })
+          run msg.append(if res < 0.30 { "Dark /" } else if res > 0.70 { "Bright /" } else { "Balanced /" })
           run msg.append(v.ipa)
           run msg.append("/ ('")
           run msg.append(v.hint)
@@ -7620,7 +7643,7 @@ impl Overtone {
           run appendFixed(&mut msg, v.f2, 0)
           run msg.append(" · F3 ")
           run appendFixed(&mut msg, v.f3, 0)
-          run msg.append(" Hz (Hillenbrand '95)")
+          run msg.append(" Hz")
           self.statusMsg = move msg
           run self.rebuildDrawings(false)
         }
@@ -7964,7 +7987,7 @@ impl Overtone {
 
       Message.SliderLayout { id, rect } => {
         let idx = u32.toUsize(id)
-        if idx < 22 {
+        if idx < 23 {
           self.sliderLeft[idx] = rect.xMin
           self.sliderWidth[idx] = rect.width()
         }
@@ -7972,7 +7995,7 @@ impl Overtone {
 
       Message.SliderDown { id, x, left, width } => {
         let idx = u32.toUsize(id)
-        if idx < 22 && width > 1.0 {
+        if idx < 23 && width > 1.0 {
           self.sliderLeft[idx] = left
           self.sliderWidth[idx] = width
         }
