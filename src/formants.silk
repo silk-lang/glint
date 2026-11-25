@@ -738,6 +738,11 @@ impl FormantTrack {
       if !actSl[runStart] {
         let frMut = self.frames.asMutSlice()
         frMut[runStart].tracked = false
+        frMut[runStart].f1 = 0.0
+        frMut[runStart].f2 = 0.0
+        frMut[runStart].f3 = 0.0
+        frMut[runStart].f4 = 0.0
+        frMut[runStart].count = 0
         runStart = runStart + 1
         continue
       }
@@ -1059,6 +1064,172 @@ effect fn smoothPositiveBand(vals: &mut [f64]) -> ()
       vals[i] = 0.22 * mSl[i - 1] + 0.56 * cur + 0.22 * mSl[i + 1]
     } else {
       vals[i] = cur
+    }
+    i = i + 1
+  }
+}
+
+/// Applies neural FormantsTracker `(times, nf1, nf2, nf3)` predictions onto an existing uniform-hop
+/// `FormantFrame` slice, gated by voiced pitch & relative speech energy and lightly smoothed.
+pub effect fn applyNeuralFormantFrames(
+  frames: &mut [FormantFrame],
+  pitchFrames: &[PitchFrame],
+  displayClarity: f64,
+  times: &[f64],
+  nf1: &[f64],
+  nf2: &[f64],
+  nf3: &[f64],
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let n = frames.length
+  let m = times.length
+  if n == 0 || m == 0 || nf1.length < m || nf2.length < m || nf3.length < m {
+    return ()
+  }
+
+  let mut peakDb: f64 = -120.0
+  let mut i: usize = 0
+  while i < n {
+    if frames[i].intensityDb > peakDb {
+      peakDb = frames[i].intensityDb
+    }
+    i = i + 1
+  }
+  let minActiveDb = f64.max(-58.0, peakDb - 34.0)
+
+  let mut active = List<bool>.make()
+  run active.appendRepeated(false, n)
+  let actSl = active.asMutSlice()
+
+  let mut pIdx: usize = 0
+  i = 0
+  while i < n {
+    let ft = frames[i].time
+    let fDb = frames[i].intensityDb
+    let mut isVoiced = false
+    if pitchFrames.length > 0 {
+      while pIdx + 1 < pitchFrames.length && pitchFrames[pIdx + 1].time < ft {
+        pIdx = pIdx + 1
+      }
+      let mut bestP = pIdx
+      if pIdx + 1 < pitchFrames.length {
+        if f64.abs(pitchFrames[pIdx + 1].time - ft) < f64.abs(pitchFrames[pIdx].time - ft) {
+          bestP = pIdx + 1
+        }
+      }
+      let pf = pitchFrames[bestP]
+      if f64.abs(pf.time - ft) <= 0.035 && pf.voiced && pf.clarity >= displayClarity && fDb >= minActiveDb {
+        isVoiced = true
+      }
+    } else if fDb >= minActiveDb {
+      isVoiced = true
+    }
+    actSl[i] = isVoiced
+    i = i + 1
+  }
+
+  // Drop isolated 1-2 frame blips
+  i = 0
+  while i < n {
+    if actSl[i] {
+      let mut j = i
+      while j < n && actSl[j] {
+        j = j + 1
+      }
+      if j - i < 3 {
+        let mut k = i
+        while k < j {
+          actSl[k] = false
+          k = k + 1
+        }
+      }
+      i = j
+    } else {
+      i = i + 1
+    }
+  }
+
+  // Interpolate neural F1/F2/F3 onto each active frame
+  let mut rF1 = List<f64>.make()
+  let mut rF2 = List<f64>.make()
+  let mut rF3 = List<f64>.make()
+  run rF1.appendRepeated(0.0, n)
+  run rF2.appendRepeated(0.0, n)
+  run rF3.appendRepeated(0.0, n)
+  let sl1 = rF1.asMutSlice()
+  let sl2 = rF2.asMutSlice()
+  let sl3 = rF3.asMutSlice()
+
+  let mut ti: usize = 0
+  i = 0
+  while i < n {
+    if actSl[i] {
+      let t = frames[i].time
+      while ti + 1 < m && times[ti + 1] < t {
+        ti = ti + 1
+      }
+      let mut v1: f64 = 0.0
+      let mut v2: f64 = 0.0
+      let mut v3: f64 = 0.0
+      if ti + 1 < m && t >= times[ti] && t <= times[ti + 1] && (times[ti + 1] - times[ti]) > 1.0e-6 {
+        let a = (t - times[ti]) / (times[ti + 1] - times[ti])
+        v1 = nf1[ti] + a * (nf1[ti + 1] - nf1[ti])
+        v2 = nf2[ti] + a * (nf2[ti + 1] - nf2[ti])
+        v3 = nf3[ti] + a * (nf3[ti + 1] - nf3[ti])
+      } else {
+        let mut best = ti
+        if ti + 1 < m && f64.abs(times[ti + 1] - t) < f64.abs(times[ti] - t) {
+          best = ti + 1
+        }
+        if f64.abs(times[best] - t) <= 0.04 {
+          v1 = nf1[best]
+          v2 = nf2[best]
+          v3 = nf3[best]
+        }
+      }
+      if v1 >= 150.0 && v1 <= 1300.0 && v2 >= v1 + 100.0 && v2 <= 3600.0 {
+        sl1[i] = v1
+        sl2[i] = v2
+        if v3 >= v2 + 120.0 && v3 <= 4600.0 {
+          sl3[i] = v3
+        }
+      }
+    }
+    i = i + 1
+  }
+
+  run smoothPositiveBand(rF1.asMutSlice())
+  run smoothPositiveBand(rF2.asMutSlice())
+  run smoothPositiveBand(rF3.asMutSlice())
+
+  let o1 = rF1.asSlice()
+  let o2 = rF2.asSlice()
+  let o3 = rF3.asSlice()
+  i = 0
+  while i < n {
+    if actSl[i] && o1[i] > 1.0 && o2[i] > o1[i] + 80.0 {
+      let v1 = o1[i]
+      let v2 = o2[i]
+      let v3 = o3[i]
+      let prevF4 = frames[i].f4
+      let v4 = if v3 > v2 + 80.0 && prevF4 > v3 + 150.0 { prevF4 } else { 0.0 }
+      let mut cnt: usize = 2
+      if v3 > v2 + 80.0 { cnt = 3 }
+      if v4 > v3 + 150.0 { cnt = 4 }
+      frames[i].f1 = v1
+      frames[i].f2 = v2
+      frames[i].f3 = v3
+      frames[i].f4 = v4
+      frames[i].count = cnt
+      frames[i].tracked = true
+    } else {
+      frames[i].f1 = 0.0
+      frames[i].f2 = 0.0
+      frames[i].f3 = 0.0
+      frames[i].f4 = 0.0
+      frames[i].count = 0
+      frames[i].tracked = false
     }
     i = i + 1
   }

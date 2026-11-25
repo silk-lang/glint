@@ -193,6 +193,32 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
   ) -> i32 as "glint#ov_lib_delete_entry"
   unsafe extern "C" fn ov_lib_get_notes(out: ?[*]mut u8, cap: i32) -> i32 as "glint#ov_lib_get_notes"
   unsafe extern "C" fn ov_lib_set_notes(relDir: ?[*]const u8, relDirLen: usize, notes: ?[*]const u8, notesLen: usize) -> i32 as "glint#ov_lib_set_notes"
+
+  unsafe extern "C" fn ov_neural_request(
+    jobId: i32,
+    isRef: i32,
+    samples: ?[*]const f32,
+    count: i32,
+    sampleRate: f64,
+    fmin: f64,
+    fmax: f64,
+  ) -> () as "glint#ov_neural_request"
+  unsafe extern "C" fn ov_neural_pitch_count() -> i32 as "glint#ov_neural_pitch_count"
+  unsafe extern "C" fn ov_neural_copy_pitch(
+    times: ?[*]mut f64,
+    hz: ?[*]mut f64,
+    conf: ?[*]mut f64,
+    maxCount: i32,
+  ) -> i32 as "glint#ov_neural_copy_pitch"
+  unsafe extern "C" fn ov_neural_formant_count() -> i32 as "glint#ov_neural_formant_count"
+  unsafe extern "C" fn ov_neural_copy_formants(
+    times: ?[*]mut f64,
+    f1: ?[*]mut f64,
+    f2: ?[*]mut f64,
+    f3: ?[*]mut f64,
+    maxCount: i32,
+  ) -> i32 as "glint#ov_neural_copy_formants"
+  unsafe extern "C" fn ov_neural_status() -> i32 as "glint#ov_neural_status"
 } else {
   unsafe extern "C" fn ov_audio_refresh_devices() -> i32
   unsafe extern "C" fn ov_audio_input_count() -> i32
@@ -1247,4 +1273,110 @@ pub fn setInputDevice(devId: u32) -> bool {
 
 pub fn setOutputDevice(devId: u32) -> bool {
   return unsafe ov_audio_set_output_device(devId) != 0
+}
+
+pub fn neuralRequest(
+  jobId: i32,
+  isRef: bool,
+  samples: &[f32],
+  sampleRate: f64,
+  fmin: f64,
+  fmax: f64,
+) -> () {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    if samples.length < 64 {
+      return ()
+    }
+    unsafe ov_neural_request(
+      jobId,
+      if isRef { 1 } else { 0 },
+      Pointer.fromSlice(samples),
+      usize.toI32(samples.length),
+      sampleRate,
+      fmin,
+      fmax,
+    )
+  } else {
+    drop jobId
+    drop isRef
+    drop samples
+    drop sampleRate
+    drop fmin
+    drop fmax
+  }
+}
+
+pub fn neuralPitchCount() -> usize {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    let n = unsafe ov_neural_pitch_count()
+    return if n > 0 { i32.toUsize(n) } else { 0 }
+  } else {
+    return 0
+  }
+}
+
+pub fn neuralCopyPitch(times: &mut [f64], hz: &mut [f64], conf: &mut [f64]) -> usize {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    let mut cap = times.length
+    if hz.length < cap { cap = hz.length }
+    if conf.length < cap { cap = conf.length }
+    if cap == 0 {
+      return 0
+    }
+    let n = unsafe ov_neural_copy_pitch(
+      Pointer.fromMutSlice(move times),
+      Pointer.fromMutSlice(move hz),
+      Pointer.fromMutSlice(move conf),
+      usize.toI32(cap),
+    )
+    return if n > 0 { i32.toUsize(n) } else { 0 }
+  } else {
+    drop times
+    drop hz
+    drop conf
+    return 0
+  }
+}
+
+pub fn neuralFormantCount() -> usize {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    let n = unsafe ov_neural_formant_count()
+    return if n > 0 { i32.toUsize(n) } else { 0 }
+  } else {
+    return 0
+  }
+}
+
+pub fn neuralCopyFormants(times: &mut [f64], f1: &mut [f64], f2: &mut [f64], f3: &mut [f64]) -> usize {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    let mut cap = times.length
+    if f1.length < cap { cap = f1.length }
+    if f2.length < cap { cap = f2.length }
+    if f3.length < cap { cap = f3.length }
+    if cap == 0 {
+      return 0
+    }
+    let n = unsafe ov_neural_copy_formants(
+      Pointer.fromMutSlice(move times),
+      Pointer.fromMutSlice(move f1),
+      Pointer.fromMutSlice(move f2),
+      Pointer.fromMutSlice(move f3),
+      usize.toI32(cap),
+    )
+    return if n > 0 { i32.toUsize(n) } else { 0 }
+  } else {
+    drop times
+    drop f1
+    drop f2
+    drop f3
+    return 0
+  }
+}
+
+pub fn neuralStatus() -> i32 {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    return unsafe ov_neural_status()
+  } else {
+    return 0
+  }
 }

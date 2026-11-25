@@ -20,11 +20,15 @@ rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 cp "$ROOT_DIR/web/index.html" "$OUT_DIR/index.html"
 cp "$ROOT_DIR/web/glint-host.js" "$OUT_DIR/glint-host.js"
+cp "$ROOT_DIR/web/neural-worker.js" "$OUT_DIR/neural-worker.js"
 cp "$DOM_JS" "$OUT_DIR/silk-ui-dom.js"
 cp "$ROOT_DIR/styles/app.css" "$OUT_DIR/app.css"
 cp "$ROOT_DIR/web-pkg/build/wasm32-unknown-unknown/size/glint-web.wasm" "$OUT_DIR/glint.wasm"
 if [ -d "$ROOT_DIR/web/demos" ]; then
   cp -R "$ROOT_DIR/web/demos" "$OUT_DIR/demos"
+fi
+if [ -d "$ROOT_DIR/web/models" ]; then
+  cp -R "$ROOT_DIR/web/models" "$OUT_DIR/models"
 fi
 
 echo "Built $OUT_DIR:"

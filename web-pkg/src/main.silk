@@ -303,6 +303,42 @@ effect fn callInner(token: ?*mut u8, op: u32, a: f64, b: f64, c: f64) -> f64
     } else if ns == "redraw_spec" {
       page.host.model.gpuNeedRedraw = true
       run page.syncSpec()
+    } else if ns == "neural_status" {
+      let flags = u32.toI32(parseUint(String.view(&payload)))
+      page.host.send(Message.NeuralStatus { flags: flags })
+      run drain<Overtone, Message, Command, OutOfMemoryError, Dom, &mut Allocator>(&mut page.host, &mut page.dom)
+    } else if ns == "neural_ready" {
+      // payload format: "<jobId>|<isRef>|<hasPitch>|<hasFormants>"
+      let ps = String.view(&payload)
+      let bytes = String.utf8Bytes(ps)
+      let mut parts: [u32; 4] = [0; 4]
+      let mut pIdx: usize = 0
+      let mut cur: u32 = 0
+      let mut k: usize = 0
+      while k < bytes.length {
+        let b = bytes[k]
+        if b == 124 {
+          if pIdx < 4 {
+            parts[pIdx] = cur
+            pIdx = pIdx + 1
+          }
+          cur = 0
+        } else if b >= 48 && b <= 57 {
+          cur = cur * 10 + u8.toU32(b - 48)
+        }
+        k = k + 1
+      }
+      if pIdx < 4 {
+        parts[pIdx] = cur
+      }
+      page.host.send(Message.NeuralReady {
+        jobId: u32.toI32(parts[0]),
+        isRef: parts[1] != 0,
+        hasPitch: parts[2] != 0,
+        hasFormants: parts[3] != 0,
+      })
+      run drain<Overtone, Message, Command, OutOfMemoryError, Dom, &mut Allocator>(&mut page.host, &mut page.dom)
+      run page.syncSpec()
     }
   } else if op == CALL_SCRATCH {
     return usize.toF64(run page.dom.reserve(f64.toUsize(a)))

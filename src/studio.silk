@@ -66,6 +66,7 @@ import formants {
   VOWELS_FEM,
   VOWELS_MASC,
   VOWEL_MODE_BOTH,
+  applyNeuralFormantFrames,
   estimateVowelForMode
 }
 import overlays {
@@ -101,6 +102,7 @@ import pitch {
   PitchFrame,
   PitchTrack,
   SelectionPitchStats,
+  applyNeuralPitchFrames,
   frequencyToNote,
   midiToFrequency,
   parseFreqOrNote,
@@ -369,6 +371,9 @@ pub union Message {
   ToggleFormantBit { pub bit: u32 },
   SetFormantMask { pub mask: u32 },
   SetBottomLaneTab { pub pitch: bool },
+  ToggleNeural,
+  NeuralReady { pub jobId: i32, pub isRef: bool, pub hasPitch: bool, pub hasFormants: bool },
+  NeuralStatus { pub flags: i32 },
   // Hillenbrand (1995) Gendered Vowel Space mode + click vowel -> F1/F2/F3 guides
   SetVowelMode { pub mode: u32 },
   ApplyVowelGuides { pub idx: usize, pub useMasc: bool },
@@ -688,6 +693,12 @@ pub struct Overtone {
   // Pending dialog commands consumed by host.silk
   pub pendingOpenDialog: bool,
   pub pendingSaveDialog: bool,
+
+  // Neural ONNX pitch (SwiftF0) & formants (FormantsTracker) state
+  pub useNeural: bool,
+  pub takeNeuralGen: i32,
+  pub refNeuralGen: i32,
+  pub neuralStatusFlags: i32,
 }
 
 effect fn copyF32List(src: &[f32]) -> List<f32>
@@ -1011,6 +1022,11 @@ impl Overtone {
 
       pendingOpenDialog: false,
       pendingSaveDialog: false,
+
+      useNeural: true,
+      takeNeuralGen: 0,
+      refNeuralGen: 0,
+      neuralStatusFlags: 0,
     }
 
     audio_native.setVolume(model.volume)
@@ -2369,6 +2385,179 @@ impl Overtone {
     )
     run self.voiceMetrics.finalizeSummary(self.samples.asSlice(), self.sampleRate)
     run self.recomputeCompare()
+    self.requestNeuralForTake()
+  }
+
+  fn requestNeuralForTake(self: &mut Self) -> () {
+    if !self.useNeural || self.recording || self.samples.length() < 64 {
+      return ()
+    }
+    self.takeNeuralGen = self.takeNeuralGen + 1
+    audio_native.neuralRequest(
+      self.takeNeuralGen,
+      false,
+      self.samples.asSlice(),
+      self.sampleRate,
+      self.pitchConfig.floorHz,
+      self.pitchConfig.ceilingHz,
+    )
+  }
+
+  fn requestNeuralForRef(self: &mut Self) -> () {
+    if !self.useNeural || !self.refClip.active || self.refClip.samples.length() < 64 {
+      return ()
+    }
+    self.refNeuralGen = self.refNeuralGen + 1
+    audio_native.neuralRequest(
+      self.refNeuralGen,
+      true,
+      self.refClip.samples.asSlice(),
+      self.refClip.sampleRate,
+      self.pitchConfig.floorHz,
+      self.pitchConfig.ceilingHz,
+    )
+  }
+
+  effect fn applyNeuralReady(self: &mut Self, jobId: i32, isRef: bool, hasPitch: bool, hasFormants: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.useNeural {
+      return ()
+    }
+    if isRef {
+      if !self.refClip.active || jobId != self.refNeuralGen {
+        return ()
+      }
+      if hasPitch {
+        let np = audio_native.neuralPitchCount()
+        if np > 0 {
+          let mut ts = List<f64>.make()
+          let mut hz = List<f64>.make()
+          let mut cf = List<f64>.make()
+          run ts.appendRepeated(0.0, np)
+          run hz.appendRepeated(0.0, np)
+          run cf.appendRepeated(0.0, np)
+          let got = audio_native.neuralCopyPitch(ts.asMutSlice(), hz.asMutSlice(), cf.asMutSlice())
+          if got > 0 {
+            applyNeuralPitchFrames(
+              self.refClip.pitchFrames.asMutSlice(),
+              ts.asSlice(),
+              hz.asSlice(),
+              cf.asSlice(),
+              self.pitchConfig.floorHz,
+              self.pitchConfig.ceilingHz,
+              self.pitchConfig.intensityFloorDb,
+              self.displayClarity,
+            )
+          }
+        }
+      }
+      if hasFormants {
+        let nf = audio_native.neuralFormantCount()
+        if nf > 0 {
+          let mut fts = List<f64>.make()
+          let mut f1 = List<f64>.make()
+          let mut f2 = List<f64>.make()
+          let mut f3 = List<f64>.make()
+          run fts.appendRepeated(0.0, nf)
+          run f1.appendRepeated(0.0, nf)
+          run f2.appendRepeated(0.0, nf)
+          run f3.appendRepeated(0.0, nf)
+          let got = audio_native.neuralCopyFormants(fts.asMutSlice(), f1.asMutSlice(), f2.asMutSlice(), f3.asMutSlice())
+          if got > 0 {
+            run applyNeuralFormantFrames(
+              self.refClip.formantFrames.asMutSlice(),
+              self.refClip.pitchFrames.asSlice(),
+              self.displayClarity,
+              fts.asSlice(),
+              f1.asSlice(),
+              f2.asSlice(),
+              f3.asSlice(),
+            )
+          }
+        }
+      }
+      let mut vm = VoiceMetricsTrack.empty()
+      drop run vm.update(
+        self.refClip.samples.asSlice(),
+        self.refClip.sampleRate,
+        self.refClip.pitchFrames.asSlice(),
+        self.refClip.formantFrames.asSlice(),
+        self.displayClarity,
+      )
+      run vm.finalizeSummary(self.refClip.samples.asSlice(), self.refClip.sampleRate)
+      self.refClip.voiceFrames = move vm.frames
+      self.refClip.summary = vm.summary
+      self.refClip.ltas = vm.ltas
+      self.refClip.hasLtas = vm.hasLtas
+      run self.recomputeCompare()
+      run self.rebuildDrawings(true)
+      return ()
+    }
+
+    if self.recording || jobId != self.takeNeuralGen {
+      return ()
+    }
+    if hasPitch {
+      let np = audio_native.neuralPitchCount()
+      if np > 0 {
+        let mut ts = List<f64>.make()
+        let mut hz = List<f64>.make()
+        let mut cf = List<f64>.make()
+        run ts.appendRepeated(0.0, np)
+        run hz.appendRepeated(0.0, np)
+        run cf.appendRepeated(0.0, np)
+        let got = audio_native.neuralCopyPitch(ts.asMutSlice(), hz.asMutSlice(), cf.asMutSlice())
+        if got > 0 {
+          applyNeuralPitchFrames(
+            self.pitchTrack.frames.asMutSlice(),
+            ts.asSlice(),
+            hz.asSlice(),
+            cf.asSlice(),
+            self.pitchConfig.floorHz,
+            self.pitchConfig.ceilingHz,
+            self.pitchConfig.intensityFloorDb,
+            self.displayClarity,
+          )
+        }
+      }
+    }
+    if hasFormants {
+      let nf = audio_native.neuralFormantCount()
+      if nf > 0 {
+        let mut fts = List<f64>.make()
+        let mut f1 = List<f64>.make()
+        let mut f2 = List<f64>.make()
+        let mut f3 = List<f64>.make()
+        run fts.appendRepeated(0.0, nf)
+        run f1.appendRepeated(0.0, nf)
+        run f2.appendRepeated(0.0, nf)
+        run f3.appendRepeated(0.0, nf)
+        let got = audio_native.neuralCopyFormants(fts.asMutSlice(), f1.asMutSlice(), f2.asMutSlice(), f3.asMutSlice())
+        if got > 0 {
+          run applyNeuralFormantFrames(
+            self.formantTrack.frames.asMutSlice(),
+            self.pitchTrack.frames.asSlice(),
+            self.displayClarity,
+            fts.asSlice(),
+            f1.asSlice(),
+            f2.asSlice(),
+            f3.asSlice(),
+          )
+        }
+      }
+    }
+    self.voiceMetrics.reset()
+    drop run self.voiceMetrics.update(
+      self.samples.asSlice(),
+      self.sampleRate,
+      self.pitchTrack.frames.asSlice(),
+      self.formantTrack.frames.asSlice(),
+      self.displayClarity,
+    )
+    run self.voiceMetrics.finalizeSummary(self.samples.asSlice(), self.sampleRate)
+    run self.recomputeCompare()
+    run self.rebuildDrawings(true)
   }
 
   /// Re-analyzes the currently pinned Reference clip using the active pitch range, clarity,
@@ -2397,6 +2586,7 @@ impl Overtone {
     self.refClip.summary = vm.summary
     self.refClip.ltas = vm.ltas
     self.refClip.hasLtas = vm.hasLtas
+    self.requestNeuralForRef()
   }
 
   effect fn reanalyzeFormants(self: &mut Self) -> ()
@@ -2459,6 +2649,7 @@ impl Overtone {
     run self.recomputeCompare()
     run self.reloadTree(false)
     run self.startBgScoring(false)
+    self.requestNeuralForRef()
   }
 
   effect fn pinCurrentAsReference(self: &mut Self) -> ()
@@ -2901,6 +3092,7 @@ impl Overtone {
     )
     run self.voiceMetrics.finalizeSummary(self.samples.asSlice(), self.sampleRate)
     run self.recomputeCompare()
+    self.requestNeuralForTake()
     let dur = self.clipDuration()
     self.cursorSec = dur
     if dur > 0.05 {
@@ -3590,6 +3782,8 @@ impl Overtone {
         vfOpt,
         self.refClip.voiceFrames.asSlice(),
         self.refClip.summary,
+        self.compare.points.asSlice(),
+        inspectSec,
         self.refClip.active,
       )
       self.sliceDrawing = run buildSpectrumSliceDrawing(
@@ -3613,6 +3807,8 @@ impl Overtone {
         self.voiceMetrics.summary,
         self.refClip.voiceFrames.asSlice(),
         self.refClip.summary,
+        self.compare.points.asSlice(),
+        inspectSec,
         self.refClip.active,
         self.vowelMode,
       )
@@ -3782,6 +3978,8 @@ impl Overtone {
       vfOpt,
       self.refClip.voiceFrames.asSlice(),
       self.refClip.summary,
+      self.compare.points.asSlice(),
+      inspectSec,
       self.refClip.active,
     )
     self.sliceDrawing = run buildSpectrumSliceDrawing(
@@ -3813,6 +4011,8 @@ impl Overtone {
       self.voiceMetrics.summary,
       self.refClip.voiceFrames.asSlice(),
       self.refClip.summary,
+      self.compare.points.asSlice(),
+      inspectSec,
       self.refClip.active,
       self.vowelMode,
     )
@@ -5365,6 +5565,27 @@ impl Overtone {
       Message.ToggleHeatmap => {
         self.showHeatmap = !self.showHeatmap
         run self.updateViewportDrawings()
+      }
+
+      Message.ToggleNeural => {
+        self.useNeural = !self.useNeural
+        if self.useNeural {
+          self.requestNeuralForTake()
+          self.requestNeuralForRef()
+        } else {
+          run self.analyzeAll()
+          run self.reanalyzeRefClip()
+          run self.recomputeCompare()
+          run self.rebuildDrawings(true)
+        }
+      }
+
+      Message.NeuralReady { jobId, isRef, hasPitch, hasFormants } => {
+        run self.applyNeuralReady(jobId, isRef, hasPitch, hasFormants)
+      }
+
+      Message.NeuralStatus { flags } => {
+        self.neuralStatusFlags = flags
       }
 
       Message.SetHeatmapMetric { metric } => {

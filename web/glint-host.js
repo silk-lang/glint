@@ -97,42 +97,40 @@ async function seedDefaultDemosIfNeeded(seededVersion) {
     const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
     const decodeCtx = OfflineCtx ? new OfflineCtx(1, 1, 44100) : ensureAudioCtx();
 
-    await Promise.all(
-      (manifest.clips || []).map(async (item) => {
-        try {
-          const r = await fetch(`./demos/${encodeURIComponent(item.file)}`);
-          if (!r.ok) return;
-          const arr = await r.arrayBuffer();
-          const audioBuf = await decodeCtx.decodeAudioData(arr);
-          const mono = new Float32Array(audioBuf.length);
-          const chCount = audioBuf.numberOfChannels;
-          for (let ch = 0; ch < chCount; ch++) {
-            const data = audioBuf.getChannelData(ch);
-            for (let i = 0; i < mono.length; i++) mono[i] += data[i] / chCount;
-          }
-          const name = item.name || `${stripExt(item.file)}.wav`;
-          const fullPath = `idb://${joinRel(folderRel, name)}`;
-          if (lib.clips.has(fullPath)) return;
-          const rec = {
-            fullPath,
-            relDir: folderRel,
-            name,
-            displayName: stripExt(name),
-            samples: mono,
-            sampleRate: audioBuf.sampleRate,
-            rating: 0,
-            starred: false,
-            comment: item.comment || "",
-            scoresByRef: {},
-            modified: nowStamp(),
-          };
-          lib.clips.set(fullPath, rec);
-          idbPut("clips", rec);
-        } catch (err) {
-          console.warn("Failed to seed demo clip:", item.file, err);
+    for (const item of manifest.clips || []) {
+      try {
+        const r = await fetch(`./demos/${encodeURIComponent(item.file)}`);
+        if (!r.ok) continue;
+        const arr = await r.arrayBuffer();
+        const audioBuf = await decodeCtx.decodeAudioData(arr);
+        const mono = new Float32Array(audioBuf.length);
+        const chCount = audioBuf.numberOfChannels;
+        for (let ch = 0; ch < chCount; ch++) {
+          const data = audioBuf.getChannelData(ch);
+          for (let i = 0; i < mono.length; i++) mono[i] += data[i] / chCount;
         }
-      }),
-    );
+        const name = item.name || `${stripExt(item.file)}.wav`;
+        const fullPath = `idb://${joinRel(folderRel, name)}`;
+        if (lib.clips.has(fullPath)) continue;
+        const rec = {
+          fullPath,
+          relDir: folderRel,
+          name,
+          displayName: stripExt(name),
+          samples: mono,
+          sampleRate: audioBuf.sampleRate,
+          rating: 0,
+          starred: false,
+          comment: item.comment || "",
+          scoresByRef: {},
+          modified: nowStamp(),
+        };
+        lib.clips.set(fullPath, rec);
+        idbPut("clips", rec);
+      } catch (err) {
+        console.warn("Failed to seed demo clip:", item.file, err);
+      }
+    }
 
     idbPut("meta", { key: "demosVersion", value: targetVer });
   } catch (err) {
@@ -1249,13 +1247,83 @@ const glintImports = {
   spec_draw: (ptr, count) => {
     specGl.draw(new Float32Array(memBuf(), ptr, count));
   },
+
+  // Neural Pitch (SwiftF0) + Formants (FormantsTracker) Worker Bridge
+  ov_neural_request: (jobId, isRef, samplesPtr, count, sampleRate, fmin, fmax) => {
+    if (!neuralWorker || count < 64) return;
+    const copy = new Float32Array(count);
+    copy.set(new Float32Array(memBuf(), samplesPtr, count));
+    neuralWorker.postMessage(
+      { type: "analyze", jobId, isRef, samples: copy, sampleRate, fmin, fmax },
+      [copy.buffer],
+    );
+  },
+  ov_neural_pitch_count: () => (neuralResult?.f0Times ? neuralResult.f0Times.length : 0),
+  ov_neural_copy_pitch: (timesPtr, hzPtr, confPtr, maxCount) => {
+    if (!neuralResult?.f0Times) return 0;
+    const n = Math.min(maxCount, neuralResult.f0Times.length);
+    new Float64Array(memBuf(), timesPtr, n).set(neuralResult.f0Times.subarray(0, n));
+    new Float64Array(memBuf(), hzPtr, n).set(neuralResult.f0Hz.subarray(0, n));
+    new Float64Array(memBuf(), confPtr, n).set(neuralResult.f0Conf.subarray(0, n));
+    return n;
+  },
+  ov_neural_formant_count: () => (neuralResult?.fmtTimes ? neuralResult.fmtTimes.length : 0),
+  ov_neural_copy_formants: (timesPtr, f1Ptr, f2Ptr, f3Ptr, maxCount) => {
+    if (!neuralResult?.fmtTimes) return 0;
+    const n = Math.min(maxCount, neuralResult.fmtTimes.length);
+    new Float64Array(memBuf(), timesPtr, n).set(neuralResult.fmtTimes.subarray(0, n));
+    new Float64Array(memBuf(), f1Ptr, n).set(neuralResult.fmtF1.subarray(0, n));
+    new Float64Array(memBuf(), f2Ptr, n).set(neuralResult.fmtF2.subarray(0, n));
+    new Float64Array(memBuf(), f3Ptr, n).set(neuralResult.fmtF3.subarray(0, n));
+    return n;
+  },
+  ov_neural_status: () => neuralStatusFlags,
 };
+
+let neuralWorker = null;
+let neuralResult = null;
+let neuralStatusFlags = 0;
+const pendingNeuralPosts = [];
+
+function initNeuralWorker() {
+  if (typeof Worker === "undefined") return;
+  try {
+    neuralWorker = new Worker(new URL("./neural-worker.js", import.meta.url), { type: "module" });
+    neuralWorker.addEventListener("message", (ev) => {
+      const msg = ev.data;
+      if (!msg) return;
+      if (msg.type === "status") {
+        neuralStatusFlags = msg.flags | 0;
+        if (mountedPage) {
+          mountedPage.post("neural_status", `${neuralStatusFlags}`);
+        } else {
+          pendingNeuralPosts.push(["neural_status", `${neuralStatusFlags}`]);
+        }
+      } else if (msg.type === "result") {
+        neuralResult = msg;
+        const payload = `${msg.jobId}|${msg.isRef ? 1 : 0}|${msg.hasPitch ? 1 : 0}|${msg.hasFormants ? 1 : 0}`;
+        if (mountedPage) {
+          mountedPage.post("neural_ready", payload);
+        } else {
+          pendingNeuralPosts.push(["neural_ready", payload]);
+        }
+      }
+    });
+    neuralWorker.addEventListener("error", (err) => {
+      console.warn("[Glint Neural] Worker error:", err.message || err);
+    });
+    neuralWorker.postMessage({ type: "warmup" });
+  } catch (err) {
+    console.warn("[Glint Neural] Failed to start worker:", err);
+  }
+}
 
 // ============================================================================
 // 5. Bootstrapping & Browser Event Wiring
 // ============================================================================
 
 async function boot() {
+  initNeuralWorker();
   await hydrateLibrary();
   await enumerateBrowserDevices();
 
@@ -1275,6 +1343,12 @@ async function boot() {
     });
   } finally {
     WebAssembly.instantiate = origInstantiate;
+  }
+
+  // Flush any neural events that arrived while WASM was mounting
+  while (pendingNeuralPosts.length > 0) {
+    const [evName, evPayload] = pendingNeuralPosts.shift();
+    mountedPage.post(evName, evPayload);
   }
 
   const loader = document.getElementById("glint-loading");

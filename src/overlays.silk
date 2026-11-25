@@ -1360,6 +1360,34 @@ pub fn vowelY(f1: f64, height: f32) -> f32 {
   return f64.toF32(c) * height
 }
 
+fn nearestAlignedAt(alignedRef: &[AlignedRefPoint], t: f64) -> Option<AlignedRefPoint> {
+  if alignedRef.length == 0 {
+    return Option<AlignedRefPoint>.None
+  }
+  let mut lo: usize = 0
+  let mut hi: usize = alignedRef.length - 1
+  while lo < hi {
+    let mid = (lo + hi) / 2
+    if alignedRef[mid].time < t {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  let mut best = lo
+  if lo > 0 {
+    let d0 = f64.abs(alignedRef[lo - 1].time - t)
+    let d1 = f64.abs(alignedRef[lo].time - t)
+    if d0 < d1 {
+      best = lo - 1
+    }
+  }
+  if f64.abs(alignedRef[best].time - t) <= 0.12 {
+    return Option<AlignedRefPoint>.some(alignedRef[best])
+  }
+  return Option<AlignedRefPoint>.None
+}
+
 pub effect fn buildVowelChartDrawing(
   width: f32,
   height: f32,
@@ -1368,6 +1396,8 @@ pub effect fn buildVowelChartDrawing(
   takeSummary: VoiceSummary,
   refFrames: &[VoiceFrame],
   refSummary: VoiceSummary,
+  alignedRef: &[AlignedRefPoint],
+  inspectSec: f64,
   hasRef: bool,
   vowelMode: u32,
 ) -> Drawing
@@ -1585,32 +1615,97 @@ pub effect fn buildVowelChartDrawing(
     }
   }
 
-  // Current voice formant position (vermilion cursor dot)
+  // Live moving dots at playhead/cursor: Reference (teal) & You (vermilion) moving together!
+  let mut hasLiveYou = false
+  let mut youX: f32 = 0.0
+  let mut youY: f32 = 0.0
   if let Option<FormantFrame>.Some { value: ff } = formant {
-    if ff.count >= 2 && ff.f1 > 150.0 && ff.f2 > ff.f1 {
-      let cx = vowelX(ff.f2, width)
-      let cy = vowelY(ff.f1, height)
-      run cmds.append(
-        CanvasCommand.FillRect {
-          x: cx - 6.0,
-          y: cy - 6.0,
-          width: 12.0,
-          height: 12.0,
-          radius: 6.0,
-          color: Rgba<f32> { r: 0.851, g: 0.220, b: 0.118, a: 0.22 },
-        },
-      )
-      run cmds.append(
-        CanvasCommand.FillRect {
-          x: cx - 3.0,
-          y: cy - 3.0,
-          width: 6.0,
-          height: 6.0,
-          radius: 3.0,
-          color: COL_VERMILION,
-        },
-      )
+    if ff.tracked && ff.count >= 2 && ff.f1 > 150.0 && ff.f2 > ff.f1 {
+      hasLiveYou = true
+      youX = vowelX(ff.f2, width)
+      youY = vowelY(ff.f1, height)
     }
+  }
+  let mut hasLiveRef = false
+  let mut refX: f32 = 0.0
+  let mut refY: f32 = 0.0
+  if hasRef {
+    if let Option<AlignedRefPoint>.Some { value: rp } = nearestAlignedAt(alignedRef, inspectSec) {
+      if rp.voiced && rp.hasFormants && rp.f1 > 150.0 && rp.f2 > rp.f1 {
+        hasLiveRef = true
+        refX = vowelX(rp.f2, width)
+        refY = vowelY(rp.f1, height)
+      }
+    }
+  }
+  if hasLiveYou && hasLiveRef {
+    run cmds.append(CanvasCommand.MoveTo { x: youX, y: youY })
+    run cmds.append(CanvasCommand.LineTo { x: refX, y: refY })
+    run cmds.append(CanvasCommand.Stroke { color: Rgba<f32> { r: 0.180, g: 0.490, b: 0.588, a: 0.42 }, width: 1.2 })
+  }
+  if hasLiveRef {
+    run cmds.append(
+      CanvasCommand.FillRect {
+        x: refX - 7.0,
+        y: refY - 7.0,
+        width: 14.0,
+        height: 14.0,
+        radius: 7.0,
+        color: Rgba<f32> { r: 0.180, g: 0.490, b: 0.588, a: 0.24 },
+      },
+    )
+    run cmds.append(
+      CanvasCommand.FillRect {
+        x: refX - 4.2,
+        y: refY - 4.2,
+        width: 8.4,
+        height: 8.4,
+        radius: 4.2,
+        color: Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: 0.95 },
+      },
+    )
+    run cmds.append(
+      CanvasCommand.FillRect {
+        x: refX - 3.2,
+        y: refY - 3.2,
+        width: 6.4,
+        height: 6.4,
+        radius: 3.2,
+        color: COL_REF_TEAL,
+      },
+    )
+  }
+  if hasLiveYou {
+    run cmds.append(
+      CanvasCommand.FillRect {
+        x: youX - 7.0,
+        y: youY - 7.0,
+        width: 14.0,
+        height: 14.0,
+        radius: 7.0,
+        color: Rgba<f32> { r: 0.851, g: 0.220, b: 0.118, a: 0.24 },
+      },
+    )
+    run cmds.append(
+      CanvasCommand.FillRect {
+        x: youX - 4.2,
+        y: youY - 4.2,
+        width: 8.4,
+        height: 8.4,
+        radius: 4.2,
+        color: Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: 0.95 },
+      },
+    )
+    run cmds.append(
+      CanvasCommand.FillRect {
+        x: youX - 3.2,
+        y: youY - 3.2,
+        width: 6.4,
+        height: 6.4,
+        radius: 3.2,
+        color: COL_VERMILION,
+      },
+    )
   }
 
   return run Drawing.make(move cmds)
@@ -2162,6 +2257,8 @@ pub effect fn buildSizeWeightPadDrawing(
   currentFrame: Option<VoiceFrame>,
   refFrames: &[VoiceFrame],
   refSummary: VoiceSummary,
+  alignedRef: &[AlignedRefPoint],
+  inspectSec: f64,
   hasRef: bool,
 ) -> Drawing
   ! OutOfMemoryError
@@ -2322,32 +2419,97 @@ pub effect fn buildSizeWeightPadDrawing(
     }
   }
 
-  // Live cursor dot (vermilion)
+  // Live moving dots at playhead/cursor: Reference (teal) & You (vermilion) moving together!
+  let mut hasLiveYou = false
+  let mut youX: f32 = 0.0
+  let mut youY: f32 = 0.0
   if let Option<VoiceFrame>.Some { value: cf } = currentFrame {
     if cf.voiced {
-      let lx = pad + f64.toF32(cf.sizeNorm) * iw
-      let ly = pad + (1.0 - f64.toF32(cf.weightLightNorm)) * ih
-      run cmds.append(
-        CanvasCommand.FillRect {
-          x: lx - 5.5,
-          y: ly - 5.5,
-          width: 11.0,
-          height: 11.0,
-          radius: 5.5,
-          color: Rgba<f32> { r: 0.851, g: 0.220, b: 0.118, a: 0.22 },
-        },
-      )
-      run cmds.append(
-        CanvasCommand.FillRect {
-          x: lx - 2.8,
-          y: ly - 2.8,
-          width: 5.6,
-          height: 5.6,
-          radius: 2.8,
-          color: COL_VERMILION,
-        },
-      )
+      hasLiveYou = true
+      youX = pad + f64.toF32(cf.sizeNorm) * iw
+      youY = pad + (1.0 - f64.toF32(cf.weightLightNorm)) * ih
     }
+  }
+  let mut hasLiveRef = false
+  let mut refX: f32 = 0.0
+  let mut refY: f32 = 0.0
+  if hasRef {
+    if let Option<AlignedRefPoint>.Some { value: rp } = nearestAlignedAt(alignedRef, inspectSec) {
+      if rp.voiced {
+        hasLiveRef = true
+        refX = pad + f64.toF32(rp.sizeNorm) * iw
+        refY = pad + (1.0 - f64.toF32(rp.weightLightNorm)) * ih
+      }
+    }
+  }
+  if hasLiveYou && hasLiveRef {
+    run cmds.append(CanvasCommand.MoveTo { x: youX, y: youY })
+    run cmds.append(CanvasCommand.LineTo { x: refX, y: refY })
+    run cmds.append(CanvasCommand.Stroke { color: Rgba<f32> { r: 0.180, g: 0.490, b: 0.588, a: 0.42 }, width: 1.2 })
+  }
+  if hasLiveRef {
+    run cmds.append(
+      CanvasCommand.FillRect {
+        x: refX - 6.8,
+        y: refY - 6.8,
+        width: 13.6,
+        height: 13.6,
+        radius: 6.8,
+        color: Rgba<f32> { r: 0.180, g: 0.490, b: 0.588, a: 0.24 },
+      },
+    )
+    run cmds.append(
+      CanvasCommand.FillRect {
+        x: refX - 4.0,
+        y: refY - 4.0,
+        width: 8.0,
+        height: 8.0,
+        radius: 4.0,
+        color: Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: 0.95 },
+      },
+    )
+    run cmds.append(
+      CanvasCommand.FillRect {
+        x: refX - 3.0,
+        y: refY - 3.0,
+        width: 6.0,
+        height: 6.0,
+        radius: 3.0,
+        color: COL_REF_TEAL,
+      },
+    )
+  }
+  if hasLiveYou {
+    run cmds.append(
+      CanvasCommand.FillRect {
+        x: youX - 6.8,
+        y: youY - 6.8,
+        width: 13.6,
+        height: 13.6,
+        radius: 6.8,
+        color: Rgba<f32> { r: 0.851, g: 0.220, b: 0.118, a: 0.24 },
+      },
+    )
+    run cmds.append(
+      CanvasCommand.FillRect {
+        x: youX - 4.0,
+        y: youY - 4.0,
+        width: 8.0,
+        height: 8.0,
+        radius: 4.0,
+        color: Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: 0.95 },
+      },
+    )
+    run cmds.append(
+      CanvasCommand.FillRect {
+        x: youX - 3.0,
+        y: youY - 3.0,
+        width: 6.0,
+        height: 6.0,
+        radius: 3.0,
+        color: COL_VERMILION,
+      },
+    )
   }
 
   return run Drawing.make(move cmds)

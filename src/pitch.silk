@@ -768,6 +768,92 @@ impl PitchTrack {
   }
 }
 
+/// Applies SwiftF0 neural pitch predictions `(times, hz, conf)` onto an existing uniform-hop `PitchFrame` track,
+/// preserving each frame's measured `intensityDb` and O(1) constant-hop indexing.
+pub fn applyNeuralPitchFrames(
+  frames: &mut [PitchFrame],
+  times: &[f64],
+  hz: &[f64],
+  conf: &[f64],
+  floorHz: f64,
+  ceilingHz: f64,
+  intensityFloorDb: f64,
+  minClarity: f64,
+) -> () {
+  if frames.length == 0 || times.length == 0 || hz.length == 0 || conf.length == 0 {
+    return ()
+  }
+  let m = if times.length < hz.length {
+    if times.length < conf.length { times.length } else { conf.length }
+  } else {
+    if hz.length < conf.length { hz.length } else { conf.length }
+  }
+  if m == 0 {
+    return ()
+  }
+  // SwiftF0 confidence is calibrated around 0.50; let the user's Clarity slider gently nudge it in [0.25..0.85]
+  let effThresh = f64.max(0.25, f64.min(0.85, minClarity))
+
+  let mut j: usize = 0
+  let mut i: usize = 0
+  while i < frames.length {
+    let t = frames[i].time
+    while j + 1 < m && times[j + 1] < t {
+      j = j + 1
+    }
+    let mut estHz: f64 = 0.0
+    let mut estConf: f64 = 0.0
+    if j + 1 < m && t >= times[j] && t <= times[j + 1] && (times[j + 1] - times[j]) > 1.0e-6 {
+      let alpha = (t - times[j]) / (times[j + 1] - times[j])
+      let c0 = conf[j]
+      let c1 = conf[j + 1]
+      estConf = c0 + alpha * (c1 - c0)
+      if c0 >= effThresh && c1 >= effThresh && hz[j] > 20.0 && hz[j + 1] > 20.0 && semitonesBetween(hz[j], hz[j + 1]) <= 6.0 {
+        let logH = f64.log2(hz[j]) + alpha * (f64.log2(hz[j + 1]) - f64.log2(hz[j]))
+        estHz = f64.pow(2.0, logH)
+      } else if alpha < 0.5 {
+        estHz = hz[j]
+        estConf = c0
+      } else {
+        estHz = hz[j + 1]
+        estConf = c1
+      }
+    } else {
+      let mut best = j
+      if j + 1 < m && f64.abs(times[j + 1] - t) < f64.abs(times[j] - t) {
+        best = j + 1
+      }
+      if f64.abs(times[best] - t) <= 0.032 {
+        estHz = hz[best]
+        estConf = conf[best]
+      }
+    }
+
+    let ok = estConf >= effThresh
+      && estHz >= floorHz
+      && estHz <= ceilingHz
+      && frames[i].intensityDb >= intensityFloorDb
+    frames[i].voiced = ok
+    frames[i].frequency = if ok { estHz } else { 0.0 }
+    frames[i].clarity = estConf
+    i = i + 1
+  }
+
+  // Drop isolated 1-frame blips
+  i = 0
+  while i < frames.length {
+    if frames[i].voiced {
+      let prevV = i > 0 && frames[i - 1].voiced
+      let nextV = i + 1 < frames.length && frames[i + 1].voiced
+      if !prevV && !nextV {
+        frames[i].voiced = false
+        frames[i].frequency = 0.0
+      }
+    }
+    i = i + 1
+  }
+}
+
 /// Praat-exact selection pitch summary (`Pitch_getMean` / `Sampled_getMean` with `interpolate = true`).
 pub struct SelectionPitchStats {
   pub valid: bool,
