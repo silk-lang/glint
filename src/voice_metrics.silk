@@ -435,9 +435,25 @@ impl VoiceMetricsTrack {
   ) -> usize
     ! OutOfMemoryError
     ? &mut Allocator {
+    return run self.updateChunk(samples, sampleRate, pitchFrames, formantFrames, displayClarity, 1000000)
+  }
+
+  /// Processes up to `maxFrames` new voice metric frames for non-blocking progressive analysis.
+  pub effect fn updateChunk(
+    self: &mut Self,
+    samples: &[f32],
+    sampleRate: f64,
+    pitchFrames: &[PitchFrame],
+    formantFrames: &[FormantFrame],
+    displayClarity: f64,
+    maxFrames: usize,
+  ) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
     let mut added: usize = 0
     let mut i = self.frames.length()
-    let maxIdx = pitchFrames.length
+    let rawMax = pitchFrames.length
+    let maxIdx = if i + maxFrames < rawMax { i + maxFrames } else { rawMax }
     while i < maxIdx {
       let pf = pitchFrames[i]
       let voiced = pf.voiced && pf.clarity >= displayClarity && pf.frequency > 45.0

@@ -489,7 +489,14 @@ impl PitchTrack {
   pub effect fn update(self: &mut Self, samples: &[f32]) -> usize
     ! OutOfMemoryError
     ? &mut Allocator {
-    if samples.length < self.windowSize {
+    return run self.updateChunk(samples, 1000000)
+  }
+
+  /// Appends up to `maxFrames` pitch frames for non-blocking progressive analysis.
+  pub effect fn updateChunk(self: &mut Self, samples: &[f32], maxFrames: usize) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if samples.length < self.windowSize || maxFrames == 0 {
       return 0
     }
     let computable = (samples.length - self.windowSize) / self.hopSamples + 1
@@ -497,11 +504,12 @@ impl PitchTrack {
     if computable <= already {
       return 0
     }
+    let target = if already + maxFrames < computable { already + maxFrames } else { computable }
     let halfWin = usize.toF64(self.windowSize) * 0.5
     let mut added: usize = 0
     if let Option<PitchDetector>.Some { value: det } = &mut self.detector {
       let mut idx = already
-      while idx < computable {
+      while idx < target {
         let offset = idx * self.hopSamples
         let time = (usize.toF64(offset) + halfWin) / self.sampleRate
         let mut cands = FrameCandidates.empty(-120.0, 0.0)
@@ -513,6 +521,52 @@ impl PitchTrack {
       }
     }
     return added
+  }
+
+  pub fn totalComputable(self: &Self, sampleCount: usize) -> usize {
+    if sampleCount < self.windowSize {
+      return 0
+    }
+    return (sampleCount - self.windowSize) / self.hopSamples + 1
+  }
+
+  /// Fast-path shell allocation (timestamps + RMS intensityDb only, <1 ms for 60s)
+  /// used when SwiftF0 ONNX is already loaded in the background worker.
+  pub effect fn populateShellFrames(self: &mut Self, samples: &[f32]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.frames.clear()
+    self.candidates.clear()
+    if samples.length < self.windowSize {
+      return ()
+    }
+    let computable = (samples.length - self.windowSize) / self.hopSamples + 1
+    let halfWin = usize.toF64(self.windowSize) * 0.5
+    let step = if self.windowSize > 128 { self.windowSize / 64 } else { 1 }
+    let mut idx: usize = 0
+    while idx < computable {
+      let offset = idx * self.hopSamples
+      let time = (usize.toF64(offset) + halfWin) / self.sampleRate
+      let mut sq: f64 = 0.0
+      let mut cnt: usize = 0
+      let mut j: usize = 0
+      while j < self.windowSize && offset + j < samples.length {
+        let v = f32.toF64(samples[offset + j])
+        sq = sq + v * v
+        cnt = cnt + 1
+        j = j + step
+      }
+      let msq = if cnt > 0 { sq / usize.toF64(cnt) } else { 0.0 }
+      let db = if msq > 1.0e-12 { 4.342944819032518 * f64.log(msq) } else { -120.0 }
+      run self.frames.append(PitchFrame {
+        time: time,
+        frequency: 0.0,
+        clarity: 0.0,
+        intensityDb: db,
+        voiced: false,
+      })
+      idx = idx + 1
+    }
   }
 
   /// Runs Praat's Boersma (1993) Viterbi dynamic-programming path across stored per-frame

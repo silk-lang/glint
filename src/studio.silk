@@ -216,6 +216,13 @@ pub const LAB_SOLO_F2: u32 = 5
 pub const LAB_SOLO_F3: u32 = 6
 pub const LAB_BREATH: u32 = 7
 
+// Progressive non-blocking background analysis stages for long clips
+const BG_ANALYZE_NONE: u32 = 0
+const BG_ANALYZE_PITCH: u32 = 1
+const BG_ANALYZE_FORMANTS: u32 = 2
+const BG_ANALYZE_METRICS: u32 = 3
+const LONG_CLIP_ASYNC_SEC: f64 = 4.5
+
 // Virtualized Explorer row layout metrics (Glint 26px crisp single-line rows)
 pub const EXPLORER_ROW_H: f32 = 26.0
 pub const EXPLORER_ROW_META_H: f32 = 26.0
@@ -841,6 +848,9 @@ pub struct Overtone {
   pub liveNeuralLastReqDur: f64,
   pub liveNeuralInFlight: bool,
   pub neuralStatusFlags: i32,
+  pub bgAnalyzeStage: u32,
+  pub bgAnalyzeWaitingNeural: bool,
+  pub bgAnalyzeDrawFrames: usize,
 
   // Vowel / consonant isolation (Option 1 instant acoustic + Option 2 lazy Allosaurus IPA) & Voice Lab
   pub isolateMode: u32,
@@ -1236,6 +1246,9 @@ impl Overtone {
       liveNeuralLastReqDur: -1.0,
       liveNeuralInFlight: false,
       neuralStatusFlags: 0,
+      bgAnalyzeStage: BG_ANALYZE_NONE,
+      bgAnalyzeWaitingNeural: false,
+      bgAnalyzeDrawFrames: 0,
 
       isolateMode: ISOLATE_FULL,
       isolateTiming: TIMING_INPLACE,
@@ -3520,13 +3533,38 @@ impl Overtone {
   effect fn analyzeAll(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    self.bgAnalyzeStage = BG_ANALYZE_NONE
+    self.bgAnalyzeWaitingNeural = false
+    self.bgAnalyzeDrawFrames = 0
     run self.pitchTrack.reset(self.sampleRate, self.pitchConfig)
+    run self.formantTrack.reset(self.sampleRate, self.formantCeilingHz, self.pitchConfig.hopSeconds)
+    self.voiceMetrics.reset()
+
+    if self.clipDuration() > LONG_CLIP_ASYNC_SEC {
+      self.takeVowelSpans.clear()
+      self.takeVowelIsNeural = false
+      self.requestNeuralForTake()
+      let neuralPitchReady = self.useNeural && (self.neuralStatusFlags & 1) != 0
+      let neuralFmtReady = self.useNeural && (self.neuralStatusFlags & 2) != 0
+      if neuralPitchReady && neuralFmtReady {
+        // ONNX models are already loaded in the background worker: allocate fast <2 ms shells
+        // and skip slow Classic Burg LPC completely so the main thread never stalls.
+        run self.pitchTrack.populateShellFrames(self.samples.asSlice())
+        run self.formantTrack.populateShellFrames(self.samples.asSlice())
+        self.bgAnalyzeWaitingNeural = true
+        self.statusMsg = run String.copy("Analyzing voice in background…")
+        return ()
+      }
+      // Classic mode (or ONNX models still downloading): run time-sliced chunks across animation frames.
+      self.bgAnalyzeStage = BG_ANALYZE_PITCH
+      self.statusMsg = run String.copy("Analyzing pitch & formants…")
+      return ()
+    }
+
     drop run self.pitchTrack.update(self.samples.asSlice())
     run self.pitchTrack.refineViterbi(self.displayClarity)
-    run self.formantTrack.reset(self.sampleRate, self.formantCeilingHz, self.pitchConfig.hopSeconds)
     drop run self.formantTrack.update(self.samples.asSlice())
     run self.formantTrack.refineTracked(self.pitchTrack.frames.asSlice(), self.displayClarity)
-    self.voiceMetrics.reset()
     drop run self.voiceMetrics.update(
       self.samples.asSlice(),
       self.sampleRate,
@@ -3538,6 +3576,73 @@ impl Overtone {
     run self.recomputeCompare()
     self.requestNeuralForTake()
     run self.refreshVowelAnalysis(false)
+  }
+
+  /// Time-sliced background DSP analysis for long clips (~5–8 ms per animation frame).
+  effect fn stepBgAnalyze(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.bgAnalyzeStage == BG_ANALYZE_NONE || self.recording || self.samples.length() < 64 {
+      self.bgAnalyzeStage = BG_ANALYZE_NONE
+      return ()
+    }
+    if self.bgAnalyzeStage == BG_ANALYZE_PITCH {
+      let added = run self.pitchTrack.updateChunk(self.samples.asSlice(), 140)
+      let total = self.pitchTrack.totalComputable(self.samples.length())
+      if self.pitchTrack.frames.length() >= total || added == 0 {
+        run self.pitchTrack.refineViterbi(self.displayClarity)
+        if self.useNeural && (self.neuralStatusFlags & 2) != 0 {
+          run self.formantTrack.populateShellFrames(self.samples.asSlice())
+          self.bgAnalyzeStage = BG_ANALYZE_NONE
+          self.bgAnalyzeWaitingNeural = true
+          self.bgAnalyzeDrawFrames = 0
+        } else {
+          self.bgAnalyzeStage = BG_ANALYZE_FORMANTS
+          self.bgAnalyzeDrawFrames = 0
+        }
+        run self.updateViewportDrawings()
+        run self.updateReadouts(false)
+      } else if self.pitchTrack.frames.length() >= self.bgAnalyzeDrawFrames + 600 {
+        self.bgAnalyzeDrawFrames = self.pitchTrack.frames.length()
+        run self.updateViewportDrawings()
+      }
+      return ()
+    }
+    if self.bgAnalyzeStage == BG_ANALYZE_FORMANTS {
+      let added = run self.formantTrack.updateChunk(self.samples.asSlice(), 60)
+      let total = self.formantTrack.totalComputable(self.samples.length())
+      if self.formantTrack.frames.length() >= total || added == 0 {
+        run self.formantTrack.refineTracked(self.pitchTrack.frames.asSlice(), self.displayClarity)
+        self.voiceMetrics.reset()
+        self.bgAnalyzeStage = BG_ANALYZE_METRICS
+        self.bgAnalyzeDrawFrames = 0
+        run self.updateViewportDrawings()
+      } else if self.formantTrack.frames.length() >= self.bgAnalyzeDrawFrames + 400 {
+        self.bgAnalyzeDrawFrames = self.formantTrack.frames.length()
+        run self.updateViewportDrawings()
+      }
+      return ()
+    }
+    if self.bgAnalyzeStage == BG_ANALYZE_METRICS {
+      let added = run self.voiceMetrics.updateChunk(
+        self.samples.asSlice(),
+        self.sampleRate,
+        self.pitchTrack.frames.asSlice(),
+        self.formantTrack.frames.asSlice(),
+        self.displayClarity,
+        120,
+      )
+      if self.voiceMetrics.frames.length() >= self.pitchTrack.frames.length() || added == 0 {
+        run self.voiceMetrics.finalizeSummary(self.samples.asSlice(), self.sampleRate)
+        run self.recomputeCompare()
+        run self.refreshVowelAnalysis(false)
+        self.bgAnalyzeStage = BG_ANALYZE_NONE
+        self.bgAnalyzeWaitingNeural = false
+        self.bgAnalyzeDrawFrames = 0
+        self.statusMsg = run String.copy("Loaded clip · Shift+Drag to slice a selection into a Ref or Take")
+        run self.rebuildDrawings(true)
+      }
+    }
   }
 
   effect fn pullVowelSpansFromHost(self: &mut Self, isRef: bool) -> ()
@@ -3676,9 +3781,6 @@ impl Overtone {
   effect fn applyPhonemesReady(self: &mut Self, jobId: i32, isRef: bool) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    if !self.useNeuralPhonemes {
-      return ()
-    }
     if isRef {
       if !self.refClip.active || jobId != self.refPhoneGen {
         return ()
@@ -3782,6 +3884,11 @@ impl Overtone {
           }
         }
       }
+      if hasPitch && !hasFormants && self.refClip.durationSec > LONG_CLIP_ASYNC_SEC && (self.neuralStatusFlags & 2) != 0 {
+        // Stage 1 pitch arrived on a long Ref; wait for Stage 2 formants before running voiceMetrics once.
+        run self.updateViewportDrawings()
+        return ()
+      }
       let mut vm = VoiceMetricsTrack.empty()
       drop run vm.update(
         self.refClip.samples.asSlice(),
@@ -3805,6 +3912,9 @@ impl Overtone {
       return ()
     }
     if hasPitch {
+      if self.pitchTrack.frames.length() == 0 {
+        run self.pitchTrack.populateShellFrames(self.samples.asSlice())
+      }
       let np = audio_native.neuralPitchCount()
       if np > 0 {
         let mut ts = List<f64>.make()
@@ -3829,6 +3939,9 @@ impl Overtone {
       }
     }
     if hasFormants {
+      if self.formantTrack.frames.length() == 0 {
+        run self.formantTrack.populateShellFrames(self.samples.asSlice())
+      }
       let nf = audio_native.neuralFormantCount()
       if nf > 0 {
         let mut fts = List<f64>.make()
@@ -3852,6 +3965,27 @@ impl Overtone {
           )
         }
       }
+    }
+    if self.clipDuration() > LONG_CLIP_ASYNC_SEC {
+      if hasPitch && !hasFormants && (self.neuralStatusFlags & 2) != 0 {
+        // Stage 1 pitch arrived: render pitch contour & live cursor F0 immediately and wait for Stage 2 formants
+        // before kicking off time-sliced voiceMetrics once (avoids 2 redundant full-clip passes).
+        if self.bgAnalyzeStage == BG_ANALYZE_PITCH {
+          self.bgAnalyzeStage = BG_ANALYZE_NONE
+        }
+        self.bgAnalyzeWaitingNeural = true
+        run self.updateViewportDrawings()
+        run self.updateReadouts(false)
+        return ()
+      }
+      // Stage 2 formants arrived (or pitch-only mode): kick off non-blocking voiceMetrics chunks.
+      self.voiceMetrics.reset()
+      self.bgAnalyzeWaitingNeural = false
+      self.bgAnalyzeStage = BG_ANALYZE_METRICS
+      self.bgAnalyzeDrawFrames = 0
+      run self.updateViewportDrawings()
+      run self.updateReadouts(false)
+      return ()
     }
     self.voiceMetrics.reset()
     drop run self.voiceMetrics.update(
@@ -4131,17 +4265,23 @@ impl Overtone {
       return ()
     }
     let sr = self.refClip.sampleRate
+    let dur = usize.toF64(self.refClip.samples.length()) / sr
     let mut pt = PitchTrack.empty()
     run pt.reset(sr, self.pitchConfig)
-    drop run pt.update(self.refClip.samples.asSlice())
-    run pt.refineViterbi(self.displayClarity)
     let mut ft = FormantTrack.empty()
     run ft.reset(sr, self.formantCeilingHz, self.pitchConfig.hopSeconds)
-    drop run ft.update(self.refClip.samples.asSlice())
-    run ft.refineTracked(pt.frames.asSlice(), self.displayClarity)
     let mut vm = VoiceMetricsTrack.empty()
-    drop run vm.update(self.refClip.samples.asSlice(), sr, pt.frames.asSlice(), ft.frames.asSlice(), self.displayClarity)
-    run vm.finalizeSummary(self.refClip.samples.asSlice(), sr)
+    if dur > LONG_CLIP_ASYNC_SEC && self.useNeural && (self.neuralStatusFlags & 1) != 0 && (self.neuralStatusFlags & 2) != 0 {
+      run pt.populateShellFrames(self.refClip.samples.asSlice())
+      run ft.populateShellFrames(self.refClip.samples.asSlice())
+    } else {
+      drop run pt.update(self.refClip.samples.asSlice())
+      run pt.refineViterbi(self.displayClarity)
+      drop run ft.update(self.refClip.samples.asSlice())
+      run ft.refineTracked(pt.frames.asSlice(), self.displayClarity)
+      drop run vm.update(self.refClip.samples.asSlice(), sr, pt.frames.asSlice(), ft.frames.asSlice(), self.displayClarity)
+      run vm.finalizeSummary(self.refClip.samples.asSlice(), sr)
+    }
     self.refClip.pitchFrames = move pt.frames
     self.refClip.formantFrames = move ft.frames
     self.refClip.voiceFrames = move vm.frames
@@ -4149,16 +4289,26 @@ impl Overtone {
     self.refClip.ltas = vm.ltas
     self.refClip.hasLtas = vm.hasLtas
     self.requestNeuralForRef()
-    run self.refreshVowelAnalysis(true)
+    if dur <= LONG_CLIP_ASYNC_SEC || !self.useNeural || (self.neuralStatusFlags & 2) == 0 {
+      run self.refreshVowelAnalysis(true)
+    }
   }
 
   effect fn reanalyzeFormants(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
     run self.formantTrack.reset(self.sampleRate, self.formantCeilingHz, self.pitchConfig.hopSeconds)
+    self.voiceMetrics.reset()
+    if self.clipDuration() > LONG_CLIP_ASYNC_SEC {
+      self.bgAnalyzeWaitingNeural = false
+      self.bgAnalyzeStage = BG_ANALYZE_FORMANTS
+      self.bgAnalyzeDrawFrames = 0
+      run self.reanalyzeRefClip()
+      run self.rebuildDrawings(true)
+      return ()
+    }
     drop run self.formantTrack.update(self.samples.asSlice())
     run self.formantTrack.refineTracked(self.pitchTrack.frames.asSlice(), self.displayClarity)
-    self.voiceMetrics.reset()
     drop run self.voiceMetrics.update(
       self.samples.asSlice(),
       self.sampleRate,
@@ -4181,19 +4331,25 @@ impl Overtone {
   ) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    let dur = usize.toF64(samples.length()) / sampleRate
     let mut pt = PitchTrack.empty()
     run pt.reset(sampleRate, self.pitchConfig)
-    drop run pt.update(samples.asSlice())
-    run pt.refineViterbi(self.displayClarity)
     let mut ft = FormantTrack.empty()
     run ft.reset(sampleRate, self.formantCeilingHz, self.pitchConfig.hopSeconds)
-    drop run ft.update(samples.asSlice())
-    run ft.refineTracked(pt.frames.asSlice(), self.displayClarity)
     let mut vm = VoiceMetricsTrack.empty()
-    drop run vm.update(samples.asSlice(), sampleRate, pt.frames.asSlice(), ft.frames.asSlice(), self.displayClarity)
-    run vm.finalizeSummary(samples.asSlice(), sampleRate)
+    let skipSyncRef = dur > LONG_CLIP_ASYNC_SEC && self.useNeural && (self.neuralStatusFlags & 1) != 0 && (self.neuralStatusFlags & 2) != 0
+    if skipSyncRef {
+      run pt.populateShellFrames(samples.asSlice())
+      run ft.populateShellFrames(samples.asSlice())
+    } else {
+      drop run pt.update(samples.asSlice())
+      run pt.refineViterbi(self.displayClarity)
+      drop run ft.update(samples.asSlice())
+      run ft.refineTracked(pt.frames.asSlice(), self.displayClarity)
+      drop run vm.update(samples.asSlice(), sampleRate, pt.frames.asSlice(), ft.frames.asSlice(), self.displayClarity)
+      run vm.finalizeSummary(samples.asSlice(), sampleRate)
+    }
 
-    let dur = usize.toF64(samples.length()) / sampleRate
     self.refClip = ReferenceClip {
       active: true,
       fullPath: move fullPath,
@@ -4219,7 +4375,9 @@ impl Overtone {
     run self.reloadTree(false)
     run self.startBgScoring(false)
     self.requestNeuralForRef()
-    run self.refreshVowelAnalysis(true)
+    if !skipSyncRef {
+      run self.refreshVowelAnalysis(true)
+    }
     run self.saveSessionPrefs()
   }
 
@@ -4676,6 +4834,9 @@ impl Overtone {
     ! OutOfMemoryError
     ? &mut Allocator {
     self.plotOnRef = false
+    self.bgAnalyzeStage = BG_ANALYZE_NONE
+    self.bgAnalyzeWaitingNeural = false
+    self.bgAnalyzeDrawFrames = 0
     self.recording = true
     self.followRecording = true
     self.isDemoClip = false
@@ -6348,8 +6509,13 @@ impl Overtone {
             }
             run self.updateCursorFast(false)
           }
+        } else if self.bgAnalyzeStage != BG_ANALYZE_NONE && self.drag == DRAG_NONE {
+          run self.stepBgAnalyze()
         } else if self.bgScoreActive && self.refClip.active && self.drag == DRAG_NONE {
           run self.stepBgScoring()
+        }
+        if isPlaying(self.transport.value) && self.bgAnalyzeStage != BG_ANALYZE_NONE && self.drag == DRAG_NONE {
+          run self.stepBgAnalyze()
         }
       }
 
@@ -8982,7 +9148,7 @@ impl App<Message, Command> for Overtone {
   }
 
   fn subscriptions(self: &Self, subs: &mut Subscriptions<Message>) -> () {
-    if self.recording || self.playing || self.gpuNeedSharp || self.practiceMode != PRACTICE_OFF || self.bgScoreActive {
+    if self.recording || self.playing || self.gpuNeedSharp || self.practiceMode != PRACTICE_OFF || self.bgScoreActive || self.bgAnalyzeStage != BG_ANALYZE_NONE {
       subs.animationFrame(1, |t| Message.Tick { time: t })
     }
   }

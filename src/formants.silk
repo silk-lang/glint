@@ -12,6 +12,7 @@ import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
 import silk.num.f64
 import silk.num.usize
 
@@ -759,8 +760,15 @@ impl FormantTrack {
   pub effect fn update(self: &mut Self, samples: &[f32]) -> usize
     ! OutOfMemoryError
     ? &mut Allocator {
+    return run self.updateChunk(samples, 1000000)
+  }
+
+  /// Appends up to `maxFrames` formant frames for non-blocking progressive analysis.
+  pub effect fn updateChunk(self: &mut Self, samples: &[f32], maxFrames: usize) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
     let duration = usize.toF64(samples.length) / self.sampleRate
-    if duration < DEFAULT_HALF_WINDOW_S * 2.0 {
+    if duration < DEFAULT_HALF_WINDOW_S * 2.0 || maxFrames == 0 {
       return 0
     }
     let margin = DEFAULT_HALF_WINDOW_S
@@ -769,9 +777,10 @@ impl FormantTrack {
     if computable <= already {
       return 0
     }
+    let target = if already + maxFrames < computable { already + maxFrames } else { computable }
     let mut added: usize = 0
     let mut idx = already
-    while idx < computable {
+    while idx < target {
       let t = margin + usize.toF64(idx) * self.hopSeconds
       let frame = self.analyzeFrame(samples, t, false)
       run self.frames.append(frame)
@@ -779,6 +788,53 @@ impl FormantTrack {
       added = added + 1
     }
     return added
+  }
+
+  pub fn totalComputable(self: &Self, sampleCount: usize) -> usize {
+    let duration = usize.toF64(sampleCount) / self.sampleRate
+    if duration < DEFAULT_HALF_WINDOW_S * 2.0 {
+      return 0
+    }
+    let margin = DEFAULT_HALF_WINDOW_S
+    return f64.toUsize(f64.floor((duration - 2.0 * margin) / self.hopSeconds)) + 1
+  }
+
+  /// Fast-path shell allocation (timestamps + RMS intensityDb only, <1 ms for 60s)
+  /// used when FormantsTracker ONNX is already loaded in the background worker so we
+  /// completely skip slow Classic Burg LPC + companion-matrix root finding on long clips!
+  pub effect fn populateShellFrames(self: &mut Self, samples: &[f32]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.frames.clear()
+    let duration = usize.toF64(samples.length) / self.sampleRate
+    if duration < DEFAULT_HALF_WINDOW_S * 2.0 {
+      return ()
+    }
+    let margin = DEFAULT_HALF_WINDOW_S
+    let computable = f64.toUsize(f64.floor((duration - 2.0 * margin) / self.hopSeconds)) + 1
+    let halfWinN = f64.toUsize(f64.max(16.0, margin * self.sampleRate))
+    let step = if halfWinN > 64 { (halfWinN * 2) / 48 } else { 1 }
+    let mut idx: usize = 0
+    while idx < computable {
+      let t = margin + usize.toF64(idx) * self.hopSeconds
+      let center = f64.toUsize(f64.round(t * self.sampleRate))
+      let s0 = if center > halfWinN { center - halfWinN } else { 0 }
+      let s1Raw = center + halfWinN
+      let s1 = if s1Raw < samples.length { s1Raw } else { samples.length }
+      let mut sq: f64 = 0.0
+      let mut cnt: usize = 0
+      let mut j = s0
+      while j < s1 {
+        let v = f32.toF64(samples[j])
+        sq = sq + v * v
+        cnt = cnt + 1
+        j = j + step
+      }
+      let msq = if cnt > 0 { sq / usize.toF64(cnt) } else { 0.0 }
+      let db = if msq > 1.0e-12 { 4.342944819032518 * f64.log(msq) } else { -120.0 }
+      run self.frames.append(FormantFrame.empty(t, db))
+      idx = idx + 1
+    }
   }
 
   /// Incrementally voice-gates and continuity-tracks newly added frames (`fromIdx..len`)

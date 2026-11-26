@@ -7,6 +7,7 @@ import { mount } from "./silk-ui-dom.js";
 import { resynthesizeVoice } from "./voice-synth.js";
 import {
   computeAcousticVowelAnalysis,
+  computeAcousticVowelAnalysisAsync,
   refineNeuralPhonemeSpans,
   buildIsolatedAudio,
   mapCompactTimeToSource,
@@ -1894,6 +1895,63 @@ const glintImports = {
     const fmtF2 = fmtCount > 0 ? new Float64Array(memBuf(), f2Ptr, fmtCount).slice() : null;
     const fmtF3 = fmtCount > 0 ? new Float64Array(memBuf(), f3Ptr, fmtCount).slice() : null;
 
+    if (count / sampleRate > 4.5) {
+      vowelSlots[slot] = {
+        jobId,
+        acoustic: null,
+        spans: [],
+        isNeural: false,
+        pendingNeuralPhones: null,
+        f0Times,
+        f0Hz,
+        f0Conf,
+        fmtTimes,
+        fmtF1,
+        fmtF2,
+        fmtF3,
+      };
+      computeAcousticVowelAnalysisAsync(
+        pcm,
+        sampleRate,
+        f0Times,
+        f0Hz,
+        f0Conf,
+        fmtTimes,
+        fmtF1,
+        fmtF2,
+        fmtF3,
+        () => vowelSlots[slot]?.jobId !== jobId,
+        (acoustic) => {
+          const cur = vowelSlots[slot];
+          if (!cur || cur.jobId !== jobId) return;
+          cur.acoustic = acoustic;
+          if (cur.pendingNeuralPhones) {
+            const refined = refineNeuralPhonemeSpans(cur.pendingNeuralPhones, acoustic);
+            cur.spans = refined;
+            cur.isNeural = true;
+            cur.pendingNeuralPhones = null;
+          } else {
+            cur.spans = acoustic.spans;
+            cur.isNeural = false;
+          }
+          const payload = `${jobId}|${slot}|${cur.spans.length}`;
+          if (mountedPage) {
+            mountedPage.post("phonemes_ready", payload);
+          } else {
+            pendingNeuralPosts.push(["phonemes_ready", payload]);
+          }
+        },
+      );
+      if (wantNeural && neuralWorker) {
+        const workerCopy = new Float32Array(pcm);
+        neuralWorker.postMessage(
+          { type: "analyze_phonemes", jobId, isRef: slot, samples: workerCopy, sampleRate },
+          [workerCopy.buffer],
+        );
+      }
+      return 0;
+    }
+
     const acoustic = computeAcousticVowelAnalysis(
       pcm,
       sampleRate,
@@ -2108,15 +2166,19 @@ function initNeuralWorker() {
       } else if (msg.type === "phonemes_result") {
         const slot = msg.isRef ? 1 : 0;
         const cur = vowelSlots[slot];
-        if (cur && cur.jobId === msg.jobId && cur.acoustic) {
-          const refined = refineNeuralPhonemeSpans(msg.phones || [], cur.acoustic);
-          cur.spans = refined;
-          cur.isNeural = true;
-          const payload = `${msg.jobId}|${slot}|${refined.length}`;
-          if (mountedPage) {
-            mountedPage.post("phonemes_ready", payload);
+        if (cur && cur.jobId === msg.jobId) {
+          if (cur.acoustic) {
+            const refined = refineNeuralPhonemeSpans(msg.phones || [], cur.acoustic);
+            cur.spans = refined;
+            cur.isNeural = true;
+            const payload = `${msg.jobId}|${slot}|${refined.length}`;
+            if (mountedPage) {
+              mountedPage.post("phonemes_ready", payload);
+            } else {
+              pendingNeuralPosts.push(["phonemes_ready", payload]);
+            }
           } else {
-            pendingNeuralPosts.push(["phonemes_ready", payload]);
+            cur.pendingNeuralPhones = msg.phones || [];
           }
         }
       }

@@ -390,13 +390,17 @@ export class WebGLSpectrogram {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, 1, 1, 0, gl.RED, gl.FLOAT, new Float32Array([0]));
 
+    // Cancellation tokens for non-blocking progressive tile computation
+    this.fullBuildGen = 0;
+    this.refBuildGen = 0;
+
     // Check GPU float FBO capability for zero-CPU Stockham Radix-2 FFT!
     const extFloat = gl.getExtension("EXT_color_buffer_float");
     const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 4096;
     this.fftN = maxTex >= 8192 ? 8192 : 4096;
     this.fftStages = this.fftN === 8192 ? 13 : 12;
     this.fftBins = this.fftN >> 1;
-    this.tileCols = this.fftN === 8192 ? 128 : 256; // 8 MB per RG32F ping-pong texture either way!
+    this.tileCols = this.fftN === 8192 ? 64 : 128; // 4 MB per RG32F ping-pong texture -> fine-grained progressive slices!
     if (extFloat && maxTex >= 4096) {
       this.winProg = this.compileProgram(FULLSCREEN_VS, WINDOW_FS);
       this.winLocs = {
@@ -422,9 +426,16 @@ export class WebGLSpectrogram {
         uEncodeNorm: gl.getUniformLocation(this.magProg, "uEncodeNorm"),
       };
 
-      // PCM R32F texture
+      // Dedicated PCM R32F textures for take & ref so concurrent progressive builds never collide
       this.pcmTex = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, this.pcmTex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+      this.refPcmTex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, this.refPcmTex);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -491,8 +502,10 @@ export class WebGLSpectrogram {
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, bytes.length / 4, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, bytes);
   }
 
-  // Internal GPU/fallback full-clip spectrogram builder writing into `dstTex`
-  _computeClipIntoTexture(samples, sampleRate, dstTex) {
+  // Internal GPU/fallback full-clip spectrogram builder writing into `dstTex`.
+  // Processes short clips in a single frame and long clips progressively across RAF ticks
+  // (4 tiles / frame on GPU, 96 cols / frame on CPU fallback) so the main thread never freezes!
+  _computeClipIntoTexture(samples, sampleRate, dstTex, isRef, gen) {
     if (!this.gl || !samples || samples.length < 64 || sampleRate <= 0) {
       return null;
     }
@@ -500,6 +513,8 @@ export class WebGLSpectrogram {
     const dur = samples.length / sampleRate;
     const gl = this.gl;
     const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 4096;
+
+    const isStale = () => (isRef ? this.refBuildGen !== gen : this.fullBuildGen !== gen);
 
     if (this.hasGpuFft) {
       const fftN = this.fftN;
@@ -512,6 +527,9 @@ export class WebGLSpectrogram {
       if (fftN === 4096 && sampleRate > 28000) {
         pcm = decimate2x(samples);
         effRate = sampleRate * 0.5;
+      } else {
+        // Copy out of WASM linear memory in case WASM memory grows between progressive RAF ticks
+        pcm = new Float32Array(samples);
       }
 
       const maxCols = Math.min(4096, maxTex);
@@ -523,7 +541,8 @@ export class WebGLSpectrogram {
       const pcmH = Math.max(1, Math.ceil(pcmLen / PCM_TEX_W));
       const padded = new Float32Array(PCM_TEX_W * pcmH);
       padded.set(pcm.subarray(0, pcmLen));
-      gl.bindTexture(gl.TEXTURE_2D, this.pcmTex);
+      const srcPcmTex = isRef ? this.refPcmTex : this.pcmTex;
+      gl.bindTexture(gl.TEXTURE_2D, srcPcmTex);
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, PCM_TEX_W, pcmH, 0, gl.RED, gl.FLOAT, padded);
 
@@ -540,63 +559,104 @@ export class WebGLSpectrogram {
         isNorm8 = true;
       }
 
+      // Clear destination texture to -150 dB (black) so progressive sweep-in is clean!
       gl.bindFramebuffer(gl.FRAMEBUFFER, this.outFbo);
       gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, dstTex, 0);
-
-      gl.bindVertexArray(this.vao);
-      gl.disable(gl.BLEND);
-      gl.disable(gl.DEPTH_TEST);
+      gl.viewport(0, 0, totalCols, fftBins);
       gl.disable(gl.SCISSOR_TEST);
+      gl.clearColor(isNorm8 ? 0.0 : -150.0, 0.0, 0.0, 1.0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
       const scale = 2.0 / (fftN * COHERENT_GAIN);
       const durSamples = Math.max(1, pcmLen - 1);
+      // Adaptive pacing: start at 1 tile on frame 0 so initial response is instant,
+      // ramp up to 6 tiles/frame on fast hardware GPUs (<24ms frames), stay at 1 on slow/software GPUs.
+      let tilesPerSlice = 1;
+      let lastSubmitAt = 0;
 
-      for (let tileStart = 0; tileStart < totalCols; tileStart += tileCols) {
-        gl.bindFramebuffer(gl.FRAMEBUFFER, this.pingFbo[0]);
-        gl.viewport(0, 0, tileCols, fftN);
-        gl.useProgram(this.winProg);
-        gl.activeTexture(gl.TEXTURE0);
-        gl.bindTexture(gl.TEXTURE_2D, this.pcmTex);
-        gl.uniform1i(this.winLocs.uPcm, 0);
-        gl.uniform1i(this.winLocs.uPcmLen, pcmLen);
-        gl.uniform1i(this.winLocs.uTileStartCol, tileStart);
-        gl.uniform1i(this.winLocs.uTotalCols, totalCols);
-        gl.uniform1i(this.winLocs.uFftN, fftN);
-        gl.uniform1i(this.winLocs.uHalfN, fftBins);
-        gl.uniform1f(this.winLocs.uDurSamples, durSamples);
-        gl.drawArrays(gl.TRIANGLES, 0, 3);
+      const runTileBatch = (tileStart) => {
+        if (isStale() || !this.gl) return;
+        const now = performance.now();
+        if (lastSubmitAt > 0) {
+          const frameGap = now - lastSubmitAt;
+          if (frameGap < 24) {
+            tilesPerSlice = Math.min(6, tilesPerSlice + 1);
+          } else if (frameGap > 42) {
+            tilesPerSlice = 1;
+          }
+        }
+        lastSubmitAt = now;
 
-        gl.useProgram(this.fftProg);
-        let srcIdx = 0;
-        for (let s = 0; s < fftStages; s++) {
-          const dstIdx = 1 - srcIdx;
-          gl.bindFramebuffer(gl.FRAMEBUFFER, this.pingFbo[dstIdx]);
+        gl.bindTexture(gl.TEXTURE_2D, srcPcmTex);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.outFbo);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, dstTex, 0);
+        gl.bindVertexArray(this.vao);
+        gl.disable(gl.BLEND);
+        gl.disable(gl.DEPTH_TEST);
+        gl.disable(gl.SCISSOR_TEST);
+
+        let cur = tileStart;
+        const batchEnd = Math.min(totalCols, tileStart + tileCols * tilesPerSlice);
+        for (; cur < batchEnd; cur += tileCols) {
+          gl.bindFramebuffer(gl.FRAMEBUFFER, this.pingFbo[0]);
           gl.viewport(0, 0, tileCols, fftN);
+          gl.useProgram(this.winProg);
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, srcPcmTex);
+          gl.uniform1i(this.winLocs.uPcm, 0);
+          gl.uniform1i(this.winLocs.uPcmLen, pcmLen);
+          gl.uniform1i(this.winLocs.uTileStartCol, cur);
+          gl.uniform1i(this.winLocs.uTotalCols, totalCols);
+          gl.uniform1i(this.winLocs.uFftN, fftN);
+          gl.uniform1i(this.winLocs.uHalfN, fftBins);
+          gl.uniform1f(this.winLocs.uDurSamples, durSamples);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+          gl.useProgram(this.fftProg);
+          let srcIdx = 0;
+          for (let s = 0; s < fftStages; s++) {
+            const dstIdx = 1 - srcIdx;
+            gl.bindFramebuffer(gl.FRAMEBUFFER, this.pingFbo[dstIdx]);
+            gl.viewport(0, 0, tileCols, fftN);
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, this.pingTex[srcIdx]);
+            gl.uniform1i(this.fftLocs.uSrc, 0);
+            gl.uniform1i(this.fftLocs.uM, 1 << s);
+            gl.uniform1i(this.fftLocs.uHalfN, fftBins);
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+            srcIdx = dstIdx;
+          }
+
+          gl.bindFramebuffer(gl.FRAMEBUFFER, this.outFbo);
+          gl.viewport(cur, 0, tileCols, fftBins);
+          gl.enable(gl.SCISSOR_TEST);
+          gl.scissor(cur, 0, tileCols, fftBins);
+          gl.useProgram(this.magProg);
           gl.activeTexture(gl.TEXTURE0);
           gl.bindTexture(gl.TEXTURE_2D, this.pingTex[srcIdx]);
-          gl.uniform1i(this.fftLocs.uSrc, 0);
-          gl.uniform1i(this.fftLocs.uM, 1 << s);
-          gl.uniform1i(this.fftLocs.uHalfN, fftBins);
+          gl.uniform1i(this.magLocs.uFft, 0);
+          gl.uniform1i(this.magLocs.uTileStartCol, cur);
+          gl.uniform1f(this.magLocs.uScale, scale);
+          gl.uniform1i(this.magLocs.uEncodeNorm, isNorm8 ? 1 : 0);
           gl.drawArrays(gl.TRIANGLES, 0, 3);
-          srcIdx = dstIdx;
+          gl.disable(gl.SCISSOR_TEST);
         }
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
-        gl.bindFramebuffer(gl.FRAMEBUFFER, this.outFbo);
-        gl.viewport(tileStart, 0, tileCols, fftBins);
-        gl.enable(gl.SCISSOR_TEST);
-        gl.scissor(tileStart, 0, tileCols, fftBins);
-        gl.useProgram(this.magProg);
-        gl.activeTexture(gl.TEXTURE0);
-        gl.bindTexture(gl.TEXTURE_2D, this.pingTex[srcIdx]);
-        gl.uniform1i(this.magLocs.uFft, 0);
-        gl.uniform1i(this.magLocs.uTileStartCol, tileStart);
-        gl.uniform1f(this.magLocs.uScale, scale);
-        gl.uniform1i(this.magLocs.uEncodeNorm, isNorm8 ? 1 : 0);
-        gl.drawArrays(gl.TRIANGLES, 0, 3);
-        gl.disable(gl.SCISSOR_TEST);
-      }
+        if (tileStart > 0 && this.lastUniforms) {
+          this.draw(this.lastUniforms);
+        }
+        if (batchEnd < totalCols) {
+          requestAnimationFrame(() => runTileBatch(batchEnd));
+        } else {
+          this.lastGpuBuildMs = performance.now() - tStart;
+          if (this.lastUniforms) this.draw(this.lastUniforms);
+        }
+      };
 
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      // Run first batch immediately so left portion of spectrogram appears on frame 0!
+      runTileBatch(0);
       return {
         cols: totalCols,
         bins: fftBins,
@@ -607,67 +667,83 @@ export class WebGLSpectrogram {
       };
     }
 
-    // Fallback for GPUs without EXT_color_buffer_float: compute full clip once on CPU into RGBA8
-    let pcm = samples;
+    // Fallback for GPUs without EXT_color_buffer_float: compute progressively into RGBA8 (zero UI freeze!)
+    let pcm = new Float32Array(samples);
     let effRate = sampleRate;
     if (sampleRate > 28000) {
-      pcm = decimate2x(samples);
+      pcm = decimate2x(pcm);
       effRate = sampleRate * 0.5;
     }
     let totalCols = Math.max(1024, Math.min(2048, Math.ceil(dur * 600)));
     const tbl = getFallbackFftTables();
     const re = new Float32Array(FALLBACK_FFT_N);
     const im = new Float32Array(FALLBACK_FFT_N);
-    const rgba = new Uint8Array(totalCols * FALLBACK_FFT_BINS * 4);
     const scaleSq = Math.pow(2.0 / (FALLBACK_FFT_N * COHERENT_GAIN), 2);
     const invLn10 = 10.0 / Math.LN10;
     const pcmLen = pcm.length;
     const halfN = FALLBACK_FFT_N >> 1;
 
-    for (let c = 0; c < totalCols; c++) {
-      const frac = totalCols > 1 ? c / (totalCols - 1) : 0.0;
-      const center = Math.round(frac * Math.max(0, pcmLen - 1));
-      for (let i = 0; i < FALLBACK_FFT_N; i++) {
-        const si = center - halfN + i;
-        const v = si >= 0 && si < pcmLen ? pcm[si] * tbl.win[i] : 0.0;
-        re[tbl.bitRev[i]] = v;
-        im[tbl.bitRev[i]] = 0.0;
-      }
-      for (let size = 2; size <= FALLBACK_FFT_N; size <<= 1) {
-        const half = size >> 1;
-        const step = FALLBACK_FFT_N / size;
-        for (let i = 0; i < FALLBACK_FFT_N; i += size) {
-          let tw = 0;
-          for (let j = 0; j < half; j++) {
-            const wr = tbl.cos[tw];
-            const wi = tbl.sin[tw];
-            tw += step;
-            const a = i + j;
-            const b = a + half;
-            const tr = wr * re[b] - wi * im[b];
-            const ti = wr * im[b] + wi * re[b];
-            re[b] = re[a] - tr;
-            im[b] = im[a] - ti;
-            re[a] += tr;
-            im[a] += ti;
-          }
-        }
-      }
-      for (let b = 0; b < FALLBACK_FFT_BINS; b++) {
-        let p = (re[b] * re[b] + im[b] * im[b]) * scaleSq;
-        if (b === 0) p *= 0.25;
-        const db = p > 1e-18 ? Math.log(p) * invLn10 : -150.0;
-        const q = Math.max(0, Math.min(255, Math.round(((db + 150.0) / 150.0) * 255.0)));
-        const off = (b * totalCols + c) * 4;
-        rgba[off] = q;
-        rgba[off + 1] = q;
-        rgba[off + 2] = q;
-        rgba[off + 3] = 255;
-      }
-    }
     gl.bindTexture(gl.TEXTURE_2D, dstTex);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, totalCols, FALLBACK_FFT_BINS, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, totalCols, FALLBACK_FFT_BINS, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(totalCols * FALLBACK_FFT_BINS * 4));
+
+    const COLS_PER_SLICE = 96;
+    const runCpuBatch = (cStart) => {
+      if (isStale() || !this.gl) return;
+      const cEnd = Math.min(totalCols, cStart + COLS_PER_SLICE);
+      const sliceW = cEnd - cStart;
+      const rgba = new Uint8Array(sliceW * FALLBACK_FFT_BINS * 4);
+      for (let c = cStart; c < cEnd; c++) {
+        const frac = totalCols > 1 ? c / (totalCols - 1) : 0.0;
+        const center = Math.round(frac * Math.max(0, pcmLen - 1));
+        for (let i = 0; i < FALLBACK_FFT_N; i++) {
+          const si = center - halfN + i;
+          const v = si >= 0 && si < pcmLen ? pcm[si] * tbl.win[i] : 0.0;
+          re[tbl.bitRev[i]] = v;
+          im[tbl.bitRev[i]] = 0.0;
+        }
+        for (let size = 2; size <= FALLBACK_FFT_N; size <<= 1) {
+          const half = size >> 1;
+          const step = FALLBACK_FFT_N / size;
+          for (let i = 0; i < FALLBACK_FFT_N; i += size) {
+            let tw = 0;
+            for (let j = 0; j < half; j++) {
+              const wr = tbl.cos[tw];
+              const wi = tbl.sin[tw];
+              tw += step;
+              const a = i + j;
+              const b = a + half;
+              const tr = wr * re[b] - wi * im[b];
+              const ti = wr * im[b] + wi * re[b];
+              re[b] = re[a] - tr;
+              im[b] = im[a] - ti;
+              re[a] += tr;
+              im[a] += ti;
+            }
+          }
+        }
+        const localC = c - cStart;
+        for (let b = 0; b < FALLBACK_FFT_BINS; b++) {
+          let p = (re[b] * re[b] + im[b] * im[b]) * scaleSq;
+          if (b === 0) p *= 0.25;
+          const db = p > 1e-18 ? Math.log(p) * invLn10 : -150.0;
+          const q = Math.max(0, Math.min(255, Math.round(((db + 150.0) / 150.0) * 255.0)));
+          const off = (b * sliceW + localC) * 4;
+          rgba[off] = q;
+          rgba[off + 1] = q;
+          rgba[off + 2] = q;
+          rgba[off + 3] = 255;
+        }
+      }
+      gl.bindTexture(gl.TEXTURE_2D, dstTex);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, cStart, 0, sliceW, FALLBACK_FFT_BINS, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+      if (this.lastUniforms) this.draw(this.lastUniforms);
+      if (cEnd < totalCols) {
+        requestAnimationFrame(() => runCpuBatch(cEnd));
+      }
+    };
+    runCpuBatch(0);
     return {
       cols: totalCols,
       bins: FALLBACK_FFT_BINS,
@@ -680,7 +756,8 @@ export class WebGLSpectrogram {
 
   // Upload raw PCM ONCE to GPU memory and compute the ENTIRE clip's high-res spectrogram on GPU!
   uploadPcmAndCompute(samples, sampleRate) {
-    const info = this._computeClipIntoTexture(samples, sampleRate, this.fullDbTex);
+    this.fullBuildGen += 1;
+    const info = this._computeClipIntoTexture(samples, sampleRate, this.fullDbTex, false, this.fullBuildGen);
     if (!info) {
       this.fullValid = false;
       return;
@@ -696,7 +773,8 @@ export class WebGLSpectrogram {
 
   // Upload Reference clip PCM ONCE to GPU memory for instant Vertical Split Spectrogram!
   uploadRefPcmAndCompute(samples, sampleRate) {
-    const info = this._computeClipIntoTexture(samples, sampleRate, this.refDbTex);
+    this.refBuildGen += 1;
+    const info = this._computeClipIntoTexture(samples, sampleRate, this.refDbTex, true, this.refBuildGen);
     if (!info) {
       this.refValid = false;
       return;
@@ -710,6 +788,7 @@ export class WebGLSpectrogram {
   }
 
   clearRef() {
+    this.refBuildGen += 1;
     this.refValid = false;
     this.refWarpLen = 0;
   }
@@ -731,7 +810,8 @@ export class WebGLSpectrogram {
   allocTier(tier, w, h) {
     if (!this.gl) return;
     if (tier === 0) {
-      // Starting a new recording or blank document: drop the previous full-clip GPU texture immediately!
+      // Starting a new recording or blank document: cancel any in-flight build & drop previous texture!
+      this.fullBuildGen += 1;
       this.fullValid = false;
       this.fullDur = 0;
       return;

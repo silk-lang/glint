@@ -140,14 +140,20 @@ function smoothstep(edge0, edge1, x) {
   return t * t * (3.0 - 2.0 * t);
 }
 
-/**
- * Option 1: Instant acoustic + SwiftF0 + FormantsTracker vowel nucleus analyzer.
- * Returns frame features (also reused to sharpen Option 2 neural IPA boundaries)
- * and clean merged vowel spans [{ t0, t1, label: "" }].
- */
-export function computeAcousticVowelAnalysis(
-  samples,
-  sampleRate,
+function decimateForVowel(samples, sampleRate) {
+  if (sampleRate <= 26000) return { pcm: samples, sr: sampleRate };
+  // 2x box-average decimation: 48 kHz -> 24 kHz (Nyquist 12 kHz > 7.8 kHz hi band, 2.5x faster FFT)
+  const outLen = samples.length >> 1;
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    out[i] = 0.5 * (samples[i << 1] + samples[(i << 1) + 1]);
+  }
+  return { pcm: out, sr: sampleRate * 0.5 };
+}
+
+function createAcousticVowelState(
+  rawSamples,
+  rawSampleRate,
   f0Times = null,
   f0Hz = null,
   f0Conf = null,
@@ -156,23 +162,27 @@ export function computeAcousticVowelAnalysis(
   fmtF2 = null,
   fmtF3 = null,
 ) {
-  const n = samples ? samples.length : 0;
-  const dur = sampleRate > 0 ? n / sampleRate : 0.0;
-  if (n < 64 || sampleRate <= 0) {
+  const rawN = rawSamples ? rawSamples.length : 0;
+  const dur = rawSampleRate > 0 ? rawN / rawSampleRate : 0.0;
+  if (rawN < 64 || rawSampleRate <= 0) {
     return {
-      source: "acoustic",
-      hopSec: 0.01,
-      durationSec: dur,
-      numFrames: 0,
-      rmsDb: new Float32Array(0),
-      voicing: new Float32Array(0),
-      hfRatio: new Float32Array(0),
-      vowelProb: new Float32Array(0),
-      peakDb: -90,
-      spans: [],
+      empty: true,
+      result: {
+        source: "acoustic",
+        hopSec: 0.01,
+        durationSec: dur,
+        numFrames: 0,
+        rmsDb: new Float32Array(0),
+        voicing: new Float32Array(0),
+        hfRatio: new Float32Array(0),
+        vowelProb: new Float32Array(0),
+        peakDb: -90,
+        spans: [],
+      },
     };
   }
-
+  const { pcm: samples, sr: sampleRate } = decimateForVowel(rawSamples, rawSampleRate);
+  const n = samples.length;
   const hopSec = 0.01;
   const hop = Math.max(16, Math.round(sampleRate * hopSec));
   const winLen = Math.max(64, Math.round(sampleRate * 0.025));
@@ -181,38 +191,63 @@ export function computeAcousticVowelAnalysis(
   const tbl = getFft(nfft);
   const bins = (nfft >> 1) + 1;
   const binHz = sampleRate / nfft;
-
   const numFrames = Math.max(1, Math.floor(n / hop));
-  const rmsDb = new Float32Array(numFrames);
-  const voicing = new Float32Array(numFrames);
-  const hfRatio = new Float32Array(numFrames);
-  const zcrArr = new Float32Array(numFrames);
-  const eLowArr = new Float32Array(numFrames);
-  const eFormArr = new Float32Array(numFrames);
-  const eF2Arr = new Float32Array(numFrames);
-  const tonalityArr = new Float32Array(numFrames);
+  return {
+    empty: false,
+    samples,
+    sampleRate,
+    n,
+    dur,
+    hopSec,
+    hop,
+    winLen,
+    nfft,
+    tbl,
+    numFrames,
+    cursor: 0,
+    rmsDb: new Float32Array(numFrames),
+    voicing: new Float32Array(numFrames),
+    hfRatio: new Float32Array(numFrames),
+    zcrArr: new Float32Array(numFrames),
+    eLowArr: new Float32Array(numFrames),
+    eFormArr: new Float32Array(numFrames),
+    eF2Arr: new Float32Array(numFrames),
+    tonalityArr: new Float32Array(numFrames),
+    frame: new Float32Array(nfft),
+    re: new Float32Array(nfft),
+    im: new Float32Array(nfft),
+    pow: new Float32Array(bins),
+    bLow0: Math.max(1, Math.floor(90 / binHz)),
+    bLow1: Math.min(bins - 1, Math.ceil(360 / binHz)),
+    bForm0: Math.max(1, Math.floor(280 / binHz)),
+    bForm1: Math.min(bins - 1, Math.ceil(3400 / binHz)),
+    bF20: Math.max(1, Math.floor(650 / binHz)),
+    bF21: Math.min(bins - 1, Math.ceil(3200 / binHz)),
+    bHi0: Math.min(bins - 1, Math.floor(3500 / binHz)),
+    bHi1: Math.min(bins - 1, Math.ceil(7800 / binHz)),
+    hasF0: !!(f0Times && f0Times.length > 0 && f0Conf && f0Conf.length === f0Times.length),
+    hasFmt: !!(fmtTimes && fmtTimes.length > 0 && fmtF1 && fmtF2),
+    f0Times,
+    f0Hz,
+    f0Conf,
+    fmtTimes,
+    fmtF1,
+    fmtF2,
+    fmtF3,
+    halfWin: winLen >> 1,
+    winScale: (nfft - 1) / Math.max(1, winLen - 1),
+  };
+}
 
-  const frame = new Float32Array(nfft);
-  const re = new Float32Array(nfft);
-  const im = new Float32Array(nfft);
-  const pow = new Float32Array(bins);
-
-  const bLow0 = Math.max(1, Math.floor(90 / binHz));
-  const bLow1 = Math.min(bins - 1, Math.ceil(360 / binHz));
-  const bForm0 = Math.max(1, Math.floor(280 / binHz));
-  const bForm1 = Math.min(bins - 1, Math.ceil(3400 / binHz));
-  const bF20 = Math.max(1, Math.floor(650 / binHz));
-  const bF21 = Math.min(bins - 1, Math.ceil(3200 / binHz));
-  const bHi0 = Math.min(bins - 1, Math.floor(3500 / binHz));
-  const bHi1 = Math.min(bins - 1, Math.ceil(7800 / binHz));
-
-  const hasF0 = !!(f0Times && f0Times.length > 0 && f0Conf && f0Conf.length === f0Times.length);
-  const hasFmt = !!(fmtTimes && fmtTimes.length > 0 && fmtF1 && fmtF2);
-
-  const halfWin = winLen >> 1;
-  const winScale = (nfft - 1) / Math.max(1, winLen - 1);
-
-  for (let t = 0; t < numFrames; t++) {
+function stepAcousticVowelFrames(st, maxFrames) {
+  const {
+    samples, sampleRate, n, hop, winLen, nfft, tbl, numFrames,
+    rmsDb, voicing, hfRatio, zcrArr, eLowArr, eFormArr, eF2Arr, tonalityArr,
+    frame, re, im, pow, bLow0, bLow1, bForm0, bForm1, bF20, bF21, bHi0, bHi1,
+    hasF0, f0Times, f0Hz, f0Conf, halfWin, winScale,
+  } = st;
+  const end = Math.min(numFrames, st.cursor + maxFrames);
+  for (let t = st.cursor; t < end; t++) {
     const center = t * hop + (hop >> 1);
     const tSec = center / sampleRate;
     const s0 = center - halfWin;
@@ -267,6 +302,16 @@ export function computeAcousticVowelAnalysis(
       voicing[t] = estimateVoicingAcf(samples, center, winLen, sampleRate);
     }
   }
+  st.cursor = end;
+  return st.cursor >= numFrames;
+}
+
+function finalizeAcousticVowelState(st) {
+  const {
+    sampleRate, dur, hopSec, hop, numFrames,
+    rmsDb, voicing, hfRatio, zcrArr, eLowArr, eFormArr, eF2Arr, tonalityArr,
+    hasFmt, fmtTimes, fmtF1, fmtF2,
+  } = st;
 
   // Utterance 95th-percentile voiced energy reference
   const voicedDbs = [];
@@ -285,27 +330,19 @@ export function computeAcousticVowelAnalysis(
     const tSec = (t * hop + (hop >> 1)) / sampleRate;
     const relDb = rmsDb[t] - peakDb;
 
-    // 1. Energy gate (vowels carry syllable-nucleus energy; drop silence & stop closures)
     const sEnergy = smoothstep(-25.0, -10.5, relDb);
     if (sEnergy < 0.02) {
       rawProb[t] = 0.0;
       continue;
     }
 
-    // 2. Voicing gate (drops all voiceless consonants /p, t, k, s, ʃ, f, θ, h/)
     const sVoice = smoothstep(0.32, 0.62, voicing[t]);
-
-    // 3. Anti-friction gate (drops voiced fricatives /z, v, ð, ʒ/ and noisy bursts)
     const sCleanHf = 1.0 - smoothstep(0.18, 0.55, hfRatio[t]);
     const sCleanZcr = 1.0 - smoothstep(2300, 4200, zcrArr[t]);
     const sNoFric = Math.min(sCleanHf, 0.35 + 0.65 * sCleanZcr);
 
-    // 4. Open vocal tract / anti-nasal-murmur gate
-    // Closed nasals (/m, n, ŋ/) and voiced stop bars (/b, d, g/) pack energy below 360 Hz
-    // while damping F2/F3 (650..3200 Hz) and dropping overall oral formant energy.
     const formFrac = eFormArr[t] / (eFormArr[t] + eLowArr[t] + 1e-12);
     const f2ToLow = eF2Arr[t] / (eLowArr[t] + 1e-12);
-    // Keep /u/ and /o/ (high formFrac or strong energy) while damping quiet nasal murmurs
     let sOral = 1.0;
     if (f2ToLow < 0.08 && relDb < -6.5) {
       sOral = smoothstep(0.015, 0.08, f2ToLow) * 0.75 + 0.25 * smoothstep(-14.0, -5.0, relDb);
@@ -313,7 +350,6 @@ export function computeAcousticVowelAnalysis(
       sOral = smoothstep(0.10, 0.30, formFrac);
     }
 
-    // 5. Spectral peakiness (tonality) & formant plausibility boost
     const sTone = 0.7 + 0.3 * smoothstep(2.5, 9.0, tonalityArr[t]);
     let sFmt = 1.0;
     if (hasFmt) {
@@ -329,7 +365,6 @@ export function computeAcousticVowelAnalysis(
     rawProb[t] = clamp01(sEnergy * sVoice * sNoFric * sOral * sTone * sFmt);
   }
 
-  // Smooth over 3 frames [0.2, 0.6, 0.2]
   const vowelProb = new Float32Array(numFrames);
   for (let t = 0; t < numFrames; t++) {
     const a = t > 0 ? rawProb[t - 1] : rawProb[t];
@@ -338,7 +373,6 @@ export function computeAcousticVowelAnalysis(
     vowelProb[t] = 0.2 * a + 0.6 * b + 0.2 * c;
   }
 
-  // Hysteresis thresholding -> spans
   const rawSpans = [];
   let inSpan = false;
   let startT = 0;
@@ -369,6 +403,64 @@ export function computeAcousticVowelAnalysis(
     peakDb,
     spans,
   };
+}
+
+/**
+ * Option 1: Instant acoustic + SwiftF0 + FormantsTracker vowel nucleus analyzer.
+ * Returns frame features (also reused to sharpen Option 2 neural IPA boundaries)
+ * and clean merged vowel spans [{ t0, t1, label: "" }].
+ */
+export function computeAcousticVowelAnalysis(
+  samples,
+  sampleRate,
+  f0Times = null,
+  f0Hz = null,
+  f0Conf = null,
+  fmtTimes = null,
+  fmtF1 = null,
+  fmtF2 = null,
+  fmtF3 = null,
+) {
+  const st = createAcousticVowelState(samples, sampleRate, f0Times, f0Hz, f0Conf, fmtTimes, fmtF1, fmtF2, fmtF3);
+  if (st.empty) return st.result;
+  stepAcousticVowelFrames(st, st.numFrames);
+  return finalizeAcousticVowelState(st);
+}
+
+/**
+ * Non-blocking time-sliced variant for long clips (>4.5 s): computes ~180 frames (~3-5 ms)
+ * per animation frame so the UI stays at 60 fps even on multi-minute recordings.
+ */
+export function computeAcousticVowelAnalysisAsync(
+  samples,
+  sampleRate,
+  f0Times,
+  f0Hz,
+  f0Conf,
+  fmtTimes,
+  fmtF1,
+  fmtF2,
+  fmtF3,
+  shouldCancel,
+  onDone,
+) {
+  const st = createAcousticVowelState(samples, sampleRate, f0Times, f0Hz, f0Conf, fmtTimes, fmtF1, fmtF2, fmtF3);
+  if (st.empty) {
+    onDone(st.result);
+    return;
+  }
+  const FRAMES_PER_SLICE = 180;
+  const tick = () => {
+    if (shouldCancel && shouldCancel()) return;
+    const done = stepAcousticVowelFrames(st, FRAMES_PER_SLICE);
+    if (done) {
+      if (shouldCancel && shouldCancel()) return;
+      onDone(finalizeAcousticVowelState(st));
+    } else {
+      requestAnimationFrame(tick);
+    }
+  };
+  requestAnimationFrame(tick);
 }
 
 function cleanSpans(rawSpans, dur, mergeGapSec, minDurSec, padLeft, padRight) {
