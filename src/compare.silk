@@ -155,6 +155,13 @@ pub struct SelectionCompare {
   pub deltaVtlCm: f64,
   pub deltaH1H2Db: f64,
   pub deltaHnrDb: f64,
+  pub deltaVowelF2: f64,
+  pub takeSummary: VoiceSummary,
+  pub refSummary: VoiceSummary,
+  pub takeLtas: [f32; 64],
+  pub hasTakeLtas: bool,
+  pub refLtas: [f32; 64],
+  pub hasRefLtas: bool,
   pub score: MatchScore,
 }
 
@@ -172,6 +179,13 @@ impl SelectionCompare {
       deltaVtlCm: 0.0,
       deltaH1H2Db: 0.0,
       deltaHnrDb: 0.0,
+      deltaVowelF2: 0.0,
+      takeSummary: VoiceSummary.empty(),
+      refSummary: VoiceSummary.empty(),
+      takeLtas: [0.0; 64],
+      hasTakeLtas: false,
+      refLtas: [0.0; 64],
+      hasRefLtas: false,
       score: MatchScore.empty(),
     }
   }
@@ -190,6 +204,7 @@ pub struct CompareAlignment {
   pub deltaVtlCm: f64,
   pub deltaH1H2Db: f64,
   pub deltaHnrDb: f64,
+  pub deltaVowelF2: f64,
   pub score: MatchScore,
 }
 
@@ -204,6 +219,7 @@ impl CompareAlignment {
       deltaVtlCm: 0.0,
       deltaH1H2Db: 0.0,
       deltaHnrDb: 0.0,
+      deltaVowelF2: 0.0,
       score: MatchScore.empty(),
     }
   }
@@ -598,6 +614,11 @@ pub effect fn buildCompareAlignment(
   }
   let deltaH1H2Db = takeSummary.medianH1H2Db - refClip.summary.medianH1H2Db
   let deltaHnrDb = takeSummary.medianHnrDb - refClip.summary.medianHnrDb
+  let deltaVowelF2 = if takeSummary.formantCount > 0 && refClip.summary.formantCount > 0 && takeSummary.meanF2 > 100.0 && refClip.summary.meanF2 > 100.0 {
+    f64.log2(takeSummary.meanF2 / refClip.summary.meanF2)
+  } else {
+    0.0
+  }
 
   let aFeats = run extractActiveFeatures(takeFrames, 140)
   let bFeats = run extractActiveFeatures(refFs, 140)
@@ -713,6 +734,7 @@ pub effect fn buildCompareAlignment(
       deltaVtlCm: deltaVtlCm,
       deltaH1H2Db: deltaH1H2Db,
       deltaHnrDb: deltaHnrDb,
+      deltaVowelF2: deltaVowelF2,
       score: score,
     }
   }
@@ -893,11 +915,12 @@ pub effect fn buildCompareAlignment(
     deltaVtlCm: deltaVtlCm,
     deltaH1H2Db: deltaH1H2Db,
     deltaHnrDb: deltaHnrDb,
+    deltaVowelF2: deltaVowelF2,
     score: score,
   }
 }
 
-effect fn summarizeVoiceRange(
+pub effect fn summarizeVoiceRange(
   frames: &[VoiceFrame],
   tStart: f64,
   tEnd: f64,
@@ -1035,6 +1058,11 @@ pub effect fn computeSelectionCompare(
   }
   let deltaH1H2Db = takeSum.medianH1H2Db - refSum.medianH1H2Db
   let deltaHnrDb = takeSum.medianHnrDb - refSum.medianHnrDb
+  let deltaVowelF2 = if takeSum.formantCount > 0 && refSum.formantCount > 0 && takeSum.meanF2 > 100.0 && refSum.meanF2 > 100.0 {
+    f64.log2(takeSum.meanF2 / refSum.meanF2)
+  } else {
+    0.0
+  }
 
   let mut pitchAbsErrs = List<f64>.make()
   let mut pitchClippedSq: f64 = 0.0
@@ -1164,6 +1192,13 @@ pub effect fn computeSelectionCompare(
     deltaVtlCm: deltaVtlCm,
     deltaH1H2Db: deltaH1H2Db,
     deltaHnrDb: deltaHnrDb,
+    deltaVowelF2: deltaVowelF2,
+    takeSummary: takeSum,
+    refSummary: refSum,
+    takeLtas: takeLtasBuf,
+    hasTakeLtas: hasTakeSelLtas,
+    refLtas: refLtasBuf,
+    hasRefLtas: hasRefSelLtas,
     score: MatchScore {
       valid: true,
       overall: clampScore(overallSim),

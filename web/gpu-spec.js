@@ -119,6 +119,8 @@ uniform sampler2D fullDbTex;
 uniform sampler2D liveTex;
 uniform sampler2D lutTex;
 uniform sampler2D refDbTex;
+uniform sampler2D refWarpTex;
+uniform int uRefWarpLen;
 
 float normToFreq(float norm) {
   if (u[13] > 0.5) {
@@ -175,7 +177,26 @@ void main() {
     if (vUv.y > 0.503) {
       float localY = (vUv.y - 0.503) / 0.497;
       float freq = normToFreq(localY);
-      vec2 r = sampleDbTex(refDbTex, u[8], u[9], u[12], u[29], u[30], u[31], 0.0, time, freq);
+      float refTime = time;
+      if (uRefWarpLen >= 2 && (u[5] - u[4]) > 0.001) {
+        float nx = (time - u[4]) / (u[5] - u[4]);
+        if (nx >= 0.0 && nx <= 1.0) {
+          float fIdx = nx * float(uRefWarpLen - 1);
+          int i0 = clamp(int(floor(fIdx)), 0, uRefWarpLen - 1);
+          int i1 = min(i0 + 1, uRefWarpLen - 1);
+          float frac = fIdx - float(i0);
+          float r0 = texelFetch(refWarpTex, ivec2(i0, 0), 0).r;
+          float r1 = texelFetch(refWarpTex, ivec2(i1, 0), 0).r;
+          refTime = mix(r0, r1, frac);
+        } else if (nx < 0.0) {
+          float rStart = texelFetch(refWarpTex, ivec2(0, 0), 0).r;
+          refTime = rStart + (time - u[4]);
+        } else {
+          float rEnd = texelFetch(refWarpTex, ivec2(uRefWarpLen - 1, 0), 0).r;
+          refTime = rEnd + (time - u[5]);
+        }
+      }
+      vec2 r = sampleDbTex(refDbTex, u[8], u[9], u[12], u[29], u[30], u[31], 0.0, refTime, freq);
       float v = clamp((r.x + u[16]) * u[17], 0.0, 1.0);
       vec3 rgb = texture(lutTex, vec2(v, 0.5)).rgb;
       outColor = vec4(rgb * step(0.5, r.y), 1.0);
@@ -342,6 +363,8 @@ export class WebGLSpectrogram {
     this.liveLoc = gl.getUniformLocation(this.displayProg, "liveTex");
     this.lutLoc = gl.getUniformLocation(this.displayProg, "lutTex");
     this.refDbLoc = gl.getUniformLocation(this.displayProg, "refDbTex");
+    this.refWarpLoc = gl.getUniformLocation(this.displayProg, "refWarpTex");
+    this.refWarpLenLoc = gl.getUniformLocation(this.displayProg, "uRefWarpLen");
 
     const makeRgbaTex = (filter) => {
       const t = gl.createTexture();
@@ -357,6 +380,15 @@ export class WebGLSpectrogram {
     this.liveTex = makeRgbaTex(gl.LINEAR);
     this.fullDbTex = makeRgbaTex(gl.LINEAR);
     this.refDbTex = makeRgbaTex(gl.LINEAR);
+
+    this.refWarpLen = 0;
+    this.refWarpTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, this.refWarpTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, 1, 1, 0, gl.RED, gl.FLOAT, new Float32Array([0]));
 
     // Check GPU float FBO capability for zero-CPU Stockham Radix-2 FFT!
     const extFloat = gl.getExtension("EXT_color_buffer_float");
@@ -679,6 +711,20 @@ export class WebGLSpectrogram {
 
   clearRef() {
     this.refValid = false;
+    this.refWarpLen = 0;
+  }
+
+  setRefWarp(lut) {
+    if (!lut || lut.length < 2) {
+      this.refWarpLen = 0;
+      return;
+    }
+    this.refWarpLen = lut.length;
+    if (!this.gl || !this.refWarpTex) return;
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, this.refWarpTex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, lut.length, 1, 0, gl.RED, gl.FLOAT, lut);
   }
 
   // Live microphone rolling tier (used ONLY while actively recording)
@@ -749,6 +795,8 @@ export class WebGLSpectrogram {
     gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.liveTex); gl.uniform1i(this.liveLoc, 1);
     gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, this.lutTex); gl.uniform1i(this.lutLoc, 2);
     gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, this.refDbTex); gl.uniform1i(this.refDbLoc, 3);
+    gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, this.refWarpTex); gl.uniform1i(this.refWarpLoc, 4);
+    gl.uniform1i(this.refWarpLenLoc, this.refWarpLen || 0);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 }

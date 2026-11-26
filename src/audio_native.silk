@@ -71,6 +71,16 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
   ) -> i32 as "glint#ov_play_mix"
   unsafe extern "C" fn ov_pref_get(key: ?[*]const u8, keyLen: usize, out: ?[*]mut u8, cap: i32) -> i32 as "glint#ov_pref_get"
   unsafe extern "C" fn ov_pref_set(key: ?[*]const u8, keyLen: usize, val: ?[*]const u8, valLen: usize) -> i32 as "glint#ov_pref_set"
+  unsafe extern "C" fn ov_now_short_time(includeDate: i32, out: ?[*]mut u8, cap: i32) -> i32 as "glint#ov_now_short_time"
+  unsafe extern "C" fn ov_play_set_ref_warp(lut: ?[*]const f32, count: i32, takeDur: f64) -> () as "glint#ov_play_set_ref_warp"
+  unsafe extern "C" fn ov_play_warped_ref(
+    samples: ?[*]const f32,
+    count: i32,
+    sampleRate: f64,
+    startSec: f64,
+    endSec: f64,
+    loop: i32,
+  ) -> i32 as "glint#ov_play_warped_ref"
   unsafe extern "C" fn ov_lib_set_parent_ref(
     relDir: ?[*]const u8,
     relDirLen: usize,
@@ -265,6 +275,21 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
     maxCount: i32,
   ) -> i32 as "glint#ov_neural_copy_formants"
   unsafe extern "C" fn ov_neural_status() -> i32 as "glint#ov_neural_status"
+  unsafe extern "C" fn ov_neural_live_formants_request(
+    jobId: i32,
+    samples: ?[*]const f32,
+    count: i32,
+    sampleRate: f64,
+    startSec: f64,
+  ) -> () as "glint#ov_neural_live_formants_request"
+  unsafe extern "C" fn ov_neural_live_formant_count() -> i32 as "glint#ov_neural_live_formant_count"
+  unsafe extern "C" fn ov_neural_live_copy_formants(
+    times: ?[*]mut f64,
+    f1: ?[*]mut f64,
+    f2: ?[*]mut f64,
+    f3: ?[*]mut f64,
+    maxCount: i32,
+  ) -> i32 as "glint#ov_neural_live_copy_formants"
 
   unsafe extern "C" fn ov_synth_render(
     samples: ?[*]const f32,
@@ -925,7 +950,24 @@ pub const SORT_PITCH: i32 = 2
 pub const SORT_SIZE: i32 = 3
 pub const SORT_WEIGHT: i32 = 4
 pub const SORT_VOWEL: i32 = 5
+pub const SORT_DATE: i32 = 6
 pub const SCORE_VERSION: i32 = 4
+
+pub effect fn nowShortTime(includeDate: bool) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    let mut buf: [u8; 64] = [0; 64]
+    let n = unsafe ov_now_short_time(if includeDate { 1 } else { 0 }, Pointer.fromMutSlice(&mut buf), 64)
+    if n > 0 {
+      return run copyUtf8Lossy(Slice.view<u8>(&buf, 0, i32.toUsize(n)))
+    }
+    return String.make()
+  } else {
+    drop includeDate
+    return String.make()
+  }
+}
 
 pub struct LibTreeNode {
   pub idx: usize,
@@ -1413,6 +1455,37 @@ pub fn playSetLoopStart(loopStartSec: f64) -> () {
   }
 }
 
+pub fn playSetRefWarp(lut: &[f32], takeDur: f64) -> () {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    if lut.length >= 2 && takeDur > 0.01 {
+      unsafe ov_play_set_ref_warp(Pointer.fromSlice(lut), usize.toI32(lut.length), takeDur)
+    } else {
+      unsafe ov_play_set_ref_warp(Pointer.fromSlice(lut), 0, 0.0)
+    }
+  } else {
+    drop lut
+    drop takeDur
+  }
+}
+
+pub fn playWarpedRef(samples: &[f32], sampleRate: f64, startSec: f64, endSec: f64, loop: bool) -> bool {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    if samples.length < 64 || sampleRate <= 0.0 {
+      return false
+    }
+    return unsafe ov_play_warped_ref(
+      Pointer.fromSlice(samples),
+      usize.toI32(samples.length),
+      sampleRate,
+      startSec,
+      endSec,
+      if loop { 1 } else { 0 },
+    ) != 0
+  } else {
+    return playRange(samples, sampleRate, startSec, endSec, loop)
+  }
+}
+
 pub fn playMix(
   aSamples: &[f32],
   aRate: f64,
@@ -1667,6 +1740,61 @@ pub fn neuralStatus() -> i32 {
   static if Intrinsic.targetArchitecture() == "wasm32" {
     return unsafe ov_neural_status()
   } else {
+    return 0
+  }
+}
+
+pub fn neuralLiveFormantsRequest(jobId: i32, samples: &[f32], sampleRate: f64, startSec: f64) -> () {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    if samples.length < 64 {
+      return ()
+    }
+    unsafe ov_neural_live_formants_request(
+      jobId,
+      Pointer.fromSlice(samples),
+      usize.toI32(samples.length),
+      sampleRate,
+      startSec,
+    )
+  } else {
+    drop jobId
+    drop samples
+    drop sampleRate
+    drop startSec
+  }
+}
+
+pub fn neuralLiveFormantCount() -> usize {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    let n = unsafe ov_neural_live_formant_count()
+    return if n > 0 { i32.toUsize(n) } else { 0 }
+  } else {
+    return 0
+  }
+}
+
+pub fn neuralLiveCopyFormants(times: &mut [f64], f1: &mut [f64], f2: &mut [f64], f3: &mut [f64]) -> usize {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    let mut cap = times.length
+    if f1.length < cap { cap = f1.length }
+    if f2.length < cap { cap = f2.length }
+    if f3.length < cap { cap = f3.length }
+    if cap == 0 {
+      return 0
+    }
+    let n = unsafe ov_neural_live_copy_formants(
+      Pointer.fromMutSlice(move times),
+      Pointer.fromMutSlice(move f1),
+      Pointer.fromMutSlice(move f2),
+      Pointer.fromMutSlice(move f3),
+      usize.toI32(cap),
+    )
+    return if n > 0 { i32.toUsize(n) } else { 0 }
+  } else {
+    drop times
+    drop f1
+    drop f2
+    drop f3
     return 0
   }
 }

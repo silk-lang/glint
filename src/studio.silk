@@ -5,7 +5,7 @@ import audio_native {
   AudioDeviceInfo,
   LibTreeNode,
   SCORE_VERSION,
-  SORT_ALPHA,
+  SORT_DATE,
   SORT_OVERALL,
   SORT_PITCH,
   SORT_SIZE,
@@ -48,7 +48,8 @@ import compare {
   ReferenceClip,
   SelectionCompare,
   buildCompareAlignment,
-  computeSelectionCompare
+  computeSelectionCompare,
+  summarizeVoiceRange
 }
 import dsp {
   COARSE_HOP,
@@ -66,6 +67,7 @@ import formants {
   FormantTrack,
   VOWELS_MASC,
   applyNeuralFormantFrames,
+  applyNeuralFormantFramesRange,
   estimateVowelForResonance,
   vowelLandmarkAt
 }
@@ -80,7 +82,6 @@ import overlays {
   appendInt,
   buildLtasDrawing,
   buildMetricsLaneDrawing,
-  buildPianoDrawing,
   buildPitchContourLaneDrawing,
   buildSizeWeightPadDrawing,
   buildSpectrogramOverlay,
@@ -121,7 +122,7 @@ import pitch {
 import synth { SYNTH_SAMPLE_RATE, synthDemoVoice }
 import viewport { RECORD_VIEW_S, Viewport }
 import view as studioView
-import voice_metrics { VoiceFrame, VoiceMetricsTrack }
+import voice_metrics { LTAS_FMAX, LTAS_FMIN, VoiceFrame, VoiceMetricsTrack, VoiceSummary }
 import loom.app { App, Context, Perform, Subscriptions }
 import loom.document { render as renderDocument }
 import loom.drawing { Drawing }
@@ -129,6 +130,7 @@ import loom.keys { MOD_ALT, MOD_CONTROL, MOD_META, MOD_SHIFT }
 import loom.lib { CanvasCommand }
 import loom.ui { Surface, Ui }
 import silk.collections.list { List }
+import silk.collections.slice { Slice }
 import silk.core.option { Option }
 import silk.geometry.rect { Rect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -444,6 +446,7 @@ pub union Message {
   SetBottomLaneTab { pub tab: u32 },
   ToggleNeural,
   NeuralReady { pub jobId: i32, pub isRef: bool, pub hasPitch: bool, pub hasFormants: bool },
+  LiveNeuralFormantsReady { pub jobId: i32 },
   NeuralStatus { pub flags: i32 },
   // Vowel / consonant isolation, TD-PSOLA stretch, Voice Lab & Klatt vowel synth
   SetIsolateMode { pub mode: u32 },
@@ -574,6 +577,9 @@ pub struct Overtone {
   pub plotOnRef: bool,
   /// Vertical split spectrogram: Reference on top, Your take on bottom!
   pub splitRefSpec: bool,
+  pub refWarpLut: [f32; 512],
+  pub refWarpActive: bool,
+  pub gpuNeedRefWarpReload: bool,
   /// Listening mix when Ref is active: 0=You, 1=Ref, 2=Both simultaneously
   pub listenMode: u32,
   /// Auto-normalize your take's loudness (spectrogram dB + playback gain) to match the Reference!
@@ -739,9 +745,14 @@ pub struct Overtone {
   pub readoutVtl: String,
   pub readoutH1H2: String,
   pub readoutHnr: String,
+  pub readoutAvgF0: String,
   pub readoutDeltaPitch: String,
   pub readoutDeltaVtl: String,
   pub readoutDeltaWeight: String,
+  pub readoutDeltaHnr: String,
+  pub selVoiceSummary: VoiceSummary,
+  pub selTakeLtas: [f32; 64],
+  pub hasSelTakeLtas: bool,
   pub readoutScoreOverall: String,
   pub readoutScorePitch: String,
   pub readoutScoreSize: String,
@@ -825,6 +836,9 @@ pub struct Overtone {
   pub useNeural: bool,
   pub takeNeuralGen: i32,
   pub refNeuralGen: i32,
+  pub liveNeuralGen: i32,
+  pub liveNeuralLastReqDur: f64,
+  pub liveNeuralInFlight: bool,
   pub neuralStatusFlags: i32,
 
   // Vowel / consonant isolation (Option 1 instant acoustic + Option 2 lazy Allosaurus IPA) & Voice Lab
@@ -885,7 +899,7 @@ impl Overtone {
 
     // Scan real folders & audio files at ~/Documents/Overtone Library/
     let mut expandedDirs = List<String>.make()
-    let initScan = run audio_native.libScanTree("", "", "", SORT_ALPHA)
+    let initScan = run audio_native.libScanTree("", "", "", SORT_DATE)
     // Auto-expand the first folder on launch if there are folders and no root-level audio files
     let mut hasRootFile = false
     let mut firstFolderRel = String.make()
@@ -902,7 +916,7 @@ impl Overtone {
     let listing = if !hasRootFile && String.byteLength(String.view(&firstFolderRel)) > 0 {
       let expCopy = run String.copy(String.view(&firstFolderRel))
       run expandedDirs.append(move expCopy)
-      run audio_native.libScanTree(String.view(&firstFolderRel), "", "", SORT_ALPHA)
+      run audio_native.libScanTree(String.view(&firstFolderRel), "", "", SORT_DATE)
     } else {
       move initScan
     }
@@ -975,6 +989,9 @@ impl Overtone {
       showRefWave: true,
       plotOnRef: false,
       splitRefSpec: false,
+      refWarpLut: [0.0; 512],
+      refWarpActive: false,
+      gpuNeedRefWarpReload: false,
       listenMode: LISTEN_YOU,
       normToRef: false,
       normRefGainDb: 0.0,
@@ -1041,7 +1058,7 @@ impl Overtone {
       activeClipDir: String.make(),
       activeClipInLib: false,
       libFilter: FILTER_ALL,
-      libSortMode: SORT_ALPHA,
+      libSortMode: SORT_DATE,
       bgScoreActive: false,
       bgScoreDone: 0,
       bgScoreTotal: 0,
@@ -1128,9 +1145,14 @@ impl Overtone {
       readoutVtl: run String.copy("—"),
       readoutH1H2: run String.copy("—"),
       readoutHnr: run String.copy("—"),
+      readoutAvgF0: run String.copy("—"),
       readoutDeltaPitch: String.make(),
       readoutDeltaVtl: String.make(),
       readoutDeltaWeight: String.make(),
+      readoutDeltaHnr: String.make(),
+      selVoiceSummary: VoiceSummary.empty(),
+      selTakeLtas: [0.0; 64],
+      hasSelTakeLtas: false,
       readoutScoreOverall: run String.copy("—"),
       readoutScorePitch: run String.copy("—"),
       readoutScoreSize: run String.copy("—"),
@@ -1208,6 +1230,9 @@ impl Overtone {
       useNeural: true,
       takeNeuralGen: 0,
       refNeuralGen: 0,
+      liveNeuralGen: 0,
+      liveNeuralLastReqDur: -1.0,
+      liveNeuralInFlight: false,
       neuralStatusFlags: 0,
 
       isolateMode: ISOLATE_FULL,
@@ -1285,10 +1310,61 @@ impl Overtone {
       self.refClip.clear()
       self.gpuNeedRefReload = true
     }
+    self.refWarpActive = false
+    self.gpuNeedRefWarpReload = true
+    audio_native.playSetRefWarp(&[], 0.0)
     self.plotOnRef = false
     self.listenMode = LISTEN_YOU
     self.bgScoreActive = false
     self.readoutBgScore.clear()
+  }
+
+  fn rebuildRefWarpLut(self: &mut Self) -> () {
+    let dur = self.clipDuration()
+    let pts = self.compare.points.asSlice()
+    if !self.refClip.active || !self.useDtwAlign || !self.compare.valid || pts.length < 2 || dur <= 0.02 {
+      self.refWarpActive = false
+      self.gpuNeedRefWarpReload = true
+      audio_native.playSetRefWarp(&[], 0.0)
+      return ()
+    }
+    // Build a 512-entry piecewise-linear warp LUT: takeTime in [0..dur] -> refTimeSec
+    let nPts = pts.length
+    let firstT = pts[0].time
+    let firstR = pts[0].refTime
+    let lastT = pts[nPts - 1].time
+    let lastR = pts[nPts - 1].refTime
+    let mut k: usize = 0
+    let mut pi: usize = 0
+    while k < 512 {
+      let t = (usize.toF64(k) / 511.0) * dur
+      let mut r: f64 = 0.0
+      if t <= firstT {
+        r = firstR - (firstT - t)
+      } else if t >= lastT {
+        r = lastR + (t - lastT)
+      } else {
+        while pi + 1 < nPts && pts[pi + 1].time < t {
+          pi = pi + 1
+        }
+        let t0 = pts[pi].time
+        let t1 = pts[pi + 1].time
+        let r0 = pts[pi].refTime
+        let r1 = pts[pi + 1].refTime
+        let span = t1 - t0
+        if span > 1.0e-6 {
+          let frac = f64.max(0.0, f64.min(1.0, (t - t0) / span))
+          r = r0 + frac * (r1 - r0)
+        } else {
+          r = r0
+        }
+      }
+      self.refWarpLut[k] = f64.toF32(r)
+      k = k + 1
+    }
+    self.refWarpActive = true
+    self.gpuNeedRefWarpReload = true
+    audio_native.playSetRefWarp(&self.refWarpLut, dur)
   }
 
   pub fn activeTakeGainDb(self: &Self) -> f32 {
@@ -1408,6 +1484,9 @@ impl Overtone {
     let mut vrStr = String.make()
     run appendInt(&mut vrStr, f32.toI32(f32.round(self.vowelResonance * 100.0)))
     audio_native.prefSet("vowel_res", String.view(&vrStr))
+    let mut smStr = String.make()
+    run appendInt(&mut smStr, self.libSortMode)
+    audio_native.prefSet("lib_sort_mode", String.view(&smStr))
   }
 
   effect fn applyFavoriteAudioDevices(self: &mut Self) -> ()
@@ -1472,6 +1551,11 @@ impl Overtone {
         vi = vi + 1
       }
       self.vowelResonance = f32.max(0.0, f32.min(1.0, i32.toF32(vrNum) * 0.01))
+    }
+    let sm = run audio_native.prefGet("lib_sort_mode")
+    let smBytes = String.utf8Bytes(String.view(&sm))
+    if smBytes.length > 0 && smBytes[0] >= 48 && smBytes[0] <= 54 {
+      self.libSortMode = u32.toI32(u8.toU32(smBytes[0] - 48))
     }
     let spitch = run audio_native.prefGet("show_pitch")
     if String.view(&spitch) == "0" { self.showPitch = false }
@@ -1680,54 +1764,128 @@ impl Overtone {
     let sr = self.sampleRate
     let src = self.samples.asSlice()
     let frameLen = f64.toUsize(f64.max(64.0, sr * 0.010))
-    let mut peakSq: f64 = 0.0
-    let mut pos: usize = 0
-    while pos + frameLen <= src.length {
+    let numFrames = src.length / frameLen
+    if numFrames < 4 {
+      self.statusMsg = run String.copy("Clip is too short to trim.")
+      return ()
+    }
+
+    // 2-stage 200 Hz high-pass filter for speech-activity detection ONLY (original PCM stays untouched!).
+    // Crushes 50-150 Hz room hum / fan rumble / desk thumps by ~18-25 dB so leading & trailing silence
+    // trims reliably even in noisy rooms!
+    let rc = 1.0 / (2.0 * 3.141592653589793 * 200.0)
+    let dt = 1.0 / sr
+    let alpha = rc / (rc + dt)
+    let mut prevIn1: f64 = 0.0
+    let mut prevOut1: f64 = 0.0
+    let mut prevIn2: f64 = 0.0
+    let mut prevOut2: f64 = 0.0
+
+    let mut frameDbs = List<f64>.make()
+    let mut sortedDbs = List<f64>.make()
+    let mut peakDb: f64 = -120.0
+    let mut fi: usize = 0
+    while fi < numFrames {
+      let base = fi * frameLen
       let mut sq: f64 = 0.0
       let mut j: usize = 0
       while j < frameLen {
-        let v = f32.toF64(src[pos + j])
-        sq = sq + v * v
+        let x = f32.toF64(src[base + j])
+        let y1 = alpha * (prevOut1 + x - prevIn1)
+        prevIn1 = x
+        prevOut1 = y1
+        let y2 = alpha * (prevOut2 + y1 - prevIn2)
+        prevIn2 = y1
+        prevOut2 = y2
+        sq = sq + y2 * y2
         j = j + 1
       }
       let msq = sq / usize.toF64(frameLen)
-      if msq > peakSq { peakSq = msq }
-      pos = pos + frameLen
+      let db = if msq > 1e-12 { 4.342944819032518 * f64.log(msq) } else { -120.0 }
+      if db > peakDb { peakDb = db }
+      run frameDbs.append(db)
+      run sortedDbs.append(db)
+      fi = fi + 1
     }
-    if peakSq <= 1e-10 {
+    if peakDb <= -80.0 {
       self.statusMsg = run String.copy("Audio is completely silent — nothing to trim.")
       return ()
     }
-    let peakDb = 4.342944819032518 * f64.log(peakSq)
-    // Adaptive threshold: 34 dB below speech peak, clamped to [-50, -32] dB so soft plosives stay safe!
-    let threshDb = f64.max(-50.0, f64.min(-32.0, peakDb - 34.0))
-    let threshSq = f64.pow(10.0, threshDb / 10.0)
 
-    let mut firstIdx: usize = src.length
-    let mut lastIdx: usize = 0
-    pos = 0
-    while pos + frameLen <= src.length {
-      let mut sq: f64 = 0.0
-      let mut j: usize = 0
-      while j < frameLen {
-        let v = f32.toF64(src[pos + j])
-        sq = sq + v * v
-        j = j + 1
+    // Insertion-sort frame energies to measure adaptive room-noise floor (15th percentile) & speech level (96th pct)
+    let sMut = sortedDbs.asMutSlice()
+    let mut si: usize = 1
+    while si < sMut.length {
+      let key = sMut[si]
+      let mut sj = si
+      while sj > 0 && sMut[sj - 1] > key {
+        sMut[sj] = sMut[sj - 1]
+        sj = sj - 1
       }
-      if (sq / usize.toF64(frameLen)) >= threshSq {
-        if firstIdx == src.length {
-          firstIdx = pos
-        }
-        lastIdx = pos + frameLen
-      }
-      pos = pos + frameLen
+      sMut[sj] = key
+      si = si + 1
     }
+    let p15Idx = (sMut.length * 15) / 100
+    let p96Idx = (sMut.length * 96) / 100
+    let noiseFloorDb = sMut[if p15Idx < sMut.length { p15Idx } else { 0 }]
+    let speechRefDb = sMut[if p96Idx < sMut.length { p96Idx } else { sMut.length - 1 }]
+    // Adaptive threshold: stays well above the room noise floor (+10 dB) yet catches soft consonants/plosives
+    let dynamicThresh = f64.max(noiseFloorDb + 10.0, speechRefDb - 28.0)
+    let threshDb = f64.min(speechRefDb - 10.0, f64.max(-52.0, dynamicThresh))
+
+    let dbs = frameDbs.asSlice()
+    // Mark active speech frames (either high-passed energy above adaptive threshold OR voiced pitch frame)
+    let mut active = List<bool>.make()
+    fi = 0
+    while fi < numFrames {
+      let tSec = (usize.toF64(fi) + 0.5) * (usize.toF64(frameLen) / sr)
+      let mut isAct = dbs[fi] >= threshDb
+      if !isAct {
+        if let Option<PitchFrame>.Some { value: pf } = self.pitchTrack.nearest(tSec) {
+          if f64.abs(pf.time - tSec) <= 0.025 && pf.voiced && pf.clarity >= self.displayClarity && dbs[fi] >= noiseFloorDb + 5.0 {
+            isAct = true
+          }
+        }
+      }
+      run active.append(isAct)
+      fi = fi + 1
+    }
+
+    // Debounce: require >= 2 consecutive active frames (20 ms) so isolated clicks/thumps don't block trimming
+    let actSl = active.asSlice()
+    let mut firstFrame: usize = numFrames
+    let mut lastFrame: usize = 0
+    fi = 0
+    while fi < numFrames {
+      let hasRun = actSl[fi] && (fi + 1 < numFrames && actSl[fi + 1])
+      if hasRun {
+        if firstFrame == numFrames {
+          firstFrame = fi
+        }
+        lastFrame = fi + 2
+      }
+      fi = fi + 1
+    }
+    // Fallback to single-frame active if clip has only a very short plosive/burst
+    if firstFrame >= lastFrame {
+      fi = 0
+      while fi < numFrames {
+        if actSl[fi] {
+          if firstFrame == numFrames { firstFrame = fi }
+          lastFrame = fi + 1
+        }
+        fi = fi + 1
+      }
+    }
+    let firstIdx = firstFrame * frameLen
+    let lastIdxRaw = lastFrame * frameLen
+    let lastIdx = if lastIdxRaw < src.length { lastIdxRaw } else { src.length }
     if firstIdx >= lastIdx {
       self.statusMsg = run String.copy("No silence found to trim.")
       return ()
     }
-    let leadPad = f64.toUsize(sr * 0.045)
-    let tailPad = f64.toUsize(sr * 0.060)
+    let leadPad = f64.toUsize(sr * 0.055)
+    let tailPad = f64.toUsize(sr * 0.075)
     let startIdx = if firstIdx > leadPad { firstIdx - leadPad } else { 0 }
     let endRaw = lastIdx + tailPad
     let endIdx = if endRaw < src.length { endRaw } else { src.length }
@@ -2492,6 +2650,42 @@ impl Overtone {
     run self.refreshActiveLibMeta()
   }
 
+  effect fn scrollExplorerToActiveClip(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.activeClipInLib || String.byteLength(String.view(&self.activeClipPath)) == 0 {
+      return ()
+    }
+    let targetPath = String.view(&self.activeClipPath)
+    let nodes = self.libTree.asSlice()
+    let filter = self.libFilter
+    let mut curY: f32 = 4.0
+    let mut foundY: f32 = -1.0
+    let mut i: usize = 0
+    while i < nodes.length {
+      let node = &nodes[i]
+      let visible = node.isDir || filter != FILTER_STARRED || node.starred || node.rating > 0
+      if visible {
+        let hasMeta = !node.isDir && (node.rating > 0 || String.byteLength(String.view(&node.comment)) > 0)
+        let rh = if hasMeta { EXPLORER_ROW_META_H } else { EXPLORER_ROW_H }
+        if !node.isDir && String.view(&node.fullPath) == targetPath {
+          foundY = curY
+          break
+        }
+        curY = curY + rh + EXPLORER_ROW_GAP
+      }
+      i = i + 1
+    }
+    if foundY >= 0.0 {
+      let viewH = f32.max(120.0, self.explorerTreeRect.height())
+      if foundY < self.explorerScrollY || foundY > self.explorerScrollY + viewH - 36.0 {
+        let maxScroll = f32.max(0.0, self.explorerTotalH - viewH)
+        self.explorerScrollY = f32.max(0.0, f32.min(maxScroll, foundY - viewH * 0.35))
+        run self.rebuildExplorerVisibleRows()
+      }
+    }
+  }
+
   effect fn startRenameActiveOrSelected(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
@@ -2900,6 +3094,23 @@ impl Overtone {
       self.refClip.durationSec = self.clipDuration()
       run self.reanalyzeRefClip()
       self.gpuNeedRefReload = true
+      run self.startBgScoring(true)
+    } else if self.refClip.active && self.activeClipInLib && self.compare.score.valid {
+      // Always re-persist updated score and re-sort sidebar immediately after editing a take!
+      if String.byteLength(String.view(&self.activeClipParentRef)) > 0 {
+        drop audio_native.libUpdateScores(
+          String.view(&self.activeClipDir),
+          String.view(&self.activeClipFilename),
+          String.view(&self.refClip.fullPath),
+          u32.toI32(self.compare.score.overall),
+          u32.toI32(self.compare.score.pitchScore),
+          u32.toI32(self.compare.score.sizeScore),
+          u32.toI32(self.compare.score.weightScore),
+          u32.toI32(self.compare.score.vowelScore),
+          SCORE_VERSION,
+        )
+        run self.reloadTree(false)
+      }
     }
     run self.recomputeNormGain()
     let mut savedMsg = run String.copy(msg)
@@ -3131,6 +3342,7 @@ impl Overtone {
       self.readoutDeltaPitch.clear()
       self.readoutDeltaVtl.clear()
       self.readoutDeltaWeight.clear()
+      self.readoutDeltaHnr.clear()
       self.readoutScoreOverall = run String.copy("—")
       self.readoutScorePitch = run String.copy("—")
       self.readoutScoreSize = run String.copy("—")
@@ -3149,17 +3361,21 @@ impl Overtone {
     let mut dSemi: f64 = 0.0
     let mut dVtl: f64 = 0.0
     let mut dWt: f64 = 0.0
+    let mut dHnr: f64 = 0.0
     if hasDeltas {
       dSemi = if useSel { self.selCompare.deltaSemi } else { self.compare.deltaSemi }
       dVtl = if useSel { self.selCompare.deltaVtlCm } else { self.compare.deltaVtlCm }
       dWt = if useSel { self.selCompare.deltaH1H2Db } else { self.compare.deltaH1H2Db }
+      dHnr = if useSel { self.selCompare.deltaHnrDb } else { self.compare.deltaHnrDb }
       self.readoutDeltaPitch = run formatSignedFixed(dSemi, 1, "st")
       self.readoutDeltaVtl = run formatSignedFixed(dVtl, 1, " cm")
       self.readoutDeltaWeight = run formatSignedFixed(dWt, 1, " dB")
+      self.readoutDeltaHnr = run formatSignedFixed(dHnr, 1, " dB")
     } else {
       self.readoutDeltaPitch.clear()
       self.readoutDeltaVtl.clear()
       self.readoutDeltaWeight.clear()
+      self.readoutDeltaHnr.clear()
     }
     if sc.valid {
       self.readoutScoreOverall = run formatScorePct(u32.toI32(sc.overall))
@@ -3286,8 +3502,12 @@ impl Overtone {
         }
       }
       run self.updateSelectionCompare()
+      self.rebuildRefWarpLut()
     } else {
       self.plotOnRef = false
+      self.refWarpActive = false
+      self.gpuNeedRefWarpReload = true
+      audio_native.playSetRefWarp(&[], 0.0)
       self.compare = CompareAlignment.empty()
       self.selCompare = SelectionCompare.empty()
       self.bgScoreActive = false
@@ -3643,6 +3863,85 @@ impl Overtone {
     run self.voiceMetrics.finalizeSummary(self.samples.asSlice(), self.sampleRate)
     run self.recomputeCompare()
     run self.refreshVowelAnalysis(false)
+    run self.rebuildDrawings(true)
+  }
+
+  fn maybeRequestLiveNeuralFormants(self: &mut Self) -> () {
+    if !self.useNeural || (self.neuralStatusFlags & 2) == 0 || self.sampleRate <= 0.0 {
+      return ()
+    }
+    let dur = self.clipDuration()
+    if dur < 0.22 {
+      return ()
+    }
+    // Throttle requests to ~220ms intervals; allow retry if a previous job took >1.2s
+    if self.liveNeuralInFlight && (dur - self.liveNeuralLastReqDur) < 1.2 {
+      return ()
+    }
+    if (dur - self.liveNeuralLastReqDur) < 0.22 {
+      return ()
+    }
+    let all = self.samples.asSlice()
+    let winN = f64.toUsize(f64.round(self.sampleRate * 2.4))
+    let startIdx = if all.length > winN { all.length - winN } else { 0 }
+    let count = all.length - startIdx
+    if count < 256 {
+      return ()
+    }
+    let startSec = usize.toF64(startIdx) / self.sampleRate
+    self.liveNeuralGen = self.liveNeuralGen + 1
+    self.liveNeuralLastReqDur = dur
+    self.liveNeuralInFlight = true
+    audio_native.neuralLiveFormantsRequest(
+      self.liveNeuralGen,
+      Slice.view<f32>(all, startIdx, count),
+      self.sampleRate,
+      startSec,
+    )
+  }
+
+  effect fn applyLiveNeuralFormants(self: &mut Self, jobId: i32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if jobId == self.liveNeuralGen {
+      self.liveNeuralInFlight = false
+    }
+    if !self.useNeural || !self.recording || jobId != self.liveNeuralGen {
+      return ()
+    }
+    let nf = audio_native.neuralLiveFormantCount()
+    if nf == 0 {
+      return ()
+    }
+    let mut fts = List<f64>.make()
+    let mut f1 = List<f64>.make()
+    let mut f2 = List<f64>.make()
+    let mut f3 = List<f64>.make()
+    run fts.appendRepeated(0.0, nf)
+    run f1.appendRepeated(0.0, nf)
+    run f2.appendRepeated(0.0, nf)
+    run f3.appendRepeated(0.0, nf)
+    let got = audio_native.neuralLiveCopyFormants(fts.asMutSlice(), f1.asMutSlice(), f2.asMutSlice(), f3.asMutSlice())
+    if got == 0 {
+      return ()
+    }
+    run applyNeuralFormantFramesRange(
+      self.formantTrack.frames.asMutSlice(),
+      self.pitchTrack.frames.asSlice(),
+      self.displayClarity,
+      fts.asSlice(),
+      f1.asSlice(),
+      f2.asSlice(),
+      f3.asSlice(),
+    )
+    self.voiceMetrics.reset()
+    drop run self.voiceMetrics.update(
+      self.samples.asSlice(),
+      self.sampleRate,
+      self.pitchTrack.frames.asSlice(),
+      self.formantTrack.frames.asSlice(),
+      self.displayClarity,
+    )
     run self.rebuildDrawings(true)
   }
 
@@ -4043,13 +4342,33 @@ impl Overtone {
     {
       run String.copy(String.view(&self.clipName))
     } else if attachToRef && String.byteLength(String.view(&self.refClip.name)) > 0 {
-      let mut tn = run String.copy(String.view(&self.refClip.name))
-      run tn.append(" take")
+      // Concise, descriptive child take name: "Take N · HH:MM" (avoids truncating long ref names!)
+      let mut takeNum: i32 = 1
+      let rIdxN = self.findLibIdxByFullPath(String.view(&self.refClip.fullPath))
+      if rIdxN < self.libTree.length() {
+        takeNum = u32.toI32(self.libTree.asSlice()[rIdxN].childCount) + 1
+      }
+      let stamp = run audio_native.nowShortTime(false)
+      let mut tn = String.make()
+      run tn.append("Take ")
+      run appendInt(&mut tn, takeNum)
+      if String.byteLength(String.view(&stamp)) > 0 {
+        run tn.append(" · ")
+        run tn.append(String.view(&stamp))
+      }
       move tn
     } else if makeNewRef {
       run String.copy("reference")
     } else {
-      run String.copy("recording")
+      let stamp = run audio_native.nowShortTime(true)
+      if String.byteLength(String.view(&stamp)) > 0 {
+        let mut rn = String.make()
+        run rn.append("Rec · ")
+        run rn.append(String.view(&stamp))
+        move rn
+      } else {
+        run String.copy("recording")
+      }
     }
 
     let sr = self.sampleRate
@@ -4103,6 +4422,9 @@ impl Overtone {
       }
       run self.ensureDirExpanded(String.view(&dirCopy))
       run self.reloadTree(false)
+      if !updateInPlace {
+        run self.scrollExplorerToActiveClip()
+      }
       run self.saveSessionPrefs()
       let mut msg = String.make()
       run msg.append("Saved ")
@@ -4403,6 +4725,9 @@ impl Overtone {
       return ()
     }
     self.errorMsg.clear()
+    self.liveNeuralGen = self.liveNeuralGen + 1
+    self.liveNeuralLastReqDur = -1.0
+    self.liveNeuralInFlight = false
     if appending {
       // Save undo before appending so user can undo a bad appended take!
       run self.saveUndoSnapshot()
@@ -4713,7 +5038,11 @@ impl Overtone {
       drop run self.pitchTrack.update(self.samples.asSlice())
       let prevFmtLen = self.formantTrack.frames.length()
       drop run self.formantTrack.update(self.samples.asSlice())
-      self.formantTrack.updateLiveTracked(self.pitchTrack.frames.asSlice(), self.displayClarity, prevFmtLen)
+      if self.useNeural && (self.neuralStatusFlags & 2) != 0 {
+        self.maybeRequestLiveNeuralFormants()
+      } else {
+        self.formantTrack.updateLiveTracked(self.pitchTrack.frames.asSlice(), self.displayClarity, prevFmtLen)
+      }
       drop run self.voiceMetrics.update(
         self.samples.asSlice(),
         self.sampleRate,
@@ -4810,25 +5139,34 @@ impl Overtone {
       )
     } else if wantRef {
       audio_native.playSetGainDb(0.0)
-      let refEnd = f64.min(self.refClip.durationSec, if self.hasSelection { endSec } else { self.refClip.durationSec })
-      let refStart = f64.min(startSec, f64.max(0.0, refEnd - 0.02))
-      let refLoopStart = f64.min(loopStartSec, refStart)
-      audio_native.playSetLoopStart(if self.loopSelection { refLoopStart } else { -1.0 })
-      if self.isolateMode != ISOLATE_FULL || self.voiceLabMode != LAB_OFF {
-        audio_native.playFiltered(
-          true,
-          self.refClip.samples.asSlice(),
-          self.refClip.sampleRate,
-          refStart,
-          refEnd,
-          self.loopSelection,
-          self.isolateMode,
-          self.isolateTiming,
-          self.voiceLabMode,
-          self.monoTargetHz(),
-        )
+      let useWarpedRef = self.isSplitRefSpec() && self.useDtwAlign && self.refWarpActive
+      if useWarpedRef && self.isolateMode == ISOLATE_FULL && self.voiceLabMode == LAB_OFF {
+        let takeEnd = f64.min(self.clipDuration(), if self.hasSelection { endSec } else { self.clipDuration() })
+        let takeStart = f64.min(startSec, f64.max(0.0, takeEnd - 0.02))
+        let takeLoopStart = f64.min(loopStartSec, takeStart)
+        audio_native.playSetLoopStart(if self.loopSelection { takeLoopStart } else { -1.0 })
+        audio_native.playWarpedRef(self.refClip.samples.asSlice(), self.refClip.sampleRate, takeStart, takeEnd, self.loopSelection)
       } else {
-        audio_native.playRange(self.refClip.samples.asSlice(), self.refClip.sampleRate, refStart, refEnd, self.loopSelection)
+        let refEnd = f64.min(self.refClip.durationSec, if self.hasSelection { endSec } else { self.refClip.durationSec })
+        let refStart = f64.min(startSec, f64.max(0.0, refEnd - 0.02))
+        let refLoopStart = f64.min(loopStartSec, refStart)
+        audio_native.playSetLoopStart(if self.loopSelection { refLoopStart } else { -1.0 })
+        if self.isolateMode != ISOLATE_FULL || self.voiceLabMode != LAB_OFF {
+          audio_native.playFiltered(
+            true,
+            self.refClip.samples.asSlice(),
+            self.refClip.sampleRate,
+            refStart,
+            refEnd,
+            self.loopSelection,
+            self.isolateMode,
+            self.isolateTiming,
+            self.voiceLabMode,
+            self.monoTargetHz(),
+          )
+        } else {
+          audio_native.playRange(self.refClip.samples.asSlice(), self.refClip.sampleRate, refStart, refEnd, self.loopSelection)
+        }
       }
     } else {
       audio_native.playSetGainDb(self.activeTakeGainDb())
@@ -4890,16 +5228,169 @@ impl Overtone {
     audio_native.playStop()
   }
 
+  effect fn refreshAvgMetricReadouts(self: &mut Self, inspectSec: f64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let selSpanValid = self.hasSelection && f64.abs(self.selEnd - self.selStart) >= 0.015
+    if self.recording {
+      let vfOpt = self.voiceMetrics.nearest(inspectSec)
+      let mut gotLive = false
+      if let Option<VoiceFrame>.Some { value: vf } = vfOpt {
+        if vf.voiced {
+          self.readoutAvgF0 = run formatHzFull(vf.f0)
+          self.readoutH1H2 = run formatSignedFixed(vf.h1h2Db, 1, " dB")
+          self.readoutHnr = run formatSignedFixed(vf.hnrDb, 0, " dB")
+          if vf.vtlCm > 1.0 {
+            self.readoutVtl = run formatVtlCm(vf.vtlCm)
+            return ()
+          }
+          gotLive = true
+        }
+      }
+      // Look back up to 0.45s for the latest live Neural VTL (accounts for ~220ms worker hop)
+      let vfs = self.voiceMetrics.frames.asSlice()
+      let mut bestVtl: f64 = 0.0
+      let mut k = vfs.length
+      while k > 0 {
+        k = k - 1
+        let fr = vfs[k]
+        if inspectSec - fr.time > 0.48 {
+          break
+        }
+        if fr.voiced && fr.vtlCm > 1.0 {
+          bestVtl = fr.vtlCm
+          if !gotLive {
+            self.readoutAvgF0 = run formatHzFull(fr.f0)
+            self.readoutH1H2 = run formatSignedFixed(fr.h1h2Db, 1, " dB")
+            self.readoutHnr = run formatSignedFixed(fr.hnrDb, 0, " dB")
+            gotLive = true
+          }
+          break
+        }
+      }
+      if bestVtl > 1.0 {
+        self.readoutVtl = run formatVtlCm(bestVtl)
+      } else {
+        self.readoutVtl = run String.copy("—")
+      }
+      if !gotLive {
+        self.readoutAvgF0 = run String.copy("—")
+        self.readoutH1H2 = run String.copy("—")
+        self.readoutHnr = run String.copy("—")
+      }
+      return ()
+    }
+    let activeSum = if selSpanValid {
+      self.selVoiceSummary
+    } else if self.isPlottingOnRef() {
+      self.refClip.summary
+    } else {
+      self.voiceMetrics.summary
+    }
+    if activeSum.voicedFrames > 0 {
+      self.readoutAvgF0 = if activeSum.medianF0 > 1.0 { run formatHzFull(activeSum.medianF0) } else { run String.copy("—") }
+      self.readoutVtl = run formatVtlCm(activeSum.medianVtlCm)
+      self.readoutH1H2 = run formatSignedFixed(activeSum.medianH1H2Db, 1, " dB")
+      self.readoutHnr = run formatSignedFixed(activeSum.medianHnrDb, 0, " dB")
+    } else {
+      self.readoutAvgF0 = run String.copy("—")
+      self.readoutVtl = run String.copy("—")
+      self.readoutH1H2 = run String.copy("—")
+      self.readoutHnr = run String.copy("—")
+    }
+  }
+
+  effect fn rebuildSideAverageDrawings(self: &mut Self, inspectSec: f64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let rightPlotW = f32.max(180.0, self.readoutsWidth - 32.0)
+    let ffOpt = self.formantTrack.nearest(inspectSec)
+    let vfOpt = self.voiceMetrics.nearest(inspectSec)
+    let selLo = f64.min(self.selStart, self.selEnd)
+    let selHi = f64.max(self.selStart, self.selEnd)
+    let hasSel = self.hasSelection && (selHi - selLo) >= 0.015
+    let hasSelTake = hasSel && self.selVoiceSummary.voicedFrames > 0
+    let hasSelRef = hasSel && self.selCompare.valid
+    let takeSum = if hasSelTake { self.selVoiceSummary } else { self.voiceMetrics.summary }
+    let refSum = if hasSelRef { self.selCompare.refSummary } else { self.refClip.summary }
+    let takeT0 = if hasSelRef { self.selCompare.takeStart } else { selLo }
+    let takeT1 = if hasSelRef { self.selCompare.takeEnd } else { selHi }
+    let refT0 = if hasSelRef { self.selCompare.refStart } else { 0.0 }
+    let refT1 = if hasSelRef { self.selCompare.refEnd } else { 0.0 }
+
+    self.sizeWeightDrawing = run buildSizeWeightPadDrawing(
+      rightPlotW,
+      PAD_H,
+      self.voiceMetrics.frames.asSlice(),
+      takeSum,
+      vfOpt,
+      self.refClip.voiceFrames.asSlice(),
+      refSum,
+      self.compare.points.asSlice(),
+      inspectSec,
+      self.refClip.active,
+      hasSel,
+      takeT0,
+      takeT1,
+      hasSelRef,
+      refT0,
+      refT1,
+    )
+    self.ltasDrawing = run buildLtasDrawing(
+      rightPlotW,
+      self.sliceHeight,
+      if hasSel && self.hasSelTakeLtas { &self.selTakeLtas } else { &self.voiceMetrics.ltas },
+      if hasSel && self.hasSelTakeLtas { true } else { self.voiceMetrics.hasLtas },
+      if hasSelRef && self.selCompare.hasRefLtas { &self.selCompare.refLtas } else { &self.refClip.ltas },
+      if hasSelRef && self.selCompare.hasRefLtas { true } else { self.refClip.active && self.refClip.hasLtas },
+    )
+    self.vowelDrawing = run buildVowelChartDrawing(
+      rightPlotW,
+      VOWEL_H,
+      ffOpt,
+      self.voiceMetrics.frames.asSlice(),
+      takeSum,
+      self.takeVowelSpans.asSlice(),
+      self.refClip.voiceFrames.asSlice(),
+      refSum,
+      self.refVowelSpans.asSlice(),
+      self.compare.points.asSlice(),
+      inspectSec,
+      self.refClip.active,
+      self.vowelResonance,
+      hasSel,
+      takeT0,
+      takeT1,
+      hasSelRef,
+      refT0,
+      refT1,
+    )
+    self.vowelChartDots = run computeVowelChartDots(
+      self.takeVowelSpans.asSlice(),
+      self.voiceMetrics.frames.asSlice(),
+      rightPlotW,
+      VOWEL_H,
+      hasSel,
+      takeT0,
+      takeT1,
+    )
+  }
+
   effect fn updateSelectionReadout(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
     if !self.hasSelection {
       self.readoutSelSpan.clear()
       self.selPitchStats = SelectionPitchStats.empty()
+      self.selVoiceSummary = VoiceSummary.empty()
+      self.hasSelTakeLtas = false
       self.readoutSelPitchChip.clear()
       self.readoutSelPitchMain.clear()
       self.readoutSelPitchSub.clear()
       run self.updateSelectionCompare()
+      let inspectSec = if self.recording { f64.max(0.0, self.clipDuration() - 0.03) } else { self.cursorSec }
+      run self.refreshAvgMetricReadouts(inspectSec)
+      run self.rebuildSideAverageDrawings(inspectSec)
       if self.refClip.active && self.showRefWave {
         run self.updateViewportDrawings()
       }
@@ -4910,10 +5401,15 @@ impl Overtone {
     if hi - lo < 0.015 {
       self.readoutSelSpan.clear()
       self.selPitchStats = SelectionPitchStats.empty()
+      self.selVoiceSummary = VoiceSummary.empty()
+      self.hasSelTakeLtas = false
       self.readoutSelPitchChip.clear()
       self.readoutSelPitchMain.clear()
       self.readoutSelPitchSub.clear()
       run self.updateSelectionCompare()
+      let inspectSec = if self.recording { f64.max(0.0, self.clipDuration() - 0.03) } else { self.cursorSec }
+      run self.refreshAvgMetricReadouts(inspectSec)
+      run self.rebuildSideAverageDrawings(inspectSec)
       if self.refClip.active && self.showRefWave {
         run self.updateViewportDrawings()
       }
@@ -4977,8 +5473,121 @@ impl Overtone {
       self.readoutSelPitchSub.clear()
     }
     run self.updateSelectionCompare()
+    // Summarize selection voice metrics & LTAS directly even when no Reference is active!
+    let vFrames = if onRef { self.refClip.voiceFrames.asSlice() } else { self.voiceMetrics.frames.asSlice() }
+    let mut selVTimes = List<f64>.make()
+    self.selVoiceSummary = run summarizeVoiceRange(vFrames, lo - 0.015, hi + 0.015, &mut selVTimes)
+    let mut selLtasBuf: [f32; 64] = [0.0; 64]
+    let ltasOk = if selVTimes.length() > 0 {
+      audio_native.computeLtasNative(
+        self.gpuSamples(),
+        self.gpuSampleRate(),
+        selVTimes.asSlice(),
+        &mut selLtasBuf,
+        LTAS_FMIN,
+        LTAS_FMAX,
+      )
+    } else {
+      false
+    }
+    self.selTakeLtas = selLtasBuf
+    self.hasSelTakeLtas = ltasOk
+    let inspectSec = if self.recording { f64.max(0.0, self.clipDuration() - 0.03) } else { self.cursorSec }
+    run self.refreshAvgMetricReadouts(inspectSec)
+    run self.refreshFormantReadouts(inspectSec)
+    run self.rebuildSideAverageDrawings(inspectSec)
     if self.refClip.active && self.showRefWave {
       run self.updateViewportDrawings()
+    }
+  }
+
+  effect fn refreshFormantReadouts(self: &mut Self, inspectSec: f64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let selSpanValid = !self.recording && self.hasSelection && f64.abs(self.selEnd - self.selStart) >= 0.015
+    if selSpanValid {
+      let lo = f64.min(self.selStart, self.selEnd)
+      let hi = f64.max(self.selStart, self.selEnd)
+      let fFrames = if self.isPlottingOnRef() { self.refClip.formantFrames.asSlice() } else { self.formantTrack.frames.asSlice() }
+      let mut s1: f64 = 0.0
+      let mut s2: f64 = 0.0
+      let mut s3: f64 = 0.0
+      let mut s4: f64 = 0.0
+      let mut c12: usize = 0
+      let mut c3: usize = 0
+      let mut c4: usize = 0
+      let mut fi: usize = 0
+      while fi < fFrames.length {
+        let fr = fFrames[fi]
+        if fr.tracked && fr.time >= lo - 0.015 && fr.time <= hi + 0.015 && fr.count >= 2 {
+          s1 = s1 + fr.f1
+          s2 = s2 + fr.f2
+          c12 = c12 + 1
+          if fr.count >= 3 && fr.f3 > fr.f2 {
+            s3 = s3 + fr.f3
+            c3 = c3 + 1
+          }
+          if fr.count >= 4 && fr.f4 > fr.f3 {
+            s4 = s4 + fr.f4
+            c4 = c4 + 1
+          }
+        }
+        fi = fi + 1
+      }
+      if c12 > 0 {
+        let m1 = s1 / usize.toF64(c12)
+        let m2 = s2 / usize.toF64(c12)
+        self.readoutF1 = run formatHz(m1)
+        self.readoutF2 = run formatHz(m2)
+        self.readoutF3 = if c3 > 0 { run formatHz(s3 / usize.toF64(c3)) } else { run String.copy("—") }
+        self.readoutF4 = if c4 > 0 { run formatHz(s4 / usize.toF64(c4)) } else { run String.copy("—") }
+        self.readoutVowel = estimateVowelForResonance(m1, m2, f32.toF64(self.vowelResonance))
+      } else {
+        self.readoutF1 = run String.copy("—")
+        self.readoutF2 = run String.copy("—")
+        self.readoutF3 = run String.copy("—")
+        self.readoutF4 = run String.copy("—")
+        self.readoutVowel = "—"
+      }
+    } else {
+      let mut ffOpt = self.formantTrack.nearest(inspectSec)
+      // During live recording, look back up to 0.45s for the latest Neural formant frame
+      if self.recording {
+        let mut needFallback = true
+        if let Option<FormantFrame>.Some { value: curFf } = ffOpt {
+          if curFf.tracked && curFf.count >= 2 {
+            needFallback = false
+          }
+        }
+        if needFallback {
+          let ffs = self.formantTrack.frames.asSlice()
+          let mut k = ffs.length
+          while k > 0 {
+            k = k - 1
+            let fr = ffs[k]
+            if inspectSec - fr.time > 0.48 {
+              break
+            }
+            if fr.tracked && fr.count >= 2 {
+              ffOpt = Option<FormantFrame>.Some { value: fr }
+              break
+            }
+          }
+        }
+      }
+      if let Option<FormantFrame>.Some { value: ff } = ffOpt {
+        self.readoutF1 = if ff.tracked && ff.count >= 1 { run formatHz(ff.f1) } else { run String.copy("—") }
+        self.readoutF2 = if ff.tracked && ff.count >= 2 { run formatHz(ff.f2) } else { run String.copy("—") }
+        self.readoutF3 = if ff.tracked && ff.count >= 3 { run formatHz(ff.f3) } else { run String.copy("—") }
+        self.readoutF4 = if ff.tracked && ff.count >= 4 { run formatHz(ff.f4) } else { run String.copy("—") }
+        self.readoutVowel = if ff.tracked && ff.count >= 2 { estimateVowelForResonance(ff.f1, ff.f2, f32.toF64(self.vowelResonance)) } else { "—" }
+      } else {
+        self.readoutF1 = run String.copy("—")
+        self.readoutF2 = run String.copy("—")
+        self.readoutF3 = run String.copy("—")
+        self.readoutF4 = run String.copy("—")
+        self.readoutVowel = "—"
+      }
     }
   }
 
@@ -5021,41 +5630,9 @@ impl Overtone {
       self.readoutDb = run String.copy("-∞ dB")
     }
 
-    let ffOpt = self.formantTrack.nearest(inspectSec)
-    if let Option<FormantFrame>.Some { value: ff } = ffOpt {
-      self.readoutF1 = if ff.tracked && ff.count >= 1 { run formatHz(ff.f1) } else { run String.copy("—") }
-      self.readoutF2 = if ff.tracked && ff.count >= 2 { run formatHz(ff.f2) } else { run String.copy("—") }
-      self.readoutF3 = if ff.tracked && ff.count >= 3 { run formatHz(ff.f3) } else { run String.copy("—") }
-      self.readoutF4 = if ff.tracked && ff.count >= 4 { run formatHz(ff.f4) } else { run String.copy("—") }
-      self.readoutVowel = if ff.tracked && ff.count >= 2 { estimateVowelForResonance(ff.f1, ff.f2, f32.toF64(self.vowelResonance)) } else { "—" }
-    } else {
-      self.readoutF1 = run String.copy("—")
-      self.readoutF2 = run String.copy("—")
-      self.readoutF3 = run String.copy("—")
-      self.readoutF4 = run String.copy("—")
-      self.readoutVowel = "—"
-    }
+    run self.refreshFormantReadouts(inspectSec)
 
-    let vfOpt = self.voiceMetrics.nearest(inspectSec)
-    if let Option<VoiceFrame>.Some { value: vf } = vfOpt {
-      if vf.voiced {
-        self.readoutVtl = run formatVtlCm(vf.vtlCm)
-        self.readoutH1H2 = run formatSignedFixed(vf.h1h2Db, 1, " dB")
-        self.readoutHnr = run formatSignedFixed(vf.hnrDb, 0, " dB")
-      } else if self.voiceMetrics.summary.voicedFrames > 0 {
-        self.readoutVtl = run formatVtlCm(self.voiceMetrics.summary.medianVtlCm)
-        self.readoutH1H2 = run formatSignedFixed(self.voiceMetrics.summary.medianH1H2Db, 1, " dB")
-        self.readoutHnr = run formatSignedFixed(self.voiceMetrics.summary.medianHnrDb, 0, " dB")
-      } else {
-        self.readoutVtl = run String.copy("—")
-        self.readoutH1H2 = run String.copy("—")
-        self.readoutHnr = run String.copy("—")
-      }
-    } else {
-      self.readoutVtl = run String.copy("—")
-      self.readoutH1H2 = run String.copy("—")
-      self.readoutHnr = run String.copy("—")
-    }
+    run self.refreshAvgMetricReadouts(inspectSec)
 
     if recomputeSlice && self.samples.length() > 0 {
       self.sliceData = run computeSpectrumSlice(
@@ -5228,36 +5805,9 @@ impl Overtone {
     }
     let pfOpt = self.pitchTrack.nearest(inspectSec)
     let ffOpt = self.formantTrack.nearest(inspectSec)
-    let vfOpt = self.voiceMetrics.nearest(inspectSec)
-
-    let mut activeMidi: i32 = 0
-    let mut hasActivePitch = false
-    if let Option<PitchFrame>.Some { value: pf } = pfOpt {
-      if pf.voiced && pf.clarity >= self.displayClarity {
-        activeMidi = frequencyToNote(pf.frequency).midi
-        hasActivePitch = true
-      }
-    }
-    if activeMidi != self.lastPianoMidi || hasActivePitch != self.lastPianoActive {
-      self.lastPianoMidi = activeMidi
-      self.lastPianoActive = hasActivePitch
-      self.pianoDrawing = run buildPianoDrawing(&self.vp, PIANO_W, self.specRect.height(), activeMidi, hasActivePitch)
-    }
-
     if doSlice {
       let rightPlotW = f32.max(180.0, self.readoutsWidth - 32.0)
-      self.sizeWeightDrawing = run buildSizeWeightPadDrawing(
-        rightPlotW,
-        PAD_H,
-        self.voiceMetrics.frames.asSlice(),
-        self.voiceMetrics.summary,
-        vfOpt,
-        self.refClip.voiceFrames.asSlice(),
-        self.refClip.summary,
-        self.compare.points.asSlice(),
-        inspectSec,
-        self.refClip.active,
-      )
+      run self.rebuildSideAverageDrawings(inspectSec)
       self.sliceDrawing = run buildSpectrumSliceDrawing(
         &self.vp,
         rightPlotW,
@@ -5271,28 +5821,96 @@ impl Overtone {
         self.displayFloorDb,
         self.displayCeilingDb,
       )
-      self.vowelDrawing = run buildVowelChartDrawing(
-        rightPlotW,
-        VOWEL_H,
-        ffOpt,
-        self.voiceMetrics.frames.asSlice(),
-        self.voiceMetrics.summary,
-        self.takeVowelSpans.asSlice(),
-        self.refClip.voiceFrames.asSlice(),
-        self.refClip.summary,
-        self.refVowelSpans.asSlice(),
-        self.compare.points.asSlice(),
-        inspectSec,
-        self.refClip.active,
-        self.vowelResonance,
-      )
-      self.vowelChartDots = run computeVowelChartDots(
-        self.takeVowelSpans.asSlice(),
-        self.voiceMetrics.frames.asSlice(),
-        rightPlotW,
-        VOWEL_H,
+    }
+  }
+
+  effect fn buildSplitRefOverlayDrawing(self: &Self, sw: f32, paneH: f32) -> Drawing
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let refOpts = OverlayOptions {
+      showPitch: self.showPitch,
+      showHarmonics: self.showHarmonics,
+      showFormants: self.showFormants,
+      formantMask: self.formantMask,
+      showNoteGrid: self.showNoteGrid,
+      showRefOverlay: false,
+      showRefWave: false,
+      showHeatmap: false,
+      heatmapMetric: self.heatmapMetric,
+      useDtwAlign: self.useDtwAlign,
+      plotOnRef: false,
+      showVowelRegions: self.showVowelRegions,
+      isolateMode: self.isolateMode,
+      displayClarity: self.displayClarity,
+      cursorSec: self.cursorSec,
+      hasSelection: self.hasSelection,
+      selStart: self.selStart,
+      selEnd: self.selEnd,
+      hasRefSel: false,
+      refSelStart: 0.0,
+      refSelEnd: 0.0,
+      hoverValid: false,
+      hoverX: 0.0,
+      hoverY: 0.0,
+    }
+    let pts = self.compare.points.asSlice()
+    if self.useDtwAlign && self.refWarpActive && pts.length >= 2 {
+      // Project Reference pitch & formant contours onto the Take timeline using the exact DTW warp!
+      let mut wPitch = List<PitchFrame>.make()
+      let mut wFmt = List<FormantFrame>.make()
+      let mut i: usize = 0
+      while i < pts.length {
+        let pt = pts[i]
+        run wPitch.append(PitchFrame {
+          time: pt.time,
+          frequency: pt.f0,
+          clarity: if pt.voiced { 0.95 } else { 0.0 },
+          intensityDb: if pt.voiced { -20.0 } else { -80.0 },
+          voiced: pt.voiced,
+        })
+        let mut cnt: usize = 0
+        if pt.hasFormants && pt.f1 > 1.0 && pt.f2 > pt.f1 {
+          cnt = 2
+          if pt.f3 > pt.f2 { cnt = 3 }
+          if pt.f4 > pt.f3 { cnt = 4 }
+        }
+        let mut wf = FormantFrame.empty(pt.time, if pt.voiced { -20.0 } else { -80.0 })
+        wf.f1 = pt.f1
+        wf.f2 = pt.f2
+        wf.f3 = pt.f3
+        wf.f4 = pt.f4
+        wf.count = cnt
+        wf.tracked = pt.voiced && pt.hasFormants && cnt >= 2
+        run wFmt.append(wf)
+        i = i + 1
+      }
+      return run buildSpectrogramOverlay(
+        &self.vp,
+        sw,
+        paneH,
+        wPitch.asSlice(),
+        wFmt.asSlice(),
+        &[],
+        &[],
+        self.refClip.sampleRate,
+        self.guides.asSlice(),
+        &[],
+        refOpts,
       )
     }
+    return run buildSpectrogramOverlay(
+      &self.vp,
+      sw,
+      paneH,
+      self.refClip.pitchFrames.asSlice(),
+      self.refClip.formantFrames.asSlice(),
+      &[],
+      &[],
+      self.refClip.sampleRate,
+      self.guides.asSlice(),
+      self.refVowelSpans.asSlice(),
+      refOpts,
+    )
   }
 
   /// Viewport-only pan/zoom update: ONLY rebuilds time/freq-dependent stage overlays & axis ticks!
@@ -5347,46 +5965,7 @@ impl Overtone {
       opts,
     )
     if split {
-      let refOpts = OverlayOptions {
-        showPitch: self.showPitch,
-        showHarmonics: self.showHarmonics,
-        showFormants: self.showFormants,
-        formantMask: self.formantMask,
-        showNoteGrid: self.showNoteGrid,
-        showRefOverlay: false,
-        showRefWave: false,
-        showHeatmap: false,
-        heatmapMetric: self.heatmapMetric,
-        useDtwAlign: self.useDtwAlign,
-        plotOnRef: false,
-        showVowelRegions: self.showVowelRegions,
-        isolateMode: self.isolateMode,
-        displayClarity: self.displayClarity,
-        cursorSec: self.cursorSec,
-        hasSelection: self.hasSelection,
-        selStart: self.selStart,
-        selEnd: self.selEnd,
-        hasRefSel: false,
-        refSelStart: 0.0,
-        refSelEnd: 0.0,
-        hoverValid: false,
-        hoverX: 0.0,
-        hoverY: 0.0,
-      }
-      self.refOverlayDrawing = run buildSpectrogramOverlay(
-        &self.vp,
-        sw,
-        paneH,
-        self.refClip.pitchFrames.asSlice(),
-        self.refClip.formantFrames.asSlice(),
-        &[],
-        &[],
-        self.refClip.sampleRate,
-        self.guides.asSlice(),
-        self.refVowelSpans.asSlice(),
-        refOpts,
-      )
-      self.refPianoDrawing = run buildPianoDrawing(&self.vp, PIANO_W, paneH, 0, false)
+      self.refOverlayDrawing = run self.buildSplitRefOverlayDrawing(sw, paneH)
       self.refFreqTicks = run computeFreqTicks(&self.vp, paneH)
     }
     self.vowelBadges = run computeVowelBadges(activeVowels, &self.vp, sw)
@@ -5421,7 +6000,6 @@ impl Overtone {
       onRef,
     )
     self.vowelLaneBadges = run computeVowelLaneBadges(activeVowels, activeVoiceFs, &self.vp, sw, self.vowelResonance)
-    self.pianoDrawing = run buildPianoDrawing(&self.vp, PIANO_W, paneH, self.lastPianoMidi, self.lastPianoActive)
     self.freqTicks = run computeFreqTicks(&self.vp, paneH)
     self.timeTicks = run computeTimeTicks(&self.vp, sw)
     self.guideLabels = run computeGuideBadges(self.guides.asSlice(), &self.vp, paneH)
@@ -5439,7 +6017,6 @@ impl Overtone {
     }
     let pfOpt = self.pitchTrack.nearest(inspectSec)
     let ffOpt = self.formantTrack.nearest(inspectSec)
-    let vfOpt = self.voiceMetrics.nearest(inspectSec)
     let mut activeMidi: i32 = 0
     let mut hasActivePitch = false
     if let Option<PitchFrame>.Some { value: pf } = pfOpt {
@@ -5496,46 +6073,7 @@ impl Overtone {
       opts,
     )
     if split {
-      let refOpts = OverlayOptions {
-        showPitch: self.showPitch,
-        showHarmonics: self.showHarmonics,
-        showFormants: self.showFormants,
-        formantMask: self.formantMask,
-        showNoteGrid: self.showNoteGrid,
-        showRefOverlay: false,
-        showRefWave: false,
-        showHeatmap: false,
-        heatmapMetric: self.heatmapMetric,
-        useDtwAlign: self.useDtwAlign,
-        plotOnRef: false,
-        showVowelRegions: self.showVowelRegions,
-        isolateMode: self.isolateMode,
-        displayClarity: self.displayClarity,
-        cursorSec: self.cursorSec,
-        hasSelection: self.hasSelection,
-        selStart: self.selStart,
-        selEnd: self.selEnd,
-        hasRefSel: false,
-        refSelStart: 0.0,
-        refSelEnd: 0.0,
-        hoverValid: false,
-        hoverX: 0.0,
-        hoverY: 0.0,
-      }
-      self.refOverlayDrawing = run buildSpectrogramOverlay(
-        &self.vp,
-        sw,
-        paneH,
-        self.refClip.pitchFrames.asSlice(),
-        self.refClip.formantFrames.asSlice(),
-        &[],
-        &[],
-        self.refClip.sampleRate,
-        self.guides.asSlice(),
-        self.refVowelSpans.asSlice(),
-        refOpts,
-      )
-      self.refPianoDrawing = run buildPianoDrawing(&self.vp, PIANO_W, paneH, 0, false)
+      self.refOverlayDrawing = run self.buildSplitRefOverlayDrawing(sw, paneH)
       self.refFreqTicks = run computeFreqTicks(&self.vp, paneH)
     }
     self.vowelBadges = run computeVowelBadges(activeVowels, &self.vp, sw)
@@ -5571,19 +6109,7 @@ impl Overtone {
     )
     self.vowelLaneBadges = run computeVowelLaneBadges(activeVowels, activeVoiceFs, &self.vp, sw, self.vowelResonance)
     let rightPlotW = f32.max(180.0, self.readoutsWidth - 32.0)
-    self.pianoDrawing = run buildPianoDrawing(&self.vp, PIANO_W, paneH, activeMidi, hasActivePitch)
-    self.sizeWeightDrawing = run buildSizeWeightPadDrawing(
-      rightPlotW,
-      PAD_H,
-      self.voiceMetrics.frames.asSlice(),
-      self.voiceMetrics.summary,
-      vfOpt,
-      self.refClip.voiceFrames.asSlice(),
-      self.refClip.summary,
-      self.compare.points.asSlice(),
-      inspectSec,
-      self.refClip.active,
-    )
+    run self.rebuildSideAverageDrawings(inspectSec)
     self.sliceDrawing = run buildSpectrumSliceDrawing(
       &self.vp,
       rightPlotW,
@@ -5596,35 +6122,6 @@ impl Overtone {
       pfOpt,
       self.displayFloorDb,
       self.displayCeilingDb,
-    )
-    self.ltasDrawing = run buildLtasDrawing(
-      rightPlotW,
-      self.sliceHeight,
-      &self.voiceMetrics.ltas,
-      self.voiceMetrics.hasLtas,
-      &self.refClip.ltas,
-      self.refClip.active && self.refClip.hasLtas,
-    )
-    self.vowelDrawing = run buildVowelChartDrawing(
-      rightPlotW,
-      VOWEL_H,
-      ffOpt,
-      self.voiceMetrics.frames.asSlice(),
-      self.voiceMetrics.summary,
-      self.takeVowelSpans.asSlice(),
-      self.refClip.voiceFrames.asSlice(),
-      self.refClip.summary,
-      self.refVowelSpans.asSlice(),
-      self.compare.points.asSlice(),
-      inspectSec,
-      self.refClip.active,
-      self.vowelResonance,
-    )
-    self.vowelChartDots = run computeVowelChartDots(
-      self.takeVowelSpans.asSlice(),
-      self.voiceMetrics.frames.asSlice(),
-      rightPlotW,
-      VOWEL_H,
     )
     self.overviewDrawing = run buildWaveformOverview(
       self.gpuSamples(),
@@ -5801,7 +6298,11 @@ impl Overtone {
             drop run self.pitchTrack.update(self.samples.asSlice())
             let prevFmtLen = self.formantTrack.frames.length()
             drop run self.formantTrack.update(self.samples.asSlice())
-            self.formantTrack.updateLiveTracked(self.pitchTrack.frames.asSlice(), self.displayClarity, prevFmtLen)
+            if self.useNeural && (self.neuralStatusFlags & 2) != 0 {
+              self.maybeRequestLiveNeuralFormants()
+            } else {
+              self.formantTrack.updateLiveTracked(self.pitchTrack.frames.asSlice(), self.displayClarity, prevFmtLen)
+            }
             drop run self.voiceMetrics.update(
               self.samples.asSlice(),
               self.sampleRate,
@@ -5891,18 +6392,31 @@ impl Overtone {
 
       Message.FileChosen { path } => {
         run self.sendTransport(TransportEvent.StopAll)
-        let pathCopy = run String.copy(String.view(&path))
         match move run audio_native.loadAudioFile(String.view(&path)) {
           Option<audio_native.LoadedAudio>.Some { value } => {
             let disp = run Overtone.stripAudioExt(String.view(&value.name))
-            self.activeClipPath = move pathCopy
-            self.activeClipFilename = move value.name
+            // Import directly into the library (current folder or General) so it shows up immediately in the sidebar!
+            self.clearActiveRefSilent()
+            self.activeClipPath.clear()
+            self.activeClipFilename.clear()
             self.activeClipDir.clear()
             self.activeClipInLib = false
+            self.activeClipIsRef = false
+            self.activeClipParentRef.clear()
             self.plotOnRef = false
             run self.loadSamples(move disp, move value.samples, value.sampleRate)
-            run self.refreshActiveLibMeta()
-            self.statusMsg = run String.copy("Opened external file · Press ⌘S or Save to copy into your library")
+            run self.saveCurrentClipToFolder(false)
+            run self.scrollExplorerToActiveClip()
+            let mut msg = String.make()
+            run msg.append("Imported ")
+            run msg.append(String.view(&self.clipName))
+            run msg.append(" into ")
+            if String.byteLength(String.view(&self.activeClipDir)) > 0 {
+              run msg.append(String.view(&self.activeClipDir))
+            } else {
+              run msg.append("Library")
+            }
+            self.statusMsg = move msg
           }
           Option<audio_native.LoadedAudio>.None => {
             self.errorMsg = run String.copy("Could not decode audio file (supports WAV, MP3, M4A, FLAC, AIFF).")
@@ -6283,21 +6797,24 @@ impl Overtone {
         self.libSortMode = mode
         self.explorerScrollY = 0.0
         run self.reloadTree(false)
-        if mode > SORT_ALPHA && self.refClip.active {
+        run self.saveSessionPrefs()
+        if mode >= SORT_OVERALL && mode <= SORT_VOWEL && self.refClip.active {
           run self.startBgScoring(false)
         }
-        self.statusMsg = if mode == SORT_OVERALL {
-          run String.copy("Explorer sorted by Overall Match (highest first)")
+        self.statusMsg = if mode == SORT_DATE {
+          run String.copy("Library sorted by Date (newest first)")
+        } else if mode == SORT_OVERALL {
+          run String.copy("Library sorted by Match Score (highest first)")
         } else if mode == SORT_PITCH {
-          run String.copy("Explorer sorted by Pitch Score (highest first)")
+          run String.copy("Library sorted by Pitch Score (highest first)")
         } else if mode == SORT_SIZE {
-          run String.copy("Explorer sorted by Size / Resonance Score (highest first)")
+          run String.copy("Library sorted by Size / Resonance Score (highest first)")
         } else if mode == SORT_WEIGHT {
-          run String.copy("Explorer sorted by Vocal Weight Score (highest first)")
+          run String.copy("Library sorted by Vocal Weight Score (highest first)")
         } else if mode == SORT_VOWEL {
-          run String.copy("Explorer sorted by Vowels Score (highest first)")
+          run String.copy("Library sorted by Vowels Score (highest first)")
         } else {
-          run String.copy("Explorer sorted alphabetically (A–Z)")
+          run String.copy("Library sorted alphabetically (A–Z)")
         }
       }
 
@@ -7603,6 +8120,10 @@ impl Overtone {
 
       Message.NeuralReady { jobId, isRef, hasPitch, hasFormants } => {
         run self.applyNeuralReady(jobId, isRef, hasPitch, hasFormants)
+      }
+
+      Message.LiveNeuralFormantsReady { jobId } => {
+        run self.applyLiveNeuralFormants(jobId)
       }
 
       Message.NeuralStatus { flags } => {

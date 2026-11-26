@@ -1664,6 +1664,9 @@ pub effect fn computeVowelChartDots(
   frames: &[VoiceFrame],
   width: f32,
   height: f32,
+  hasRange: bool,
+  rangeT0: f64,
+  rangeT1: f64,
 ) -> List<VowelChartDot>
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -1675,7 +1678,8 @@ pub effect fn computeVowelChartDots(
   while i < spans.length {
     let sp = &spans[i]
     let lbl = String.view(&sp.label)
-    if String.byteLength(lbl) > 0 {
+    let inRange = !hasRange || (sp.t1 >= rangeT0 && sp.t0 <= rangeT1)
+    if inRange && String.byteLength(lbl) > 0 {
       let dur = sp.t1 - sp.t0
       let margin = f64.min(0.016, dur * 0.18)
       let lo = sp.t0 + margin
@@ -1720,6 +1724,12 @@ pub effect fn buildVowelChartDrawing(
   inspectSec: f64,
   hasRef: bool,
   vowelResonance: f32,
+  hasTakeRange: bool,
+  takeT0: f64,
+  takeT1: f64,
+  hasRefRange: bool,
+  refT0: f64,
+  refT1: f64,
 ) -> Drawing
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -1805,11 +1815,12 @@ pub effect fn buildVowelChartDrawing(
     let mut sumRf1 = 0.0
     let mut sumRf2 = 0.0
     let mut cntRf: usize = 0
-    let step = if refFrames.length > 180 { refFrames.length / 180 } else { 1 }
+    let step = if hasRefRange || refFrames.length <= 180 { 1 } else { refFrames.length / 180 }
     let mut k: usize = 0
     while k < refFrames.length {
       let rf = refFrames[k]
-      if rf.voiced && rf.hasFormants && (!filterRef || isTimeInVowelCore(rf.time, refVowelSpans)) {
+      let inRefWin = !hasRefRange || (rf.time >= refT0 && rf.time <= refT1)
+      if inRefWin && rf.voiced && rf.hasFormants && (!filterRef || isTimeInVowelCore(rf.time, refVowelSpans)) {
         sumRf1 = sumRf1 + rf.f1
         sumRf2 = sumRf2 + rf.f2
         cntRf = cntRf + 1
@@ -1875,11 +1886,12 @@ pub effect fn buildVowelChartDrawing(
     let mut sumTf1 = 0.0
     let mut sumTf2 = 0.0
     let mut cntTf: usize = 0
-    let step = if takeFrames.length > 180 { takeFrames.length / 180 } else { 1 }
+    let step = if hasTakeRange || takeFrames.length <= 180 { 1 } else { takeFrames.length / 180 }
     let mut k: usize = 0
     while k < takeFrames.length {
       let tf = takeFrames[k]
-      if tf.voiced && tf.hasFormants && (!filterTake || isTimeInVowelCore(tf.time, takeVowelSpans)) {
+      let inTakeWin = !hasTakeRange || (tf.time >= takeT0 && tf.time <= takeT1)
+      if inTakeWin && tf.voiced && tf.hasFormants && (!filterTake || isTimeInVowelCore(tf.time, takeVowelSpans)) {
         sumTf1 = sumTf1 + tf.f1
         sumTf2 = sumTf2 + tf.f2
         cntTf = cntTf + 1
@@ -2896,6 +2908,12 @@ pub effect fn buildSizeWeightPadDrawing(
   alignedRef: &[AlignedRefPoint],
   inspectSec: f64,
   hasRef: bool,
+  hasTakeRange: bool,
+  takeT0: f64,
+  takeT1: f64,
+  hasRefRange: bool,
+  refT0: f64,
+  refT1: f64,
 ) -> Drawing
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -2954,11 +2972,12 @@ pub effect fn buildSizeWeightPadDrawing(
 
   // Reference cloud (crisp steel-teal goal!) + soft halo + hollow teal ring
   if hasRef && refFrames.length > 0 {
-    let step = if refFrames.length > 140 { refFrames.length / 140 } else { 1 }
+    let step = if hasRefRange || refFrames.length <= 140 { 1 } else { refFrames.length / 140 }
     let mut k: usize = 0
     while k < refFrames.length {
       let rf = refFrames[k]
-      if rf.voiced && rf.vtlCm > 1.0 {
+      let inRefWin = !hasRefRange || (rf.time >= refT0 && rf.time <= refT1)
+      if inRefWin && rf.voiced && rf.vtlCm > 1.0 {
         let rx = pad + f64.toF32(rf.sizeNorm) * iw
         let ry = pad + (1.0 - f64.toF32(rf.weightLightNorm)) * ih
         run cmds.append(
@@ -3012,11 +3031,12 @@ pub effect fn buildSizeWeightPadDrawing(
 
   // Your Take cloud (#0B0B0C 18%) & solid dot (#0B0B0C) + vermilion delta line to Ref
   if takeFrames.length > 0 {
-    let step = if takeFrames.length > 140 { takeFrames.length / 140 } else { 1 }
+    let step = if hasTakeRange || takeFrames.length <= 140 { 1 } else { takeFrames.length / 140 }
     let mut k: usize = 0
     while k < takeFrames.length {
       let tf = takeFrames[k]
-      if tf.voiced && tf.vtlCm > 1.0 {
+      let inTakeWin = !hasTakeRange || (tf.time >= takeT0 && tf.time <= takeT1)
+      if inTakeWin && tf.voiced && tf.vtlCm > 1.0 {
         let tx = pad + f64.toF32(tf.sizeNorm) * iw
         let ty = pad + (1.0 - f64.toF32(tf.weightLightNorm)) * ih
         run cmds.append(

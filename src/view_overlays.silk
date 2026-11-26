@@ -1,5 +1,5 @@
 //! Glint floating overlays: Guides popover, all 8 Context Menus, Settings Modal (7 tabs), and Drag Ghost.
-import audio_native { AudioDeviceInfo, SORT_ALPHA, SORT_OVERALL, SORT_PITCH, SORT_SIZE, SORT_VOWEL, SORT_WEIGHT }
+import audio_native { AudioDeviceInfo, SORT_ALPHA, SORT_DATE, SORT_OVERALL, SORT_PITCH, SORT_SIZE, SORT_VOWEL, SORT_WEIGHT }
 import colormap { paletteIndex }
 import overlays { GuideBadge }
 import studio {
@@ -795,9 +795,10 @@ pub fn renderContextMenu(m: &Overtone, h: &Document<Message>) -> Node {
         menuItem(h, isRootSelected, "Save new takes here", "", false, false, Message.SelectRootFolder),
         menuSep(h),
         menuHeader(h, "Sort"),
+        menuItem(h, m.libSortMode == SORT_DATE, "Date (newest first)", "", false, false, Message.SetLibSortMode { mode: SORT_DATE }),
+        menuItem(h, m.libSortMode == SORT_OVERALL, "Match score ↓", "", false, false, Message.SetLibSortMode { mode: SORT_OVERALL }),
+        menuItem(h, m.libSortMode == SORT_WEIGHT, "Weight score ↓", "", false, false, Message.SetLibSortMode { mode: SORT_WEIGHT }),
         menuItem(h, m.libSortMode == SORT_ALPHA, "Name A–Z", "", false, false, Message.SetLibSortMode { mode: SORT_ALPHA }),
-        menuItem(h, m.libSortMode == SORT_OVERALL, "Overall match", "", false, false, Message.SetLibSortMode { mode: SORT_OVERALL }),
-        menuItem(h, m.libSortMode == SORT_WEIGHT, "Weight score", "", false, false, Message.SetLibSortMode { mode: SORT_WEIGHT }),
         menuItem(h, false, "Re-score visible takes", "", false, false, Message.RescoreVisibleClips),
         menuSep(h),
         menuItem(h, false, "Refresh", "", false, false, Message.RefreshLibDir),
@@ -810,7 +811,7 @@ pub fn renderContextMenu(m: &Overtone, h: &Document<Message>) -> Node {
     )
   } else if m.ctxMenuKind == CTX_LIB_SORT {
     let menuX = clampMenuX(m.ctxMenuX, 214.0)
-    let menuY = clampMenuY(m.ctxMenuY, 260.0)
+    let menuY = clampMenuY(m.ctxMenuY, 286.0)
     h.column(
       &[
         h.class("absolute w-[210px] p-[4px] glint-menu"),
@@ -818,12 +819,13 @@ pub fn renderContextMenu(m: &Overtone, h: &Document<Message>) -> Node {
       ],
       &[
         menuHeader(h, "Sort takes in each folder"),
+        menuItem(h, m.libSortMode == SORT_DATE, "Date (newest first)", "", false, false, Message.SetLibSortMode { mode: SORT_DATE }),
+        menuItem(h, m.libSortMode == SORT_OVERALL, "Match score ↓", "", false, false, Message.SetLibSortMode { mode: SORT_OVERALL }),
+        menuItem(h, m.libSortMode == SORT_PITCH, "Pitch score ↓", "", false, false, Message.SetLibSortMode { mode: SORT_PITCH }),
+        menuItem(h, m.libSortMode == SORT_SIZE, "Size score ↓", "", false, false, Message.SetLibSortMode { mode: SORT_SIZE }),
+        menuItem(h, m.libSortMode == SORT_WEIGHT, "Weight score ↓", "", false, false, Message.SetLibSortMode { mode: SORT_WEIGHT }),
+        menuItem(h, m.libSortMode == SORT_VOWEL, "Vowels score ↓", "", false, false, Message.SetLibSortMode { mode: SORT_VOWEL }),
         menuItem(h, m.libSortMode == SORT_ALPHA, "Name A–Z", "", false, false, Message.SetLibSortMode { mode: SORT_ALPHA }),
-        menuItem(h, m.libSortMode == SORT_OVERALL, "Overall match ↓", "", false, false, Message.SetLibSortMode { mode: SORT_OVERALL }),
-        menuItem(h, m.libSortMode == SORT_PITCH, "Pitch ↓", "", false, false, Message.SetLibSortMode { mode: SORT_PITCH }),
-        menuItem(h, m.libSortMode == SORT_SIZE, "Size · resonance ↓", "", false, false, Message.SetLibSortMode { mode: SORT_SIZE }),
-        menuItem(h, m.libSortMode == SORT_WEIGHT, "Weight ↓", "", false, false, Message.SetLibSortMode { mode: SORT_WEIGHT }),
-        menuItem(h, m.libSortMode == SORT_VOWEL, "Vowels · LTAS ↓", "", false, false, Message.SetLibSortMode { mode: SORT_VOWEL }),
         menuSep(h),
         menuItem(h, false, "Re-score all visible", "", false, false, Message.RescoreVisibleClips),
       ],

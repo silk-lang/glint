@@ -87,6 +87,16 @@ impl GlintPage {
       model.gpuNeedRedraw = true
     }
 
+    if model.gpuNeedRefWarpReload {
+      model.gpuNeedRefWarpReload = false
+      if model.refWarpActive && model.useDtwAlign && model.refClip.active {
+        g.setRefWarp(&model.refWarpLut)
+      } else {
+        g.setRefWarp(&[])
+      }
+      model.gpuNeedRedraw = true
+    }
+
     if model.gpuNeedClear {
       model.gpuNeedClear = false
       g.clearLiveTier()
@@ -312,6 +322,11 @@ effect fn callInner(token: ?*mut u8, op: u32, a: f64, b: f64, c: f64) -> f64
         hasPitch: parts[2] != 0,
         hasFormants: parts[3] != 0,
       })
+      run drain<Overtone, Message, Command, OutOfMemoryError, Dom, &mut Allocator>(&mut page.host, &mut page.dom)
+      run page.syncSpec()
+    } else if ns == "neural_live_formants" {
+      let jid = u32.toI32(parseUint(String.view(&payload)))
+      page.host.send(Message.LiveNeuralFormantsReady { jobId: jid })
       run drain<Overtone, Message, Command, OutOfMemoryError, Dom, &mut Allocator>(&mut page.host, &mut page.dom)
       run page.syncSpec()
     } else if ns == "phonemes_ready" {

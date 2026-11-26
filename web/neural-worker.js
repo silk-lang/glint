@@ -27,6 +27,7 @@ let phonemeBusyCount = 0;
 // Latest job id per target (0 = take, 1 = ref) so stale queued work is dropped immediately
 const latestJobId = new Map();
 const latestPhoneJobId = new Map();
+let latestLiveFormantJobId = 0;
 // Simple LRU cache keyed by clip fingerprint -> { f0Times, f0Hz, f0Conf, fmtTimes, fmtF1, fmtF2, fmtF3 }
 const resultCache = new Map();
 const phoneCache = new Map();
@@ -362,20 +363,90 @@ async function runFormantsTracker(wav16k, f0Result) {
       endSample = Math.min(wav16k.length, (lastV + 10) * SWIFT_HOP);
     }
   }
-  // Cap single pass to 12 seconds (192,000 samples) for predictable memory/latency
-  if (endSample - startSample > 192000) {
-    endSample = startSample + 192000;
+  // Cap total analyzed speech to 60 seconds (960,000 samples) and process in 10s chunks
+  // with 0.5s context overlap so long clips get accurate neural F1-F3 all the way to the end!
+  const MAX_TOTAL = 60 * SWIFT_SR;
+  if (endSample - startSample > MAX_TOTAL) {
+    endSample = startSample + MAX_TOTAL;
   }
   if (endSample - startSample < 512) {
     startSample = 0;
-    endSample = Math.min(wav16k.length, 192000);
+    endSample = Math.min(wav16k.length, MAX_TOTAL);
   }
-  const sub = wav16k.subarray(startSample, endSample);
-  const { spect, numFrames } = computeFormantSpectrogram(sub);
-  const out = await formantSession.run({
-    spect: new ort.Tensor("float32", spect, [1, numFrames, FT_BINS]),
-  });
-  return decodeFormantHeatmaps(out.heatmaps.data, numFrames, startSample / SWIFT_SR);
+  const CHUNK_SAMP = 10 * SWIFT_SR; // 160,000 samples (10s)
+  const OVERLAP_SAMP = Math.round(0.5 * SWIFT_SR); // 8,000 samples (0.5s)
+  if (endSample - startSample <= CHUNK_SAMP + OVERLAP_SAMP) {
+    const sub = wav16k.subarray(startSample, endSample);
+    const { spect, numFrames } = computeFormantSpectrogram(sub);
+    const out = await formantSession.run({
+      spect: new ort.Tensor("float32", spect, [1, numFrames, FT_BINS]),
+    });
+    return decodeFormantHeatmaps(out.heatmaps.data, numFrames, startSample / SWIFT_SR);
+  }
+
+  const allTimes = [];
+  const allF1 = [];
+  const allF2 = [];
+  const allF3 = [];
+  let cursor = startSample;
+  let prevKeepEndSec = -1.0;
+  while (cursor < endSample) {
+    const winStart = Math.max(startSample, cursor - OVERLAP_SAMP);
+    const winEnd = Math.min(endSample, cursor + CHUNK_SAMP + OVERLAP_SAMP);
+    const keepEnd = Math.min(endSample, cursor + CHUNK_SAMP);
+    const keepEndSec = keepEnd / SWIFT_SR;
+    const sub = wav16k.subarray(winStart, winEnd);
+    if (sub.length < 512) break;
+    const { spect, numFrames } = computeFormantSpectrogram(sub);
+    const out = await formantSession.run({
+      spect: new ort.Tensor("float32", spect, [1, numFrames, FT_BINS]),
+    });
+    const dec = decodeFormantHeatmaps(out.heatmaps.data, numFrames, winStart / SWIFT_SR);
+    for (let i = 0; i < dec.fmtTimes.length; i++) {
+      const t = dec.fmtTimes[i];
+      if (t > prevKeepEndSec && (keepEnd >= endSample || t <= keepEndSec)) {
+        allTimes.push(t);
+        allF1.push(dec.fmtF1[i]);
+        allF2.push(dec.fmtF2[i]);
+        allF3.push(dec.fmtF3[i]);
+      }
+    }
+    prevKeepEndSec = keepEndSec;
+    cursor = keepEnd;
+  }
+  return {
+    fmtTimes: Float64Array.from(allTimes),
+    fmtF1: Float64Array.from(allF1),
+    fmtF2: Float64Array.from(allF2),
+    fmtF3: Float64Array.from(allF3),
+  };
+}
+
+async function handleAnalyzeLiveFormants(msg) {
+  const { jobId, samples, sampleRate, startSec } = msg;
+  if (latestLiveFormantJobId !== jobId) return;
+  await ensureModels();
+  if (!formantSession || latestLiveFormantJobId !== jobId) return;
+  try {
+    const wav16k = resampleTo16k(samples, sampleRate);
+    if (wav16k.length < 512) return;
+    const { spect, numFrames } = computeFormantSpectrogram(wav16k);
+    const out = await formantSession.run({
+      spect: new ort.Tensor("float32", spect, [1, numFrames, FT_BINS]),
+    });
+    if (latestLiveFormantJobId !== jobId) return;
+    const dec = decodeFormantHeatmaps(out.heatmaps.data, numFrames, startSec || 0.0);
+    self.postMessage({
+      type: "live_formants_result",
+      jobId,
+      fmtTimes: dec.fmtTimes,
+      fmtF1: dec.fmtF1,
+      fmtF2: dec.fmtF2,
+      fmtF3: dec.fmtF3,
+    });
+  } catch (err) {
+    console.warn("[Glint Neural] Live formants failed:", err);
+  }
 }
 
 // Serialize ONNX session execution (ORT WASM/WebGPU sessions shouldn't run concurrently)
@@ -737,6 +808,11 @@ self.addEventListener("message", (ev) => {
   if (msg.type === "analyze") {
     latestJobId.set(msg.isRef, msg.jobId);
     queueTail = queueTail.then(() => handleAnalyze(msg));
+    return;
+  }
+  if (msg.type === "analyze_live_formants") {
+    latestLiveFormantJobId = msg.jobId;
+    queueTail = queueTail.then(() => handleAnalyzeLiveFormants(msg));
     return;
   }
   if (msg.type === "analyze_phonemes") {

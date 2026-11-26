@@ -23,6 +23,7 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
   unsafe extern "C" fn js_spec_upload_pcm(samples: ?[*]const f32, count: i32, sampleRate: f64) -> () as "glint#spec_upload_pcm"
   unsafe extern "C" fn js_spec_upload_ref_pcm(samples: ?[*]const f32, count: i32, sampleRate: f64) -> () as "glint#spec_upload_ref_pcm"
   unsafe extern "C" fn js_spec_clear_ref() -> () as "glint#spec_clear_ref"
+  unsafe extern "C" fn js_spec_set_ref_warp(lut: ?[*]const f32, count: i32) -> () as "glint#spec_set_ref_warp"
   unsafe extern "C" fn js_spec_alloc_tier(tier: u32, w: u32, h: u32) -> () as "glint#spec_alloc_tier"
   unsafe extern "C" fn js_spec_write_tier(
     tier: u32,
@@ -444,6 +445,18 @@ impl WasmSpectrogram {
   pub fn clearRef(self: &mut Self) -> () {
     static if Intrinsic.targetArchitecture() == "wasm32" {
       unsafe js_spec_clear_ref()
+    }
+  }
+
+  pub fn setRefWarp(self: &mut Self, lut: &[f32]) -> () {
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      if lut.length >= 2 {
+        unsafe js_spec_set_ref_warp(Pointer.fromSlice(lut), usize.toI32(lut.length))
+      } else {
+        unsafe js_spec_set_ref_warp(Pointer.fromSlice(lut), 0)
+      }
+    } else {
+      drop lut
     }
   }
 

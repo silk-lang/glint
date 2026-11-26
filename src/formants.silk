@@ -1561,3 +1561,165 @@ pub effect fn applyNeuralFormantFrames(
     i = i + 1
   }
 }
+
+/// Applies a live rolling window of Neural FormantsTracker frames `[winStart..winEnd]`
+/// onto `frames` during active recording, using the exact same pitch/energy gating and
+/// smoothing as post-stop `applyNeuralFormantFrames` so live F1-F3 matches post-stop F1-F3!
+pub effect fn applyNeuralFormantFramesRange(
+  frames: &mut [FormantFrame],
+  pitchFrames: &[PitchFrame],
+  displayClarity: f64,
+  times: &[f64],
+  nf1: &[f64],
+  nf2: &[f64],
+  nf3: &[f64],
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let n = frames.length
+  let m = times.length
+  if n == 0 || m == 0 || nf1.length < m || nf2.length < m || nf3.length < m {
+    return ()
+  }
+  let winStart = times[0] - 0.02
+  let winEnd = times[m - 1] + 0.02
+
+  let mut startIdx: usize = n
+  let mut endIdx: usize = 0
+  let mut i: usize = 0
+  while i < n {
+    let ft = frames[i].time
+    if ft >= winStart && ft <= winEnd {
+      if startIdx == n { startIdx = i }
+      endIdx = i + 1
+    }
+    i = i + 1
+  }
+  if startIdx >= endIdx {
+    return ()
+  }
+  let subLen = endIdx - startIdx
+
+  let mut peakDb: f64 = -120.0
+  i = 0
+  while i < n {
+    if frames[i].intensityDb > peakDb {
+      peakDb = frames[i].intensityDb
+    }
+    i = i + 1
+  }
+  let minActiveDb = f64.max(-58.0, peakDb - 34.0)
+
+  let mut active = List<bool>.make()
+  run active.appendRepeated(false, subLen)
+  let actSl = active.asMutSlice()
+
+  let mut pIdx: usize = 0
+  let mut k: usize = 0
+  while k < subLen {
+    let fi = startIdx + k
+    let ft = frames[fi].time
+    let fDb = frames[fi].intensityDb
+    let mut isVoiced = false
+    if pitchFrames.length > 0 {
+      while pIdx + 1 < pitchFrames.length && pitchFrames[pIdx + 1].time < ft {
+        pIdx = pIdx + 1
+      }
+      let mut bestP = pIdx
+      if pIdx + 1 < pitchFrames.length {
+        if f64.abs(pitchFrames[pIdx + 1].time - ft) < f64.abs(pitchFrames[pIdx].time - ft) {
+          bestP = pIdx + 1
+        }
+      }
+      let pf = pitchFrames[bestP]
+      if f64.abs(pf.time - ft) <= 0.035 && pf.voiced && pf.clarity >= displayClarity && fDb >= minActiveDb {
+        isVoiced = true
+      }
+    } else if fDb >= minActiveDb {
+      isVoiced = true
+    }
+    actSl[k] = isVoiced
+    k = k + 1
+  }
+
+  let mut rF1 = List<f64>.make()
+  let mut rF2 = List<f64>.make()
+  let mut rF3 = List<f64>.make()
+  run rF1.appendRepeated(0.0, subLen)
+  run rF2.appendRepeated(0.0, subLen)
+  run rF3.appendRepeated(0.0, subLen)
+  let sl1 = rF1.asMutSlice()
+  let sl2 = rF2.asMutSlice()
+  let sl3 = rF3.asMutSlice()
+
+  let mut ti: usize = 0
+  k = 0
+  while k < subLen {
+    if actSl[k] {
+      let t = frames[startIdx + k].time
+      while ti + 1 < m && times[ti + 1] < t {
+        ti = ti + 1
+      }
+      let mut v1: f64 = 0.0
+      let mut v2: f64 = 0.0
+      let mut v3: f64 = 0.0
+      if ti + 1 < m && t >= times[ti] && t <= times[ti + 1] && (times[ti + 1] - times[ti]) > 1.0e-6 {
+        let a = (t - times[ti]) / (times[ti + 1] - times[ti])
+        v1 = nf1[ti] + a * (nf1[ti + 1] - nf1[ti])
+        v2 = nf2[ti] + a * (nf2[ti + 1] - nf2[ti])
+        v3 = nf3[ti] + a * (nf3[ti + 1] - nf3[ti])
+      } else {
+        let mut best = ti
+        if ti + 1 < m && f64.abs(times[ti + 1] - t) < f64.abs(times[ti] - t) {
+          best = ti + 1
+        }
+        if f64.abs(times[best] - t) <= 0.04 {
+          v1 = nf1[best]
+          v2 = nf2[best]
+          v3 = nf3[best]
+        }
+      }
+      if v1 >= 150.0 && v1 <= 1300.0 && v2 >= v1 + 100.0 && v2 <= 3600.0 {
+        sl1[k] = v1
+        sl2[k] = v2
+        if v3 >= v2 + 120.0 && v3 <= 4600.0 {
+          sl3[k] = v3
+        }
+      }
+    }
+    k = k + 1
+  }
+
+  run smoothPositiveBand(rF1.asMutSlice())
+  run smoothPositiveBand(rF2.asMutSlice())
+  run smoothPositiveBand(rF3.asMutSlice())
+
+  let o1 = rF1.asSlice()
+  let o2 = rF2.asSlice()
+  let o3 = rF3.asSlice()
+  k = 0
+  while k < subLen {
+    let fi = startIdx + k
+    if actSl[k] && o1[k] > 1.0 && o2[k] > o1[k] + 80.0 {
+      let v1 = o1[k]
+      let v2 = o2[k]
+      let v3 = o3[k]
+      let mut cnt: usize = 2
+      if v3 > v2 + 80.0 { cnt = 3 }
+      frames[fi].f1 = v1
+      frames[fi].f2 = v2
+      frames[fi].f3 = v3
+      frames[fi].f4 = 0.0
+      frames[fi].count = cnt
+      frames[fi].tracked = true
+    } else {
+      frames[fi].f1 = 0.0
+      frames[fi].f2 = 0.0
+      frames[fi].f3 = 0.0
+      frames[fi].f4 = 0.0
+      frames[fi].count = 0
+      frames[fi].tracked = false
+    }
+    k = k + 1
+  }
+}
