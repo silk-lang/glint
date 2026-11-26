@@ -4775,10 +4775,12 @@ impl Overtone {
     }
     let mut startSec = self.cursorSec
     let mut endSec = dur
+    let mut loopStartSec = 0.0
     if self.hasSelection {
       let lo = f64.min(self.selStart, self.selEnd)
       let hi = f64.max(self.selStart, self.selEnd)
       if hi - lo > 0.01 {
+        loopStartSec = lo
         if startSec < lo || startSec >= hi - 0.02 {
           startSec = lo
         }
@@ -4791,6 +4793,7 @@ impl Overtone {
     let onRef = self.isPlottingOnRef()
     let wantMix = self.refClip.active && self.listenMode == LISTEN_BOTH && !self.isEditingActiveRef()
     let wantRef = self.refClip.active && self.listenMode == LISTEN_REF
+    audio_native.playSetLoopStart(if self.loopSelection { loopStartSec } else { -1.0 })
     let started = if wantMix {
       let maxDur = f64.max(self.clipDuration(), self.refClip.durationSec)
       let mixEnd = if self.hasSelection { endSec } else { maxDur }
@@ -4809,6 +4812,8 @@ impl Overtone {
       audio_native.playSetGainDb(0.0)
       let refEnd = f64.min(self.refClip.durationSec, if self.hasSelection { endSec } else { self.refClip.durationSec })
       let refStart = f64.min(startSec, f64.max(0.0, refEnd - 0.02))
+      let refLoopStart = f64.min(loopStartSec, refStart)
+      audio_native.playSetLoopStart(if self.loopSelection { refLoopStart } else { -1.0 })
       if self.isolateMode != ISOLATE_FULL || self.voiceLabMode != LAB_OFF {
         audio_native.playFiltered(
           true,

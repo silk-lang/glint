@@ -55,6 +55,7 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
     loop: i32,
   ) -> i32 as "glint#ov_play_range"
   unsafe extern "C" fn ov_play_set_gain_db(gainDb: f32) -> () as "glint#ov_play_set_gain_db"
+  unsafe extern "C" fn ov_play_set_loop_start(loopStartSec: f64) -> () as "glint#ov_play_set_loop_start"
   unsafe extern "C" fn ov_play_mix(
     aSamples: ?[*]const f32,
     aCount: i32,
@@ -1401,6 +1402,14 @@ pub fn playSetGainDb(gainDb: f32) -> () {
     unsafe ov_play_set_gain_db(gainDb)
   } else {
     drop gainDb
+  }
+}
+
+pub fn playSetLoopStart(loopStartSec: f64) -> () {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    unsafe ov_play_set_loop_start(loopStartSec)
+  } else {
+    drop loopStartSec
   }
 }
 

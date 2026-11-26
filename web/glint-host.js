@@ -458,6 +458,8 @@ const audioState = {
   playGainDb: 0.0,
   playStartCtxTime: 0,
   playStartSec: 0,
+  playLoopStartSec: 0,
+  pendingLoopStartSec: null,
   playEndSec: 0,
   playLoop: false,
   playPositionSec: 0,
@@ -756,6 +758,11 @@ function startPlayback(samples, sampleRate, startSec, endSec, loop, timeMap = nu
   const dur = scaled.length / sampleRate;
   const s0 = Math.max(0, Math.min(dur, startSec));
   const s1 = Math.max(s0 + 0.01, Math.min(dur, endSec > s0 ? endSec : dur));
+  const pendingLoop = audioState.pendingLoopStartSec;
+  audioState.pendingLoopStartSec = null;
+  const loopS0 = loop && pendingLoop != null && Number.isFinite(pendingLoop)
+    ? Math.max(0, Math.min(s0, pendingLoop))
+    : s0;
 
   const buf = ctx.createBuffer(1, scaled.length, Math.round(sampleRate));
   buf.copyToChannel(scaled, 0);
@@ -765,7 +772,7 @@ function startPlayback(samples, sampleRate, startSec, endSec, loop, timeMap = nu
   src.playbackRate.value = audioState.speed;
   src.loop = !!loop;
   if (loop) {
-    src.loopStart = s0;
+    src.loopStart = loopS0;
     src.loopEnd = s1;
   }
   const gain = ctx.createGain();
@@ -779,6 +786,7 @@ function startPlayback(samples, sampleRate, startSec, endSec, loop, timeMap = nu
   audioState.finishedFlag = false;
   audioState.playStartCtxTime = ctx.currentTime;
   audioState.playStartSec = s0;
+  audioState.playLoopStartSec = loopS0;
   audioState.playEndSec = s1;
   audioState.playLoop = !!loop;
   audioState.playTimeMap = timeMap || null;
@@ -851,11 +859,17 @@ function startMixedPlayback(samplesA, rateA, samplesB, rateB, startSec, endSec, 
 
 function currentPlayPosition() {
   if (!audioState.playing || !audioCtx) return audioState.playPositionSec;
-  const elapsed = (audioCtx.currentTime - audioState.playStartCtxTime) * audioState.speed;
-  const span = Math.max(0.01, audioState.playEndSec - audioState.playStartSec);
+  const elapsed = Math.max(0, (audioCtx.currentTime - audioState.playStartCtxTime) * audioState.speed);
   let rawPos = audioState.playStartSec + elapsed;
   if (audioState.playLoop) {
-    rawPos = audioState.playStartSec + (elapsed % span);
+    const firstLeg = Math.max(0.0, audioState.playEndSec - audioState.playStartSec);
+    if (elapsed < firstLeg) {
+      rawPos = audioState.playStartSec + elapsed;
+    } else {
+      const loopStart = audioState.playLoopStartSec;
+      const loopSpan = Math.max(0.01, audioState.playEndSec - loopStart);
+      rawPos = loopStart + ((elapsed - firstLeg) % loopSpan);
+    }
   } else if (rawPos >= audioState.playEndSec) {
     rawPos = audioState.playEndSec;
   }
@@ -1089,6 +1103,9 @@ const glintImports = {
   },
   ov_play_set_gain_db: (db) => {
     audioState.playGainDb = Number.isFinite(db) ? Math.max(-24, Math.min(36, db)) : 0.0;
+  },
+  ov_play_set_loop_start: (sec) => {
+    audioState.pendingLoopStartSec = Number.isFinite(sec) && sec >= 0 ? sec : null;
   },
   ov_play_mix: (aPtr, aCount, aSr, bPtr, bCount, bSr, startSec, endSec, loop, aGainDb, bGainDb) => {
     const samplesA = aCount > 0 ? readF32Copy(aPtr, aCount) : null;
@@ -1756,17 +1773,26 @@ const glintImports = {
     if (mode === 0) {
       return startPlayback(pcm, sampleRate, startSec, endSec, loop !== 0, null, gainDb);
     }
+    const pendingLoop = audioState.pendingLoopStartSec;
+    const isoRangeStart = loop !== 0 && pendingLoop != null && Number.isFinite(pendingLoop)
+      ? Math.max(0, Math.min(startSec, pendingLoop))
+      : startSec;
     const iso = buildIsolatedAudio(
       pcm,
       sampleRate,
       st.spans,
       mode,
       timingMode | 0,
-      startSec,
+      isoRangeStart,
       endSec,
       st?.f0Times || null,
       st?.f0Hz || null,
     );
+    if ((timingMode | 0) !== 0) {
+      audioState.pendingLoopStartSec = null;
+    } else if (loop !== 0 && pendingLoop != null && Number.isFinite(pendingLoop)) {
+      iso.startSec = startSec;
+    }
     return startPlayback(
       iso.samples,
       iso.sampleRate,
