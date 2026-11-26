@@ -1611,11 +1611,7 @@ fn renderSpectrogramWell(m: &Overtone, h: &Document<Message>) -> Node {
                         h.row(
                           &[h.class("absolute left-[8px] top-[6px] items-center gap-[5px] px-[6px] py-[2px] rounded-[4px] bg-[#0E0E10]/85 border border-[#5BCEFA]/40")],
                           &[
-                            txt(
-                              h,
-                              if m.useDtwAlign && m.refWarpActive { "REF · ALIGNED" } else { "REF" },
-                              "glint-mono text-[9px] leading-[11px] font-semibold tracking-[0.06em] text-[#5BCEFA]",
-                            ),
+                            txt(h, "REF", "glint-mono text-[9px] leading-[11px] font-semibold tracking-[0.06em] text-[#5BCEFA]"),
                             txt(h, String.view(&m.refClip.name), "text-[10px] leading-[12px] text-white/90 truncate max-w-[200px]"),
                           ],
                         ),

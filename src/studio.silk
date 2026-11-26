@@ -1322,58 +1322,11 @@ impl Overtone {
     self.readoutBgScore.clear()
   }
 
-  /// Computes a rigid onset-shift offset (`refTime = takeTime + refAlignOffsetSec`) so Split view
-  /// and Both/Ref playback align the beginning of speech at exact 1.0x speed with ZERO time stretching!
   fn rebuildRefWarpLut(self: &mut Self) -> () {
-    let dur = self.clipDuration()
-    if !self.refClip.active || !self.useDtwAlign || dur <= 0.02 || self.refClip.durationSec <= 0.02 {
-      self.refAlignOffsetSec = 0.0
-      self.refWarpActive = false
-      self.gpuNeedRefWarpReload = true
-      audio_native.playSetRefWarp(&[], 0.0)
-      return ()
-    }
-    let mut takeStart = self.voiceMetrics.summary.activeStartSec
-    let mut refStart = self.refClip.summary.activeStartSec
-    // Prefer median onset offset across the first few matched voiced frames if available
-    let pts = self.compare.points.asSlice()
-    let mut offs: [f64; 8] = [0.0; 8]
-    let mut cnt: usize = 0
-    let mut i: usize = 0
-    while i < pts.length && cnt < 8 {
-      if pts[i].bothVoiced {
-        offs[cnt] = pts[i].refTime - pts[i].time
-        cnt = cnt + 1
-      }
-      i = i + 1
-    }
-    let mut offsetSec: f64 = refStart - takeStart
-    if cnt >= 3 {
-      // Insertion sort the small onset sample window for a blip-proof median offset
-      let mut a: usize = 1
-      while a < cnt {
-        let key = offs[a]
-        let mut b = a
-        while b > 0 && offs[b - 1] > key {
-          offs[b] = offs[b - 1]
-          b = b - 1
-        }
-        offs[b] = key
-        a = a + 1
-      }
-      offsetSec = offs[cnt / 2]
-    }
-    self.refAlignOffsetSec = offsetSec
-    // Fill 512-entry rigid linear shift LUT (`refTime = takeTime + offsetSec`, slope = 1.0, zero stretch!)
-    let mut k: usize = 0
-    while k < 512 {
-      let t = (usize.toF64(k) / 511.0) * dur
-      self.refWarpLut[k] = f64.toF32(t + offsetSec)
-      k = k + 1
-    }
-    self.refWarpActive = true
+    self.refAlignOffsetSec = 0.0
+    self.refWarpActive = false
     self.gpuNeedRefWarpReload = true
-    audio_native.playSetRefWarp(&self.refWarpLut, dur)
+    audio_native.playSetRefWarp(&[], 0.0)
   }
 
   fn saveCurrentClipViewState(self: &Self) -> () {
