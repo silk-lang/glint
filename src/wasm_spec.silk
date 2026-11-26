@@ -176,7 +176,7 @@ impl WasmSpectrogram {
   }
 
   pub fn beginLiveTier(self: &mut Self, sampleRate: f64, hop: usize, bins: usize, hzPerBin: f64) -> () {
-    let w: usize = 2048
+    let w: usize = 4096
     self.liveWidth = w
     self.liveWritten = 0
     self.liveFirstColumn = 0
@@ -247,37 +247,80 @@ impl WasmSpectrogram {
     if col.columns == 0 || col.bins == 0 || self.liveWidth == 0 {
       return ()
     }
-    let mut localStart: usize = 0
-    if startCol >= self.liveFirstColumn {
-      localStart = startCol - self.liveFirstColumn
+    let w = self.liveWidth
+    // Ring-buffer upload: keep the newest `w` columns and wrap seamlessly so long live
+    // recordings never hit a wall or go black as the viewport scrolls forward.
+    let mut srcOffset: usize = 0
+    let mut globalStart = startCol
+    let mut count = col.columns
+    if count > w {
+      srcOffset = count - w
+      globalStart = startCol + srcOffset
+      count = w
     }
-    if localStart >= self.liveWidth {
-      return ()
-    }
-    let avail = self.liveWidth - localStart
-    let count = if col.columns < avail { col.columns } else { avail }
-    run self.ensureScratch(count, col.bins)
-    audio_native.columnsToRgbaNative(col.data.asSlice(), 0, count, col.bins, self.displayFloorDb, self.displayCeilingDb, self.uploadScratch.asMutSlice())
-    static if Intrinsic.targetArchitecture() == "wasm32" {
-      unsafe js_spec_write_tier(
-        TIER_LIVE,
-        usize.toU32(localStart),
-        usize.toU32(count),
-        usize.toU32(col.bins),
-        Pointer.fromSlice(self.uploadScratch.asSlice()),
-        count * col.bins * 4,
+    let ringX = globalStart % w
+    let firstAvail = w - ringX
+    let firstPart = if count < firstAvail { count } else { firstAvail }
+    let secondPart = count - firstPart
+
+    if firstPart > 0 {
+      run self.ensureScratch(firstPart, col.bins)
+      audio_native.columnsToRgbaNative(
+        col.data.asSlice(),
+        srcOffset,
+        firstPart,
+        col.bins,
+        self.displayFloorDb,
+        self.displayCeilingDb,
+        self.uploadScratch.asMutSlice(),
       )
+      static if Intrinsic.targetArchitecture() == "wasm32" {
+        unsafe js_spec_write_tier(
+          TIER_LIVE,
+          usize.toU32(ringX),
+          usize.toU32(firstPart),
+          usize.toU32(col.bins),
+          Pointer.fromSlice(self.uploadScratch.asSlice()),
+          firstPart * col.bins * 4,
+        )
+      }
     }
-    let endCol = localStart + count
-    if endCol > self.liveWritten {
-      self.liveWritten = endCol
+    if secondPart > 0 {
+      run self.ensureScratch(secondPart, col.bins)
+      audio_native.columnsToRgbaNative(
+        col.data.asSlice(),
+        srcOffset + firstPart,
+        secondPart,
+        col.bins,
+        self.displayFloorDb,
+        self.displayCeilingDb,
+        self.uploadScratch.asMutSlice(),
+      )
+      static if Intrinsic.targetArchitecture() == "wasm32" {
+        unsafe js_spec_write_tier(
+          TIER_LIVE,
+          0,
+          usize.toU32(secondPart),
+          usize.toU32(col.bins),
+          Pointer.fromSlice(self.uploadScratch.asSlice()),
+          secondPart * col.bins * 4,
+        )
+      }
     }
+
+    let endGlobal = startCol + col.columns
+    if endGlobal > self.liveWritten {
+      self.liveWritten = endGlobal
+    }
+    let firstCol = if self.liveWritten > w { self.liveWritten - w } else { 0 }
+    self.liveFirstColumn = firstCol
+    let spanCols = self.liveWritten - firstCol
     let step = usize.toF64(self.liveHop) / f64.max(1.0, self.liveSampleRate)
-    self.live.t0 = usize.toF64(self.liveFirstColumn) * step
-    self.live.t1 = usize.toF64(self.liveFirstColumn + (if self.liveWritten > 0 { self.liveWritten - 1 } else { 0 })) * step
-    self.live.valid = self.liveWritten > 0
-    self.live.uScale = uScaleOf(self.liveWritten, self.liveWidth)
-    self.live.uOffset = uOffsetOf(self.liveWidth)
+    self.live.t0 = usize.toF64(firstCol) * step
+    self.live.t1 = usize.toF64(if self.liveWritten > 0 { self.liveWritten - 1 } else { 0 }) * step
+    self.live.valid = spanCols > 0
+    self.live.uScale = uScaleOf(spanCols, w)
+    self.live.uOffset = (usize.toF32(firstCol % w) + 0.5) / usize.toF32(w)
   }
 
   pub effect fn setCoarseTier(self: &mut Self, col: &ColumnData) -> ()
