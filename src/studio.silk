@@ -578,6 +578,7 @@ pub struct Overtone {
   /// Vertical split spectrogram: Reference on top, Your take on bottom!
   pub splitRefSpec: bool,
   pub refWarpLut: [f32; 512],
+  pub refAlignOffsetSec: f64,
   pub refWarpActive: bool,
   pub gpuNeedRefWarpReload: bool,
   /// Listening mix when Ref is active: 0=You, 1=Ref, 2=Both simultaneously
@@ -990,6 +991,7 @@ impl Overtone {
       plotOnRef: false,
       splitRefSpec: false,
       refWarpLut: [0.0; 512],
+      refAlignOffsetSec: 0.0,
       refWarpActive: false,
       gpuNeedRefWarpReload: false,
       listenMode: LISTEN_YOU,
@@ -1310,6 +1312,7 @@ impl Overtone {
       self.refClip.clear()
       self.gpuNeedRefReload = true
     }
+    self.refAlignOffsetSec = 0.0
     self.refWarpActive = false
     self.gpuNeedRefWarpReload = true
     audio_native.playSetRefWarp(&[], 0.0)
@@ -1319,52 +1322,96 @@ impl Overtone {
     self.readoutBgScore.clear()
   }
 
+  /// Computes a rigid onset-shift offset (`refTime = takeTime + refAlignOffsetSec`) so Split view
+  /// and Both/Ref playback align the beginning of speech at exact 1.0x speed with ZERO time stretching!
   fn rebuildRefWarpLut(self: &mut Self) -> () {
     let dur = self.clipDuration()
-    let pts = self.compare.points.asSlice()
-    if !self.refClip.active || !self.useDtwAlign || !self.compare.valid || pts.length < 2 || dur <= 0.02 {
+    if !self.refClip.active || !self.useDtwAlign || dur <= 0.02 || self.refClip.durationSec <= 0.02 {
+      self.refAlignOffsetSec = 0.0
       self.refWarpActive = false
       self.gpuNeedRefWarpReload = true
       audio_native.playSetRefWarp(&[], 0.0)
       return ()
     }
-    // Build a 512-entry piecewise-linear warp LUT: takeTime in [0..dur] -> refTimeSec
-    let nPts = pts.length
-    let firstT = pts[0].time
-    let firstR = pts[0].refTime
-    let lastT = pts[nPts - 1].time
-    let lastR = pts[nPts - 1].refTime
+    let mut takeStart = self.voiceMetrics.summary.activeStartSec
+    let mut refStart = self.refClip.summary.activeStartSec
+    // Prefer median onset offset across the first few matched voiced frames if available
+    let pts = self.compare.points.asSlice()
+    let mut offs: [f64; 8] = [0.0; 8]
+    let mut cnt: usize = 0
+    let mut i: usize = 0
+    while i < pts.length && cnt < 8 {
+      if pts[i].bothVoiced {
+        offs[cnt] = pts[i].refTime - pts[i].time
+        cnt = cnt + 1
+      }
+      i = i + 1
+    }
+    let mut offsetSec: f64 = refStart - takeStart
+    if cnt >= 3 {
+      // Insertion sort the small onset sample window for a blip-proof median offset
+      let mut a: usize = 1
+      while a < cnt {
+        let key = offs[a]
+        let mut b = a
+        while b > 0 && offs[b - 1] > key {
+          offs[b] = offs[b - 1]
+          b = b - 1
+        }
+        offs[b] = key
+        a = a + 1
+      }
+      offsetSec = offs[cnt / 2]
+    }
+    self.refAlignOffsetSec = offsetSec
+    // Fill 512-entry rigid linear shift LUT (`refTime = takeTime + offsetSec`, slope = 1.0, zero stretch!)
     let mut k: usize = 0
-    let mut pi: usize = 0
     while k < 512 {
       let t = (usize.toF64(k) / 511.0) * dur
-      let mut r: f64 = 0.0
-      if t <= firstT {
-        r = firstR - (firstT - t)
-      } else if t >= lastT {
-        r = lastR + (t - lastT)
-      } else {
-        while pi + 1 < nPts && pts[pi + 1].time < t {
-          pi = pi + 1
-        }
-        let t0 = pts[pi].time
-        let t1 = pts[pi + 1].time
-        let r0 = pts[pi].refTime
-        let r1 = pts[pi + 1].refTime
-        let span = t1 - t0
-        if span > 1.0e-6 {
-          let frac = f64.max(0.0, f64.min(1.0, (t - t0) / span))
-          r = r0 + frac * (r1 - r0)
-        } else {
-          r = r0
-        }
-      }
-      self.refWarpLut[k] = f64.toF32(r)
+      self.refWarpLut[k] = f64.toF32(t + offsetSec)
       k = k + 1
     }
     self.refWarpActive = true
     self.gpuNeedRefWarpReload = true
     audio_native.playSetRefWarp(&self.refWarpLut, dur)
+  }
+
+  fn saveCurrentClipViewState(self: &Self) -> () {
+    if self.recording || !self.activeClipInLib || self.isPlottingOnRef() {
+      return ()
+    }
+    let p = String.view(&self.activeClipPath)
+    let dur = self.clipDuration()
+    if String.byteLength(p) == 0 || dur <= 0.05 {
+      return ()
+    }
+    audio_native.clipViewSave(p, self.vp.t0, self.vp.t1, self.vp.f0, self.vp.f1, self.cursorSec)
+  }
+
+  fn restoreClipViewState(self: &mut Self) -> bool {
+    if !self.activeClipInLib || self.isPlottingOnRef() {
+      return false
+    }
+    let p = String.view(&self.activeClipPath)
+    let dur = self.clipDuration()
+    if String.byteLength(p) == 0 || dur <= 0.05 {
+      return false
+    }
+    let mut vals: [f64; 5] = [0.0; 5]
+    if !audio_native.clipViewLoad(p, &mut vals) {
+      return false
+    }
+    let t0 = f64.max(0.0, f64.min(dur - 0.04, vals[0]))
+    let t1 = f64.max(t0 + 0.05, f64.min(dur, vals[1]))
+    if t1 - t0 >= 0.04 {
+      self.vp.setTimeRange(t0, t1)
+    }
+    let maxHz = self.sampleRate * 0.5
+    if vals[3] > vals[2] + 50.0 && vals[2] >= 0.0 && vals[3] <= maxHz + 1.0 {
+      self.vp.setFreqRange(vals[2], vals[3])
+    }
+    self.cursorSec = f64.max(0.0, f64.min(dur, vals[4]))
+    return true
   }
 
   pub fn activeTakeGainDb(self: &Self) -> f32 {
@@ -1487,6 +1534,7 @@ impl Overtone {
     let mut smStr = String.make()
     run appendInt(&mut smStr, self.libSortMode)
     audio_native.prefSet("lib_sort_mode", String.view(&smStr))
+    self.saveCurrentClipViewState()
   }
 
   effect fn applyFavoriteAudioDevices(self: &mut Self) -> ()
@@ -4511,6 +4559,7 @@ impl Overtone {
     // - Child of a reference -> its parent reference becomes active!
     // - Reference itself OR loose clip (no parent ref) -> nothing is set as reference!
     if !setAsRef {
+      self.saveCurrentClipViewState()
       if String.byteLength(String.view(&parentRef)) > 0 && !isClipRef {
         let alreadyActiveRef = self.refClip.active && String.view(&self.refClip.fullPath) == String.view(&parentRef)
         if !alreadyActiveRef {
@@ -4555,6 +4604,10 @@ impl Overtone {
           self.pendingNewRef = false
           self.plotOnRef = false
           run self.loadSamples(move dispName, move value.samples, value.sampleRate)
+          if self.restoreClipViewState() {
+            self.gpuNeedRedraw = true
+            run self.rebuildDrawings(true)
+          }
           run self.recomputeNormGain()
           run self.refreshActiveLibMeta()
           run self.saveSessionPrefs()
@@ -4711,6 +4764,9 @@ impl Overtone {
     ? &mut Allocator {
     let wantAppend = self.appendRecordOnce
     self.appendRecordOnce = false
+    if !wantAppend {
+      self.saveCurrentClipViewState()
+    }
     if !wantAppend && self.isViewingRefClip() && !self.refClip.active && self.samples.length() >= 64 {
       run self.activateCurrentRefForRecording()
     }
@@ -5226,6 +5282,7 @@ impl Overtone {
   fn doPausePlayback(self: &mut Self) -> () {
     self.cursorSec = audio_native.playPosition()
     audio_native.playStop()
+    self.saveCurrentClipViewState()
   }
 
   effect fn refreshAvgMetricReadouts(self: &mut Self, inspectSec: f64) -> ()
@@ -5853,48 +5910,50 @@ impl Overtone {
       hoverX: 0.0,
       hoverY: 0.0,
     }
-    let pts = self.compare.points.asSlice()
-    if self.useDtwAlign && self.refWarpActive && pts.length >= 2 {
-      // Project Reference pitch & formant contours onto the Take timeline using the exact DTW warp!
-      let mut wPitch = List<PitchFrame>.make()
-      let mut wFmt = List<FormantFrame>.make()
+    if self.useDtwAlign && self.refWarpActive {
+      // Rigidly shift Reference's original pitch, formants & vowel spans by -refAlignOffsetSec (zero stretching!)
+      let shift = -self.refAlignOffsetSec
+      let rPitch = self.refClip.pitchFrames.asSlice()
+      let mut sPitch = List<PitchFrame>.make()
       let mut i: usize = 0
-      while i < pts.length {
-        let pt = pts[i]
-        run wPitch.append(PitchFrame {
-          time: pt.time,
-          frequency: pt.f0,
-          clarity: if pt.voiced { 0.95 } else { 0.0 },
-          intensityDb: if pt.voiced { -20.0 } else { -80.0 },
-          voiced: pt.voiced,
+      while i < rPitch.length {
+        let mut pf = rPitch[i]
+        pf.time = pf.time + shift
+        run sPitch.append(pf)
+        i = i + 1
+      }
+      let rFmt = self.refClip.formantFrames.asSlice()
+      let mut sFmt = List<FormantFrame>.make()
+      i = 0
+      while i < rFmt.length {
+        let mut ff = rFmt[i]
+        ff.time = ff.time + shift
+        run sFmt.append(ff)
+        i = i + 1
+      }
+      let rVow = self.refVowelSpans.asSlice()
+      let mut sVow = List<VowelSpan>.make()
+      i = 0
+      while i < rVow.length {
+        let vs = &rVow[i]
+        run sVow.append(VowelSpan {
+          t0: vs.t0 + shift,
+          t1: vs.t1 + shift,
+          label: run String.copy(String.view(&vs.label)),
         })
-        let mut cnt: usize = 0
-        if pt.hasFormants && pt.f1 > 1.0 && pt.f2 > pt.f1 {
-          cnt = 2
-          if pt.f3 > pt.f2 { cnt = 3 }
-          if pt.f4 > pt.f3 { cnt = 4 }
-        }
-        let mut wf = FormantFrame.empty(pt.time, if pt.voiced { -20.0 } else { -80.0 })
-        wf.f1 = pt.f1
-        wf.f2 = pt.f2
-        wf.f3 = pt.f3
-        wf.f4 = pt.f4
-        wf.count = cnt
-        wf.tracked = pt.voiced && pt.hasFormants && cnt >= 2
-        run wFmt.append(wf)
         i = i + 1
       }
       return run buildSpectrogramOverlay(
         &self.vp,
         sw,
         paneH,
-        wPitch.asSlice(),
-        wFmt.asSlice(),
+        sPitch.asSlice(),
+        sFmt.asSlice(),
         &[],
         &[],
         self.refClip.sampleRate,
         self.guides.asSlice(),
-        &[],
+        sVow.asSlice(),
         refOpts,
       )
     }
@@ -6391,6 +6450,7 @@ impl Overtone {
       }
 
       Message.FileChosen { path } => {
+        self.saveCurrentClipViewState()
         run self.sendTransport(TransportEvent.StopAll)
         match move run audio_native.loadAudioFile(String.view(&path)) {
           Option<audio_native.LoadedAudio>.Some { value } => {
@@ -8075,6 +8135,7 @@ impl Overtone {
       Message.TimeRulerUp => {
         if self.drag == DRAG_TIME_RULER {
           self.drag = DRAG_NONE
+          self.saveCurrentClipViewState()
         }
       }
 
@@ -8083,6 +8144,7 @@ impl Overtone {
         self.vp.setFreqRange(f0, f64.min(f1, maxF))
         self.scheduleSharp()
         run self.updateViewportDrawings()
+        self.saveCurrentClipViewState()
       }
 
       Message.SetPitchRangePreset { floorHz, ceilHz } => {
@@ -8751,6 +8813,7 @@ impl Overtone {
         } else {
           run self.updateSelectionReadout()
         }
+        self.saveCurrentClipViewState()
       }
 
       Message.SpecLeave => {
@@ -8805,6 +8868,7 @@ impl Overtone {
         }
         self.scheduleSharp()
         run self.updateViewportDrawings()
+        self.saveCurrentClipViewState()
       }
 
       Message.OverviewDown { x } => {
@@ -8868,6 +8932,7 @@ impl Overtone {
       Message.OverviewUp => {
         if self.drag == DRAG_OVERVIEW || self.drag == DRAG_OVERVIEW_LEFT || self.drag == DRAG_OVERVIEW_RIGHT {
           self.drag = DRAG_NONE
+          self.saveCurrentClipViewState()
         }
       }
 
@@ -8930,12 +8995,14 @@ impl Overtone {
         self.vp.panTime(dir)
         self.scheduleSharp()
         run self.rebuildDrawings(false)
+        self.saveCurrentClipViewState()
       }
 
       Message.ZoomStep { factor } => {
         self.vp.zoomTimeAbout(0.5, factor)
         self.scheduleSharp()
         run self.rebuildDrawings(false)
+        self.saveCurrentClipViewState()
       }
     }
   }

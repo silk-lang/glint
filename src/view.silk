@@ -2407,21 +2407,6 @@ fn renderMatchCard(m: &Overtone, h: &Document<Message>) -> Node {
                 ),
               ],
             ),
-            h.row(
-              &[h.class("items-center gap-[4px]")],
-              &[
-                txt(h, "match", "text-[9px] text-[#8A8A90]"),
-                h.row(
-                  &[h.class("w-[42px] h-[5px] rounded-[2px] overflow-hidden")],
-                  &[
-                    h.box(&[h.class("flex-1 bg-[#3E8E68]")], &[]),
-                    h.box(&[h.class("flex-1 bg-[#D99B26]")], &[]),
-                    h.box(&[h.class("flex-1 bg-[#D9381E]")], &[]),
-                  ],
-                ),
-                txt(h, "drift", "text-[9px] text-[#8A8A90]"),
-              ],
-            ),
           ],
         )
       } else {

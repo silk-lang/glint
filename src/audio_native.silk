@@ -81,6 +81,20 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
     endSec: f64,
     loop: i32,
   ) -> i32 as "glint#ov_play_warped_ref"
+  unsafe extern "C" fn ov_clip_view_save(
+    path: ?[*]const u8,
+    pathLen: usize,
+    t0: f64,
+    t1: f64,
+    f0: f64,
+    f1: f64,
+    cursorSec: f64,
+  ) -> () as "glint#ov_clip_view_save"
+  unsafe extern "C" fn ov_clip_view_load(
+    path: ?[*]const u8,
+    pathLen: usize,
+    outVals: ?[*]mut f64,
+  ) -> i32 as "glint#ov_clip_view_load"
   unsafe extern "C" fn ov_lib_set_parent_ref(
     relDir: ?[*]const u8,
     relDirLen: usize,
@@ -1483,6 +1497,47 @@ pub fn playWarpedRef(samples: &[f32], sampleRate: f64, startSec: f64, endSec: f6
     ) != 0
   } else {
     return playRange(samples, sampleRate, startSec, endSec, loop)
+  }
+}
+
+pub fn clipViewSave(path: string, t0: f64, t1: f64, f0: f64, f1: f64, cursorSec: f64) -> () {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    if String.byteLength(path) == 0 {
+      return ()
+    }
+    unsafe ov_clip_view_save(
+      Pointer.fromSlice(String.utf8Bytes(path)),
+      String.byteLength(path),
+      t0,
+      t1,
+      f0,
+      f1,
+      cursorSec,
+    )
+  } else {
+    drop path
+    drop t0
+    drop t1
+    drop f0
+    drop f1
+    drop cursorSec
+  }
+}
+
+pub fn clipViewLoad(path: string, outVals: &mut [f64]) -> bool {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    if String.byteLength(path) == 0 || outVals.length < 5 {
+      return false
+    }
+    return unsafe ov_clip_view_load(
+      Pointer.fromSlice(String.utf8Bytes(path)),
+      String.byteLength(path),
+      Pointer.fromMutSlice(move outVals),
+    ) != 0
+  } else {
+    drop path
+    drop outVals
+    return false
   }
 }
 

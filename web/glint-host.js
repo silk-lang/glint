@@ -517,107 +517,74 @@ const audioState = {
   decodedFiles: new Map(),
   loaded: null,
 
-  // Split-view & Both-mode DTW audio alignment
-  refWarpLut: null,
-  refWarpTakeDur: 0.0,
-  warpedRefCacheKey: "",
-  warpedRefCachePcm: null,
-  warpedRefCacheSr: 0,
+  // Split-view & Both-mode rigid onset-shift alignment (zero time stretching!)
+  refAlignOffsetSec: 0.0,
+  refAlignActive: false,
 };
 
-function sampleWarpLut(lut, normX) {
-  const n = lut.length;
-  if (n < 2) return 0.0;
-  if (normX <= 0.0) return lut[0];
-  if (normX >= 1.0) return lut[n - 1];
-  const f = normX * (n - 1);
-  const i0 = Math.floor(f);
-  const i1 = Math.min(n - 1, i0 + 1);
-  const frac = f - i0;
-  return lut[i0] * (1.0 - frac) + lut[i1] * frac;
-}
-
-// Pitch-preserving WSOLA time-warper: maps Reference audio onto Take's timeline
-// along the exact DTW warp curve used by Split view, preserving natural pitch & timbre!
-function buildWarpedRefAudio(refSamples, refSr, lut, takeDur, outSr) {
-  if (!refSamples || refSamples.length < 64 || !lut || lut.length < 2 || takeDur <= 0.02 || refSr <= 0) {
-    return null;
-  }
-  const key = `${refSamples.length}:${Math.round(refSr)}:${Math.round(takeDur * 1000)}:${Math.round(outSr)}:${lut[0].toFixed(3)}:${lut[lut.length >> 1].toFixed(3)}:${lut[lut.length - 1].toFixed(3)}`;
-  if (audioState.warpedRefCacheKey === key && audioState.warpedRefCachePcm) {
-    return audioState.warpedRefCachePcm;
-  }
-  const totalOut = Math.max(64, Math.ceil(takeDur * outSr));
-  const out = new Float32Array(totalOut);
-  const refDur = refSamples.length / refSr;
-
-  let src = refSamples;
-  if (Math.abs(refSr - outSr) > 1.0) {
-    const rLen = Math.max(64, Math.round(refSamples.length * (outSr / refSr)));
-    src = new Float32Array(rLen);
-    const ratio = refSr / outSr;
-    for (let i = 0; i < rLen; i++) {
-      const f = i * ratio;
-      const k = Math.floor(f);
-      const fr = f - k;
-      src[i] = k + 1 < refSamples.length ? refSamples[k] * (1 - fr) + refSamples[k + 1] * fr : (refSamples[k] || 0);
-    }
-  }
-  const srcLen = src.length;
-  let W = Math.round(outSr * 0.034);
-  if (W % 2 !== 0) W += 1;
-  const H = W >> 1;
-  const S = Math.round(outSr * 0.006);
-  const hann = new Float32Array(W);
-  for (let i = 0; i < W; i++) {
-    hann[i] = 0.5 - 0.5 * Math.cos((2.0 * Math.PI * i) / W);
-  }
-
-  let prevNatIdx = -1;
-  for (let outPos = 0; outPos + W <= totalOut; outPos += H) {
-    const centerSec = (outPos + H) / outSr;
-    const refSec = sampleWarpLut(lut, centerSec / takeDur);
-    if (refSec < -0.02 || refSec > refDur + 0.02) {
-      prevNatIdx = -1;
-      continue;
-    }
-    let nomIdx = Math.round(refSec * outSr) - H;
-    if (nomIdx < 0) nomIdx = 0;
-    if (nomIdx + W > srcLen) nomIdx = Math.max(0, srcLen - W);
-    let bestIdx = nomIdx;
-
-    if (prevNatIdx >= 0 && prevNatIdx + H <= srcLen && Math.abs(nomIdx - prevNatIdx) < Math.round(outSr * 0.25)) {
-      let bestScore = -1e30;
-      const lo = Math.max(0, nomIdx - S);
-      const hi = Math.min(srcLen - W, nomIdx + S);
-      for (let cand = lo; cand <= hi; cand += 2) {
-        let dot = 0.0;
-        let eA = 1e-12;
-        let eB = 1e-12;
-        for (let j = 0; j < H; j += 2) {
-          const a = src[prevNatIdx + j];
-          const b = src[cand + j];
-          dot += a * b;
-          eA += a * a;
-          eB += b * b;
-        }
-        const sc = dot / Math.sqrt(eA * eB);
-        if (sc > bestScore) {
-          bestScore = sc;
-          bestIdx = cand;
-        }
+// Per-file viewport zoom / time window & cursor persistence (in-memory + localStorage)
+const CLIP_VIEWS_KEY = "prism_clip_views_v1";
+const clipViewMap = new Map();
+try {
+  const rawViews = localStorage.getItem(CLIP_VIEWS_KEY);
+  if (rawViews) {
+    const parsed = JSON.parse(rawViews);
+    if (parsed && typeof parsed === "object") {
+      for (const [k, v] of Object.entries(parsed)) {
+        if (Array.isArray(v) && v.length === 5) clipViewMap.set(k, v);
       }
     }
-
-    for (let j = 0; j < W; j++) {
-      out[outPos + j] += src[bestIdx + j] * hann[j];
-    }
-    prevNatIdx = bestIdx + H;
   }
+} catch {}
 
-  audioState.warpedRefCacheKey = key;
-  audioState.warpedRefCachePcm = out;
-  audioState.warpedRefCacheSr = outSr;
+let clipViewsSaveTimer = null;
+function schedulePersistClipViews() {
+  if (clipViewsSaveTimer !== null) return;
+  clipViewsSaveTimer = setTimeout(() => {
+    clipViewsSaveTimer = null;
+    try {
+      const obj = {};
+      for (const [k, v] of clipViewMap.entries()) obj[k] = v;
+      localStorage.setItem(CLIP_VIEWS_KEY, JSON.stringify(obj));
+    } catch {}
+  }, 250);
+}
+
+function saveClipView(path, t0, t1, f0, f1, cursorSec) {
+  if (!path) return;
+  if (clipViewMap.has(path)) clipViewMap.delete(path);
+  clipViewMap.set(path, [t0, t1, f0, f1, cursorSec]);
+  while (clipViewMap.size > 250) {
+    clipViewMap.delete(clipViewMap.keys().next().value);
+  }
+  schedulePersistClipViews();
+}
+
+function loadClipView(path) {
+  if (!path) return null;
+  const v = clipViewMap.get(path);
+  return Array.isArray(v) && v.length === 5 ? v : null;
+}
+
+// Rigid onset-shifted copy of Reference audio mapped onto Take's timeline (exact 1.0x speed, zero stretching!)
+function buildShiftedRefAudio(refSamples, refSr, offsetSec, takeDur, outSr) {
+  if (!refSamples || refSamples.length < 64 || refSr <= 0) return null;
+  const refDur = refSamples.length / refSr;
+  const totalDur = Math.max(takeDur || 0, refDur - offsetSec, 0.05);
+  const totalOut = Math.max(64, Math.ceil(totalDur * outSr));
+  const out = new Float32Array(totalOut);
+  const ratio = refSr / outSr;
+  const refLen = refSamples.length;
+  for (let i = 0; i < totalOut; i++) {
+    const refSec = i / outSr + offsetSec;
+    if (refSec < 0 || refSec >= refDur) continue;
+    const f = refSec * refSr;
+    const k = Math.floor(f);
+    if (k >= 0 && k < refLen) {
+      const fr = f - k;
+      out[i] = k + 1 < refLen ? refSamples[k] * (1 - fr) + refSamples[k + 1] * fr : refSamples[k];
+    }
+  }
   return out;
 }
 
@@ -967,27 +934,19 @@ function startMixedPlayback(samplesA, rateA, samplesB, rateB, startSec, endSec, 
   }
   const durA = samplesA && rateA > 0 ? samplesA.length / rateA : 0;
   const outSr = Math.round(rateA > 0 ? rateA : rateB);
-  let useB = samplesB;
-  let useRateB = rateB;
-  if (samplesB && samplesB.length > 64 && audioState.refWarpLut && audioState.refWarpTakeDur > 0.02 && durA > 0.02) {
-    const warped = buildWarpedRefAudio(samplesB, rateB, audioState.refWarpLut, audioState.refWarpTakeDur, outSr);
-    if (warped) {
-      useB = warped;
-      useRateB = outSr;
-    }
-  }
-  const durB = useB && useRateB > 0 ? useB.length / useRateB : 0;
+  const offsetSec = audioState.refAlignActive ? audioState.refAlignOffsetSec : 0.0;
+  const rawDurB = samplesB && rateB > 0 ? samplesB.length / rateB : 0;
+  const durB = rawDurB > 0 ? Math.max(0, rawDurB - offsetSec) : 0;
   const maxDur = Math.max(durA, durB);
   if (maxDur <= 0.01) return 0;
   const s0 = Math.max(0, Math.min(maxDur, startSec));
   const s1 = Math.max(s0 + 0.01, Math.min(maxDur, endSec > s0 ? endSec : maxDur));
   const totalLen = Math.max(64, Math.ceil(maxDur * outSr));
   const scA = samplesA && samplesA.length > 0 ? applyGainSoftLimit(samplesA, gainDbA) : null;
-  const scB = useB && useB.length > 0 ? applyGainSoftLimit(useB, gainDbB) : null;
+  const scB = samplesB && samplesB.length > 0 ? applyGainSoftLimit(samplesB, gainDbB) : null;
   const ratioA = rateA > 0 ? rateA / outSr : 1;
-  const ratioB = useRateB > 0 ? useRateB / outSr : 1;
 
-  // Render stereo buffer (Take slightly left, Ref slightly right) so overlapping voices don't mask!
+  // Render stereo buffer (Take slightly left, Ref slightly right) with rigid onset shift (zero stretching!)
   const buf = ctx.createBuffer(2, totalLen, outSr);
   const chL = buf.getChannelData(0);
   const chR = buf.getChannelData(1);
@@ -1002,12 +961,15 @@ function startMixedPlayback(samplesA, rateA, samplesB, rateB, startSec, endSec, 
       }
     }
     let vb = 0;
-    if (scB) {
-      const fb = i * ratioB;
-      const ib = Math.floor(fb);
-      if (ib < scB.length) {
-        const frac = fb - ib;
-        vb = ib + 1 < scB.length ? scB[ib] * (1 - frac) + scB[ib + 1] * frac : scB[ib];
+    if (scB && rateB > 0) {
+      const refSec = i / outSr + offsetSec;
+      if (refSec >= 0) {
+        const fb = refSec * rateB;
+        const ib = Math.floor(fb);
+        if (ib >= 0 && ib < scB.length) {
+          const frac = fb - ib;
+          vb = ib + 1 < scB.length ? scB[ib] * (1 - frac) + scB[ib + 1] * frac : scB[ib];
+        }
       }
     }
     const xl = (va * 0.72 + vb * 0.44);
@@ -1311,22 +1273,32 @@ const glintImports = {
   },
   ov_play_set_ref_warp: (lutPtr, count, takeDur) => {
     if (lutPtr && count >= 2 && takeDur > 0.01) {
-      audioState.refWarpLut = readF32Copy(lutPtr, count);
-      audioState.refWarpTakeDur = takeDur;
+      const lut = readF32Copy(lutPtr, count);
+      audioState.refAlignOffsetSec = Number.isFinite(lut[0]) ? lut[0] : 0.0;
+      audioState.refAlignActive = true;
     } else {
-      audioState.refWarpLut = null;
-      audioState.refWarpTakeDur = 0.0;
+      audioState.refAlignOffsetSec = 0.0;
+      audioState.refAlignActive = false;
     }
   },
   ov_play_warped_ref: (ptr, count, sr, startSec, endSec, loop) => {
     const samples = readF32Copy(ptr, count);
-    if (audioState.refWarpLut && audioState.refWarpTakeDur > 0.02) {
-      const warped = buildWarpedRefAudio(samples, sr, audioState.refWarpLut, audioState.refWarpTakeDur, Math.round(sr));
-      if (warped) {
-        return startPlayback(warped, Math.round(sr), startSec, endSec, loop !== 0, null, 0.0);
+    if (audioState.refAlignActive) {
+      const shifted = buildShiftedRefAudio(samples, sr, audioState.refAlignOffsetSec, endSec, Math.round(sr));
+      if (shifted) {
+        return startPlayback(shifted, Math.round(sr), startSec, endSec, loop !== 0, null, 0.0);
       }
     }
     return startPlayback(samples, sr, startSec, endSec, loop !== 0, null, 0.0);
+  },
+  ov_clip_view_save: (pathPtr, pathLen, t0, t1, f0, f1, cursorSec) => {
+    saveClipView(readStr(pathPtr, pathLen), t0, t1, f0, f1, cursorSec);
+  },
+  ov_clip_view_load: (pathPtr, pathLen, outPtr) => {
+    const v = loadClipView(readStr(pathPtr, pathLen));
+    if (!v) return 0;
+    new Float64Array(memBuf(), outPtr, 5).set(v);
+    return 1;
   },
   ov_play_mix: (aPtr, aCount, aSr, bPtr, bCount, bSr, startSec, endSec, loop, aGainDb, bGainDb) => {
     const samplesA = aCount > 0 ? readF32Copy(aPtr, aCount) : null;
