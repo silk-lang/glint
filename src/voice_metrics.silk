@@ -51,6 +51,14 @@ pub struct VoiceFrame {
   pub weightLightNorm: f64,
   /// Harmonics-to-Noise Ratio (dB) from Boersma autocorrelation peak.
   pub hnrDb: f64,
+  /// Smoothed Cepstral Peak Prominence (dB): noise-robust vocal-fold closure metric.
+  pub cppsDb: f64,
+  /// Epilaryngeal Twang/Ring ratio (2–4 kHz vs 300–1800 Hz, dB).
+  pub twangDb: f64,
+  /// Normalized Twang/Ring in [0, 1] (0 = mellow/covered, 1 = bright/ringy).
+  pub twangNorm: f64,
+  /// Acoustic pressed/strain index in [0, 1] (0 = easy/open, 1 = heavily pressed).
+  pub strainNorm: f64,
   /// Formant snapshot for vowel cloud & aligned formant ribbon plotting.
   pub f1: f64,
   pub f2: f64,
@@ -74,6 +82,10 @@ impl VoiceFrame {
       tiltDb: 15.0,
       weightLightNorm: 0.5,
       hnrDb: 0.0,
+      cppsDb: 0.0,
+      twangDb: -18.0,
+      twangNorm: 0.4,
+      strainNorm: 0.0,
       f1: 0.0,
       f2: 0.0,
       f3: 0.0,
@@ -91,6 +103,12 @@ pub struct VoiceSummary {
   pub medianH1H2Db: f64,
   pub medianWeightLight: f64,
   pub medianHnrDb: f64,
+  pub medianCppsDb: f64,
+  pub medianTwangDb: f64,
+  pub medianTwangNorm: f64,
+  pub medianStrainNorm: f64,
+  pub pitchSpanSt: f64,
+  pub expressNorm: f64,
   pub meanF1: f64,
   pub meanF2: f64,
   pub formantCount: usize,
@@ -110,6 +128,12 @@ impl VoiceSummary {
       medianH1H2Db: 0.0,
       medianWeightLight: 0.5,
       medianHnrDb: 0.0,
+      medianCppsDb: 0.0,
+      medianTwangDb: -18.0,
+      medianTwangNorm: 0.4,
+      medianStrainNorm: 0.0,
+      pitchSpanSt: 0.0,
+      expressNorm: 0.0,
       meanF1: 0.0,
       meanF2: 0.0,
       formantCount: 0,
@@ -143,6 +167,81 @@ pub fn weightTiltToLightNorm(h1h2StarDb: f64, tiltStarDb: f64) -> f64 {
   return f64.max(0.02, f64.min(0.98, s))
 }
 
+/// Maps Omori Singing Power Ratio `peak(2–4 kHz) - peak(0.2–2 kHz)` (dB) into [0, 1]:
+/// -42 dB = 0% (mellow/dark), -27 dB = 50% (balanced speech), -12 dB = 100% (strong twang/ring).
+pub fn twangToNorm(twangDb: f64) -> f64 {
+  return f64.max(0.0, f64.min(1.0, (twangDb + 42.0) / 30.0))
+}
+
+/// Acoustic pressed/hyperfunction index in [0, 1]:
+/// High closure (CPPS > 9 dB) combined with tight/negative H1*-H2* and flat harsh spectral tilt.
+/// Clean bright twang with positive H1*-H2* stays low so bright resonance isn't misread as strain!
+pub fn computeStrainNorm(cppsDb: f64, h1h2StarDb: f64, tiltStarDb: f64) -> f64 {
+  let highClose = f64.max(0.0, f64.min(1.0, (cppsDb - 8.5) / 7.5))
+  let pressComp = f64.max(0.0, f64.min(1.0, (1.5 - h1h2StarDb) / 8.5))
+  let tiltComp = f64.max(0.0, f64.min(1.0, (12.5 - tiltStarDb) / 11.0))
+  return f64.max(0.0, f64.min(1.0, highClose * (0.55 * pressComp + 0.45 * tiltComp)))
+}
+
+pub struct ExpressStats {
+  pub pitchSpanSt: f64,
+  pub expressNorm: f64,
+}
+
+impl Copy for ExpressStats {}
+
+/// Computes pitch-dynamics Expressiveness from sorted voiced F0s (for robust P90-P10 span)
+/// and chronological voiced `(f0, time)` pairs (for contour slope activity).
+pub fn computeExpressiveness(sortedF0: &[f64], seqF0: &[f64], seqTime: &[f64]) -> ExpressStats {
+  let n = sortedF0.length
+  if n < 3 {
+    return ExpressStats { pitchSpanSt: 0.0, expressNorm: 0.0 }
+  }
+  // Reject isolated octave-halving/doubling glitches (> ±10 st from median F0)
+  let medF0 = sortedF0[n / 2]
+  let fMinKeep = medF0 * 0.56
+  let fMaxKeep = medF0 * 1.80
+  let mut kLo: usize = 0
+  while kLo < n && sortedF0[kLo] < fMinKeep {
+    kLo = kLo + 1
+  }
+  let mut kHi: usize = n
+  while kHi > kLo && sortedF0[kHi - 1] > fMaxKeep {
+    kHi = kHi - 1
+  }
+  let m = if kHi > kLo + 2 { kHi - kLo } else { n }
+  let base = if kHi > kLo + 2 { kLo } else { 0 }
+  let loIdx = base + (m * 10) / 100
+  let hiIdxRaw = base + (m * 90) / 100
+  let hiIdx = if hiIdxRaw >= base + m { base + m - 1 } else { hiIdxRaw }
+  let fLo = sortedF0[loIdx]
+  let fHi = sortedF0[hiIdx]
+  let spanSt = if fLo > 20.0 && fHi > fLo {
+    f64.max(0.0, f64.min(24.0, 12.0 * f64.log2(fHi / fLo)))
+  } else {
+    0.0
+  }
+  let mut slopeSum: f64 = 0.0
+  let mut slopeCnt: usize = 0
+  let mut i: usize = 1
+  while i < seqF0.length && i < seqTime.length {
+    let dt = seqTime[i] - seqTime[i - 1]
+    if dt > 0.004 && dt < 0.06 && seqF0[i] > 20.0 && seqF0[i - 1] > 20.0 {
+      let dst = f64.abs(12.0 * f64.log2(seqF0[i] / seqF0[i - 1]))
+      if dst < 6.0 {
+        slopeSum = slopeSum + dst / dt
+        slopeCnt = slopeCnt + 1
+      }
+    }
+    i = i + 1
+  }
+  let meanSlope = if slopeCnt > 0 { slopeSum / usize.toF64(slopeCnt) } else { 0.0 }
+  let spanNorm = f64.max(0.0, f64.min(1.0, (spanSt - 1.0) / 10.0))
+  let slopeNorm = f64.max(0.0, f64.min(1.0, meanSlope / 32.0))
+  let expr = f64.max(0.0, f64.min(1.0, 0.70 * spanNorm + 0.30 * slopeNorm))
+  return ExpressStats { pitchSpanSt: spanSt, expressNorm: expr }
+}
+
 /// All-pole vocal-tract resonator transfer gain (dB) at `freq` for a formant `(formantHz, bwHz)`.
 /// Used for Iseli-Shue-Alwan formant correction (`H1* - H2*` & `H1*` spectral tilt).
 fn resonatorGainDb(freq: f64, formantHz: f64, bwHz: f64) -> f64 {
@@ -159,6 +258,8 @@ fn resonatorGainDb(freq: f64, formantHz: f64, bwHz: f64) -> f64 {
 struct HarmonicWeightRaw {
   rawH1H2: f64,
   rawTilt: f64,
+  cppsDb: f64,
+  twangDb: f64,
   valid: bool,
 }
 
@@ -232,11 +333,12 @@ fn peakPowerAtHz(re: &[f64], im: &[f64], nHalf: usize, hzPerBin: f64, targetHz: 
   return best
 }
 
-/// Measures raw `H1 - H2` and Hanson-style `H1 - A1/A2/A3` harmonic spectral tilt
-/// in a single 2048-pt Hann-windowed FFT.
+/// Measures raw `H1 - H2`, Hanson-style `H1 - A1/A2/A3` spectral tilt,
+/// Praat-style Smoothed Cepstral Peak Prominence (`cppsDb`), and 2–4 kHz Twang/Ring (`twangDb`)
+/// from a single 2048-pt Hann-windowed FFT.
 fn measureHarmonicWeight(samples: &[f32], sampleRate: f64, centreSec: f64, f0: f64) -> HarmonicWeightRaw {
   if samples.length < 256 || sampleRate <= 0.0 || f0 < 45.0 || f0 * 2.5 >= sampleRate * 0.5 {
-    return HarmonicWeightRaw { rawH1H2: 0.0, rawTilt: 15.0, valid: false }
+    return HarmonicWeightRaw { rawH1H2: 0.0, rawTilt: 15.0, cppsDb: 0.0, twangDb: -18.0, valid: false }
   }
   let n: usize = 2048
   let nHalf: usize = 1024
@@ -315,7 +417,110 @@ fn measureHarmonicWeight(samples: &[f32], sampleRate: f64, centreSec: f64, f0: f
   }
   let rawTilt = if wSum > 0.0 { tSum / wSum } else { rawH1H2 + 16.0 }
 
-  return HarmonicWeightRaw { rawH1H2: rawH1H2, rawTilt: rawTilt, valid: true }
+  // Epilaryngeal Twang / Ring (Omori Singing Power Ratio): peak(2000..4000 Hz) - peak(200..2000 Hz) in dB
+  // Sample-rate & FFT-bin-width invariant!
+  let bMid0 = f64.toUsize(f64.max(1.0, f64.floor(200.0 / hzPerBin)))
+  let bMid1 = f64.toUsize(f64.min(usize.toF64(nHalf - 1), f64.ceil(2000.0 / hzPerBin)))
+  let bTw0 = f64.toUsize(f64.max(1.0, f64.floor(2000.0 / hzPerBin)))
+  let bTw1 = f64.toUsize(f64.min(usize.toF64(nHalf - 1), f64.ceil(4000.0 / hzPerBin)))
+  let mut maxMid: f64 = 1.0e-18
+  let mut bi = bMid0
+  while bi <= bMid1 {
+    let p = re[bi] * re[bi] + im[bi] * im[bi]
+    if p > maxMid { maxMid = p }
+    bi = bi + 1
+  }
+  let mut maxTw: f64 = 1.0e-18
+  bi = bTw0
+  while bi <= bTw1 {
+    let p = re[bi] * re[bi] + im[bi] * im[bi]
+    if p > maxTw { maxTw = p }
+    bi = bi + 1
+  }
+  let twangDb = f64.max(-46.0, f64.min(6.0, invLn10 * f64.log(maxTw / maxMid)))
+
+  // Praat / Hillenbrand Power Cepstral Peak Prominence (CPPS, dB) from log-power spectrum
+  let mut cre: [f64; 2048] = [0.0; 2048]
+  let mut cim: [f64; 2048] = [0.0; 2048]
+  let p0 = re[0] * re[0] + im[0] * im[0]
+  cre[0] = f64.log(p0 + 1.0e-18)
+  let pNyq = re[nHalf] * re[nHalf] + im[nHalf] * im[nHalf]
+  cre[nHalf] = f64.log(pNyq + 1.0e-18)
+  let mut ci: usize = 1
+  while ci < nHalf {
+    let lp = f64.log(re[ci] * re[ci] + im[ci] * im[ci] + 1.0e-18)
+    cre[ci] = lp
+    cre[n - ci] = lp
+    ci = ci + 1
+  }
+  fftRadix2Local(&mut cre, &mut cim, n)
+  let invN = 1.0 / nF
+  let qLo = f64.toUsize(f64.max(4.0, f64.floor(sampleRate / 380.0)))
+  let qHiRaw = f64.toUsize(f64.ceil(sampleRate / 60.0))
+  let qHi = if qHiRaw < nHalf - 3 { qHiRaw } else { nHalf - 3 }
+  let mut cppsDb: f64 = 0.0
+  if qHi > qLo + 6 {
+    let mut cDb: [f64; 1024] = [0.0; 1024]
+    let qStart = if qLo >= 2 { qLo - 2 } else { 0 }
+    let qEnd = if qHi + 2 < nHalf { qHi + 2 } else { nHalf - 1 }
+    let mut q = qStart
+    while q <= qEnd {
+      let mag = cre[q] * invN
+      cDb[q] = invLn10 * f64.log(mag * mag + 1.0e-12)
+      q = q + 1
+    }
+    // 5-bin quefrency smoothing + OLS linear regression baseline across [qLo..qHi]
+    let mut sumQ: f64 = 0.0
+    let mut sumY: f64 = 0.0
+    let mut cntQ: usize = 0
+    let mut sm: [f64; 1024] = [0.0; 1024]
+    q = qLo
+    while q <= qHi {
+      let y = 0.20 * (cDb[q - 2] + cDb[q - 1] + cDb[q] + cDb[q + 1] + cDb[q + 2])
+      sm[q] = y
+      sumQ = sumQ + usize.toF64(q)
+      sumY = sumY + y
+      cntQ = cntQ + 1
+      q = q + 1
+    }
+    let cntF = usize.toF64(cntQ)
+    let meanQ = sumQ / cntF
+    let meanY = sumY / cntF
+    let mut num: f64 = 0.0
+    let mut den: f64 = 0.0
+    q = qLo
+    while q <= qHi {
+      let dq = usize.toF64(q) - meanQ
+      num = num + dq * (sm[q] - meanY)
+      den = den + dq * dq
+      q = q + 1
+    }
+    let slope = if den > 1.0e-12 { num / den } else { 0.0 }
+    let intercept = meanY - slope * meanQ
+    // Search cepstral peak around the F0 quefrency
+    let sLoRaw = f64.toUsize(f64.floor(sampleRate / f64.min(420.0, f0 * 1.35)))
+    let sHiRaw = f64.toUsize(f64.ceil(sampleRate / f64.max(55.0, f0 * 0.72)))
+    let sLo = if sLoRaw > qLo { sLoRaw } else { qLo }
+    let sHi = if sHiRaw < qHi { sHiRaw } else { qHi }
+    let mut bestProm: f64 = 0.0
+    q = sLo
+    while q <= sHi {
+      let prom = sm[q] - (intercept + slope * usize.toF64(q))
+      if prom > bestProm {
+        bestProm = prom
+      }
+      q = q + 1
+    }
+    cppsDb = f64.max(0.0, f64.min(30.0, bestProm))
+  }
+
+  return HarmonicWeightRaw {
+    rawH1H2: rawH1H2,
+    rawTilt: rawTilt,
+    cppsDb: cppsDb,
+    twangDb: twangDb,
+    valid: true,
+  }
 }
 
 /// Estimates apparent Vocal Tract Length (cm) from F1..F3 using quarter-wave tube scaling,
@@ -516,6 +721,9 @@ impl VoiceMetricsTrack {
           }
         }
 
+        let twangNorm = twangToNorm(hw.twangDb)
+        let strainNorm = computeStrainNorm(hw.cppsDb, h1h2Db, tiltDb)
+
         run self.frames.append(VoiceFrame {
           time: pf.time,
           voiced: true,
@@ -527,6 +735,10 @@ impl VoiceMetricsTrack {
           tiltDb: tiltDb,
           weightLightNorm: self.smoothLight,
           hnrDb: hnrDb,
+          cppsDb: hw.cppsDb,
+          twangDb: hw.twangDb,
+          twangNorm: twangNorm,
+          strainNorm: strainNorm,
           f1: f1,
           f2: f2,
           f3: f3,
@@ -546,11 +758,16 @@ impl VoiceMetricsTrack {
     ? &mut Allocator {
     let fs = self.frames.asSlice()
     let mut f0s = List<f64>.make()
+    let mut f0Seq = List<f64>.make()
     let mut vtls = List<f64>.make()
     let mut sizes = List<f64>.make()
     let mut h1h2s = List<f64>.make()
     let mut lights = List<f64>.make()
     let mut hnrs = List<f64>.make()
+    let mut cppsList = List<f64>.make()
+    let mut twangDbs = List<f64>.make()
+    let mut twangNorms = List<f64>.make()
+    let mut strains = List<f64>.make()
     let mut voicedTimes = List<f64>.make()
 
     let mut f1Sum: f64 = 0.0
@@ -568,9 +785,14 @@ impl VoiceMetricsTrack {
         }
         activeEnd = fr.time
         run f0s.append(fr.f0)
+        run f0Seq.append(fr.f0)
         run h1h2s.append(fr.h1h2Db)
         run lights.append(fr.weightLightNorm)
         run hnrs.append(fr.hnrDb)
+        run cppsList.append(fr.cppsDb)
+        run twangDbs.append(fr.twangDb)
+        run twangNorms.append(fr.twangNorm)
+        run strains.append(fr.strainNorm)
         run voicedTimes.append(fr.time)
         if fr.vtlCm > 1.0 {
           run vtls.append(fr.vtlCm)
@@ -592,14 +814,23 @@ impl VoiceMetricsTrack {
       return ()
     }
 
+    let medF0 = medianOfList(&mut f0s)
+    let expr = computeExpressiveness(f0s.asSlice(), f0Seq.asSlice(), voicedTimes.asSlice())
+
     self.summary = VoiceSummary {
       voicedFrames: vc,
-      medianF0: medianOfList(&mut f0s),
+      medianF0: medF0,
       medianVtlCm: medianOfList(&mut vtls),
       medianSizeNorm: if sizes.length() > 0 { medianOfList(&mut sizes) } else { 0.5 },
       medianH1H2Db: medianOfList(&mut h1h2s),
       medianWeightLight: medianOfList(&mut lights),
       medianHnrDb: medianOfList(&mut hnrs),
+      medianCppsDb: medianOfList(&mut cppsList),
+      medianTwangDb: medianOfList(&mut twangDbs),
+      medianTwangNorm: medianOfList(&mut twangNorms),
+      medianStrainNorm: medianOfList(&mut strains),
+      pitchSpanSt: expr.pitchSpanSt,
+      expressNorm: expr.expressNorm,
       meanF1: if fmtCount > 0 { f1Sum / usize.toF64(fmtCount) } else { 0.0 },
       meanF2: if fmtCount > 0 { f2Sum / usize.toF64(fmtCount) } else { 0.0 },
       formantCount: fmtCount,

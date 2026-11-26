@@ -329,6 +329,37 @@ effect fn callInner(token: ?*mut u8, op: u32, a: f64, b: f64, c: f64) -> f64
       page.host.send(Message.LiveNeuralFormantsReady { jobId: jid })
       run drain<Overtone, Message, Command, OutOfMemoryError, Dom, &mut Allocator>(&mut page.host, &mut page.dom)
       run page.syncSpec()
+    } else if ns == "timbre_ready" {
+      // payload format: "<jobId>|<pct>|<cosPermille>"
+      let ps = String.view(&payload)
+      let bytes = String.utf8Bytes(ps)
+      let mut parts: [u32; 3] = [0; 3]
+      let mut pIdx: usize = 0
+      let mut cur: u32 = 0
+      let mut k: usize = 0
+      while k < bytes.length {
+        let b = bytes[k]
+        if b == 124 {
+          if pIdx < 3 {
+            parts[pIdx] = cur
+            pIdx = pIdx + 1
+          }
+          cur = 0
+        } else if b >= 48 && b <= 57 {
+          cur = cur * 10 + u8.toU32(b - 48)
+        }
+        k = k + 1
+      }
+      if pIdx < 3 {
+        parts[pIdx] = cur
+      }
+      page.host.send(Message.TimbreReady {
+        jobId: u32.toI32(parts[0]),
+        pct: u32.toI32(parts[1]),
+        cosPermille: u32.toI32(parts[2]),
+      })
+      run drain<Overtone, Message, Command, OutOfMemoryError, Dom, &mut Allocator>(&mut page.host, &mut page.dom)
+      run page.syncSpec()
     } else if ns == "phonemes_ready" {
       // payload format: "<jobId>|<isRef>|<count>"
       let ps = String.view(&payload)

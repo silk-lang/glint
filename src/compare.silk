@@ -3,7 +3,7 @@
 import audio_native
 import formants { FormantFrame }
 import pitch { PitchFrame }
-import voice_metrics { LTAS_BINS, LTAS_FMAX, LTAS_FMIN, VoiceFrame, VoiceSummary }
+import voice_metrics { LTAS_BINS, LTAS_FMAX, LTAS_FMIN, VoiceFrame, VoiceSummary, computeExpressiveness }
 import silk.collections.list { List }
 import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -155,6 +155,10 @@ pub struct SelectionCompare {
   pub deltaVtlCm: f64,
   pub deltaH1H2Db: f64,
   pub deltaHnrDb: f64,
+  pub deltaCppsDb: f64,
+  pub deltaTwangDb: f64,
+  pub deltaStrainPct: f64,
+  pub deltaPitchSpanSt: f64,
   pub deltaVowelF2: f64,
   pub takeSummary: VoiceSummary,
   pub refSummary: VoiceSummary,
@@ -179,6 +183,10 @@ impl SelectionCompare {
       deltaVtlCm: 0.0,
       deltaH1H2Db: 0.0,
       deltaHnrDb: 0.0,
+      deltaCppsDb: 0.0,
+      deltaTwangDb: 0.0,
+      deltaStrainPct: 0.0,
+      deltaPitchSpanSt: 0.0,
       deltaVowelF2: 0.0,
       takeSummary: VoiceSummary.empty(),
       refSummary: VoiceSummary.empty(),
@@ -204,6 +212,10 @@ pub struct CompareAlignment {
   pub deltaVtlCm: f64,
   pub deltaH1H2Db: f64,
   pub deltaHnrDb: f64,
+  pub deltaCppsDb: f64,
+  pub deltaTwangDb: f64,
+  pub deltaStrainPct: f64,
+  pub deltaPitchSpanSt: f64,
   pub deltaVowelF2: f64,
   pub score: MatchScore,
 }
@@ -219,6 +231,10 @@ impl CompareAlignment {
       deltaVtlCm: 0.0,
       deltaH1H2Db: 0.0,
       deltaHnrDb: 0.0,
+      deltaCppsDb: 0.0,
+      deltaTwangDb: 0.0,
+      deltaStrainPct: 0.0,
+      deltaPitchSpanSt: 0.0,
       deltaVowelF2: 0.0,
       score: MatchScore.empty(),
     }
@@ -614,6 +630,10 @@ pub effect fn buildCompareAlignment(
   }
   let deltaH1H2Db = takeSummary.medianH1H2Db - refClip.summary.medianH1H2Db
   let deltaHnrDb = takeSummary.medianHnrDb - refClip.summary.medianHnrDb
+  let deltaCppsDb = takeSummary.medianCppsDb - refClip.summary.medianCppsDb
+  let deltaTwangDb = takeSummary.medianTwangDb - refClip.summary.medianTwangDb
+  let deltaStrainPct = (takeSummary.medianStrainNorm - refClip.summary.medianStrainNorm) * 100.0
+  let deltaPitchSpanSt = takeSummary.pitchSpanSt - refClip.summary.pitchSpanSt
   let deltaVowelF2 = if takeSummary.formantCount > 0 && refClip.summary.formantCount > 0 && takeSummary.meanF2 > 100.0 && refClip.summary.meanF2 > 100.0 {
     f64.log2(takeSummary.meanF2 / refClip.summary.meanF2)
   } else {
@@ -734,6 +754,10 @@ pub effect fn buildCompareAlignment(
       deltaVtlCm: deltaVtlCm,
       deltaH1H2Db: deltaH1H2Db,
       deltaHnrDb: deltaHnrDb,
+      deltaCppsDb: deltaCppsDb,
+      deltaTwangDb: deltaTwangDb,
+      deltaStrainPct: deltaStrainPct,
+      deltaPitchSpanSt: deltaPitchSpanSt,
       deltaVowelF2: deltaVowelF2,
       score: score,
     }
@@ -915,6 +939,10 @@ pub effect fn buildCompareAlignment(
     deltaVtlCm: deltaVtlCm,
     deltaH1H2Db: deltaH1H2Db,
     deltaHnrDb: deltaHnrDb,
+    deltaCppsDb: deltaCppsDb,
+    deltaTwangDb: deltaTwangDb,
+    deltaStrainPct: deltaStrainPct,
+    deltaPitchSpanSt: deltaPitchSpanSt,
     deltaVowelF2: deltaVowelF2,
     score: score,
   }
@@ -929,11 +957,16 @@ pub effect fn summarizeVoiceRange(
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut f0s = List<f64>.make()
+  let mut f0Seq = List<f64>.make()
   let mut vtls = List<f64>.make()
   let mut sizes = List<f64>.make()
   let mut h1h2s = List<f64>.make()
   let mut lights = List<f64>.make()
   let mut hnrs = List<f64>.make()
+  let mut cppsList = List<f64>.make()
+  let mut twangDbs = List<f64>.make()
+  let mut twangNorms = List<f64>.make()
+  let mut strains = List<f64>.make()
   let mut f1Sum: f64 = 0.0
   let mut f2Sum: f64 = 0.0
   let mut fmtCnt: usize = 0
@@ -947,9 +980,14 @@ pub effect fn summarizeVoiceRange(
       if firstT < 0.0 { firstT = fr.time }
       lastT = fr.time
       run f0s.append(fr.f0)
+      run f0Seq.append(fr.f0)
       run h1h2s.append(fr.h1h2Db)
       run lights.append(fr.weightLightNorm)
       run hnrs.append(fr.hnrDb)
+      run cppsList.append(fr.cppsDb)
+      run twangDbs.append(fr.twangDb)
+      run twangNorms.append(fr.twangNorm)
+      run strains.append(fr.strainNorm)
       run outVoicedTimes.append(fr.time)
       if fr.vtlCm > 1.0 {
         run vtls.append(fr.vtlCm)
@@ -966,14 +1004,22 @@ pub effect fn summarizeVoiceRange(
   if f0s.length() == 0 {
     return VoiceSummary.empty()
   }
+  let medF0 = medianSortF64(f0s.asMutSlice())
+  let expr = computeExpressiveness(f0s.asSlice(), f0Seq.asSlice(), outVoicedTimes.asSlice())
   return VoiceSummary {
     voicedFrames: f0s.length(),
-    medianF0: medianSortF64(f0s.asMutSlice()),
+    medianF0: medF0,
     medianVtlCm: if vtls.length() > 0 { medianSortF64(vtls.asMutSlice()) } else { 0.0 },
     medianSizeNorm: if sizes.length() > 0 { medianSortF64(sizes.asMutSlice()) } else { 0.5 },
     medianH1H2Db: medianSortF64(h1h2s.asMutSlice()),
     medianWeightLight: medianSortF64(lights.asMutSlice()),
     medianHnrDb: medianSortF64(hnrs.asMutSlice()),
+    medianCppsDb: medianSortF64(cppsList.asMutSlice()),
+    medianTwangDb: medianSortF64(twangDbs.asMutSlice()),
+    medianTwangNorm: medianSortF64(twangNorms.asMutSlice()),
+    medianStrainNorm: medianSortF64(strains.asMutSlice()),
+    pitchSpanSt: expr.pitchSpanSt,
+    expressNorm: expr.expressNorm,
     meanF1: if fmtCnt > 0 { f1Sum / usize.toF64(fmtCnt) } else { 0.0 },
     meanF2: if fmtCnt > 0 { f2Sum / usize.toF64(fmtCnt) } else { 0.0 },
     formantCount: fmtCnt,
@@ -1058,6 +1104,10 @@ pub effect fn computeSelectionCompare(
   }
   let deltaH1H2Db = takeSum.medianH1H2Db - refSum.medianH1H2Db
   let deltaHnrDb = takeSum.medianHnrDb - refSum.medianHnrDb
+  let deltaCppsDb = takeSum.medianCppsDb - refSum.medianCppsDb
+  let deltaTwangDb = takeSum.medianTwangDb - refSum.medianTwangDb
+  let deltaStrainPct = (takeSum.medianStrainNorm - refSum.medianStrainNorm) * 100.0
+  let deltaPitchSpanSt = takeSum.pitchSpanSt - refSum.pitchSpanSt
   let deltaVowelF2 = if takeSum.formantCount > 0 && refSum.formantCount > 0 && takeSum.meanF2 > 100.0 && refSum.meanF2 > 100.0 {
     f64.log2(takeSum.meanF2 / refSum.meanF2)
   } else {
@@ -1192,6 +1242,10 @@ pub effect fn computeSelectionCompare(
     deltaVtlCm: deltaVtlCm,
     deltaH1H2Db: deltaH1H2Db,
     deltaHnrDb: deltaHnrDb,
+    deltaCppsDb: deltaCppsDb,
+    deltaTwangDb: deltaTwangDb,
+    deltaStrainPct: deltaStrainPct,
+    deltaPitchSpanSt: deltaPitchSpanSt,
     deltaVowelF2: deltaVowelF2,
     takeSummary: takeSum,
     refSummary: refSum,

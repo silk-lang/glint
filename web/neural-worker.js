@@ -18,9 +18,11 @@ const FT_BIN_RES = (SWIFT_SR / 2) / FT_BINS;
 let pitchSession = null;
 let formantSession = null;
 let phonemeSession = null;
+let timbreSession = null;
 let formantBackend = "none";
 let initPromise = null;
 let phonemeInitPromise = null;
+let timbreInitPromise = null;
 let busyCount = 0;
 let phonemeBusyCount = 0;
 
@@ -28,9 +30,11 @@ let phonemeBusyCount = 0;
 const latestJobId = new Map();
 const latestPhoneJobId = new Map();
 let latestLiveFormantJobId = 0;
+let latestTimbreJobId = 0;
 // Simple LRU cache keyed by clip fingerprint -> { f0Times, f0Hz, f0Conf, fmtTimes, fmtF1, fmtF2, fmtF3 }
 const resultCache = new Map();
 const phoneCache = new Map();
+const timbreCache = new Map();
 const MAX_CACHE = 48;
 
 // Allosaurus uni2005 230-unit IPA table (index 0 = CTC blank, 1..229 = universal phones)
@@ -43,8 +47,35 @@ function postStatus() {
     (formantSession ? 2 : 0) |
     (busyCount > 0 ? 4 : 0) |
     (phonemeSession ? 8 : 0) |
-    (phonemeBusyCount > 0 ? 16 : 0);
+    (phonemeBusyCount > 0 ? 16 : 0) |
+    (timbreSession ? 32 : 0);
   self.postMessage({ type: "status", flags, backend: formantBackend });
+}
+
+async function ensureTimbreModel() {
+  if (timbreSession) return timbreSession;
+  if (timbreInitPromise) return timbreInitPromise;
+  busyCount++;
+  postStatus();
+  timbreInitPromise = (async () => {
+    try {
+      const resp = await fetch("./models/wespeaker_campplus_q8.onnx");
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const buf = await resp.arrayBuffer();
+      timbreSession = await ort.InferenceSession.create(buf, {
+        executionProviders: ["wasm"],
+      });
+      return timbreSession;
+    } catch (err) {
+      console.warn("[Glint Neural] WeSpeaker CAM++ load failed:", err);
+      timbreInitPromise = null;
+      return null;
+    } finally {
+      busyCount = Math.max(0, busyCount - 1);
+      postStatus();
+    }
+  })();
+  return timbreInitPromise;
 }
 
 async function ensurePhonemeModel() {
@@ -794,6 +825,183 @@ async function handleAnalyzePhonemes(msg) {
   }
 }
 
+// ============================================================================
+// WeSpeaker CAM++ LM (INT8, 8.0 MB) 80-dim Kaldi Fbank + 512-d Timbre Embedding
+// ============================================================================
+const TIMBRE_SR = 16000;
+const TIMBRE_WIN = 400; // 25 ms
+const TIMBRE_HOP = 160; // 10 ms
+const TIMBRE_NFFT = 512;
+const TIMBRE_BINS = 257;
+const TIMBRE_MELS = 80;
+const TIMBRE_POVEY = new Float64Array(TIMBRE_WIN);
+const TIMBRE_FB = new Float64Array(TIMBRE_MELS * TIMBRE_BINS);
+const TIMBRE_BIT_REV = new Uint16Array(TIMBRE_NFFT);
+const TIMBRE_COS = new Float64Array(TIMBRE_NFFT >> 1);
+const TIMBRE_SIN = new Float64Array(TIMBRE_NFFT >> 1);
+{
+  for (let i = 0; i < TIMBRE_WIN; i++) {
+    TIMBRE_POVEY[i] = Math.pow(0.5 - 0.5 * Math.cos((2.0 * Math.PI * i) / (TIMBRE_WIN - 1)), 0.85);
+  }
+  const bits = 9;
+  for (let i = 0; i < TIMBRE_NFFT; i++) {
+    let r = 0, v = i;
+    for (let b = 0; b < bits; b++) { r = (r << 1) | (v & 1); v >>= 1; }
+    TIMBRE_BIT_REV[i] = r;
+  }
+  for (let i = 0; i < (TIMBRE_NFFT >> 1); i++) {
+    const a = (-2.0 * Math.PI * i) / TIMBRE_NFFT;
+    TIMBRE_COS[i] = Math.cos(a);
+    TIMBRE_SIN[i] = Math.sin(a);
+  }
+  const hz2mel = (f) => 1127.0 * Math.log(1.0 + f / 700.0);
+  const melLo = hz2mel(20.0);
+  const melHi = hz2mel(7600.0);
+  const melPts = new Float64Array(TIMBRE_MELS + 2);
+  for (let i = 0; i < TIMBRE_MELS + 2; i++) {
+    melPts[i] = melLo + ((melHi - melLo) * i) / (TIMBRE_MELS + 1);
+  }
+  for (let m = 0; m < TIMBRE_MELS; m++) {
+    const l = melPts[m], c = melPts[m + 1], r = melPts[m + 2];
+    for (let k = 0; k < TIMBRE_BINS; k++) {
+      const bm = hz2mel((k * TIMBRE_SR) / TIMBRE_NFFT);
+      TIMBRE_FB[m * TIMBRE_BINS + k] = Math.max(0.0, Math.min((bm - l) / (c - l), (r - bm) / (r - c)));
+    }
+  }
+}
+
+function computeTimbreFbank(samples, sampleRate) {
+  const wav16k = resampleTo16k(samples, sampleRate);
+  // Trim leading/trailing near-silence and cap to 16s for fast, speech-focused timbre embedding
+  let start = 0;
+  let end = wav16k.length;
+  const thresh = 0.004;
+  while (start < end && Math.abs(wav16k[start]) < thresh) start++;
+  while (end > start && Math.abs(wav16k[end - 1]) < thresh) end--;
+  if (end - start < TIMBRE_WIN * 2) {
+    start = 0;
+    end = wav16k.length;
+  } else {
+    start = Math.max(0, start - 1600);
+    end = Math.min(wav16k.length, end + 1600);
+  }
+  const maxSamp = TIMBRE_SR * 16;
+  if (end - start > maxSamp) end = start + maxSamp;
+  const sub = wav16k.subarray(start, end);
+  if (sub.length < TIMBRE_WIN) return null;
+
+  const numFrames = 1 + Math.floor((sub.length - TIMBRE_WIN) / TIMBRE_HOP);
+  const feats = new Float32Array(numFrames * TIMBRE_MELS);
+  const re = new Float64Array(TIMBRE_NFFT);
+  const im = new Float64Array(TIMBRE_NFFT);
+  const pow = new Float64Array(TIMBRE_BINS);
+  const emph = new Float64Array(TIMBRE_WIN);
+
+  for (let t = 0; t < numFrames; t++) {
+    const base = t * TIMBRE_HOP;
+    let mean = 0.0;
+    for (let i = 0; i < TIMBRE_WIN; i++) mean += sub[base + i] * 32768.0;
+    mean /= TIMBRE_WIN;
+
+    let prev = sub[base] * 32768.0 - mean;
+    emph[0] = prev * 0.03 * TIMBRE_POVEY[0];
+    for (let i = 1; i < TIMBRE_WIN; i++) {
+      const cur = sub[base + i] * 32768.0 - mean;
+      emph[i] = (cur - 0.97 * prev) * TIMBRE_POVEY[i];
+      prev = cur;
+    }
+
+    re.fill(0.0);
+    im.fill(0.0);
+    for (let i = 0; i < TIMBRE_WIN; i++) re[TIMBRE_BIT_REV[i]] = emph[i];
+    for (let size = 2; size <= TIMBRE_NFFT; size <<= 1) {
+      const half = size >> 1;
+      const step = TIMBRE_NFFT / size;
+      for (let i = 0; i < TIMBRE_NFFT; i += size) {
+        let tw = 0;
+        for (let j = 0; j < half; j++) {
+          const wr = TIMBRE_COS[tw];
+          const wi = TIMBRE_SIN[tw];
+          tw += step;
+          const a = i + j;
+          const b = a + half;
+          const tr = wr * re[b] - wi * im[b];
+          const ti = wr * im[b] + wi * re[b];
+          re[b] = re[a] - tr;
+          im[b] = im[a] - ti;
+          re[a] += tr;
+          im[a] += ti;
+        }
+      }
+    }
+    for (let k = 0; k < TIMBRE_BINS; k++) pow[k] = re[k] * re[k] + im[k] * im[k];
+
+    const row = t * TIMBRE_MELS;
+    for (let m = 0; m < TIMBRE_MELS; m++) {
+      let acc = 0.0;
+      const off = m * TIMBRE_BINS;
+      for (let k = 0; k < TIMBRE_BINS; k++) acc += TIMBRE_FB[off + k] * pow[k];
+      feats[row + m] = Math.log(acc > 1e-10 ? acc : 1e-10);
+    }
+  }
+
+  // Per-utterance cepstral mean normalization (WeSpeaker standard)
+  for (let m = 0; m < TIMBRE_MELS; m++) {
+    let sum = 0.0;
+    for (let t = 0; t < numFrames; t++) sum += feats[t * TIMBRE_MELS + m];
+    const mu = sum / numFrames;
+    for (let t = 0; t < numFrames; t++) feats[t * TIMBRE_MELS + m] -= mu;
+  }
+  return { feats, numFrames };
+}
+
+async function computeTimbreEmbedding(sess, samples, sampleRate) {
+  const key = fingerprintClip(samples, sampleRate, 1, 80);
+  const cached = timbreCache.get(key);
+  if (cached) return cached;
+  const prep = computeTimbreFbank(samples, sampleRate);
+  if (!prep || prep.numFrames < 8) return null;
+  const out = await sess.run({
+    feats: new ort.Tensor("float32", prep.feats, [1, prep.numFrames, TIMBRE_MELS]),
+  });
+  const raw = out.embs.data;
+  const emb = new Float32Array(raw.length);
+  let sq = 0.0;
+  for (let i = 0; i < raw.length; i++) {
+    const v = Number(raw[i]);
+    emb[i] = v;
+    sq += v * v;
+  }
+  const inv = 1.0 / (Math.sqrt(sq) + 1e-12);
+  for (let i = 0; i < emb.length; i++) emb[i] *= inv;
+  if (timbreCache.has(key)) timbreCache.delete(key);
+  timbreCache.set(key, emb);
+  if (timbreCache.size > MAX_CACHE) timbreCache.delete(timbreCache.keys().next().value);
+  return emb;
+}
+
+async function handleCompareTimbre(msg) {
+  const { jobId, takeSamples, takeSr, refSamples, refSr } = msg;
+  if (latestTimbreJobId !== jobId) return;
+  const sess = await ensureTimbreModel();
+  if (!sess || latestTimbreJobId !== jobId) return;
+  try {
+    const eTake = await computeTimbreEmbedding(sess, takeSamples, takeSr);
+    if (!eTake || latestTimbreJobId !== jobId) return;
+    const eRef = await computeTimbreEmbedding(sess, refSamples, refSr);
+    if (!eRef || latestTimbreJobId !== jobId) return;
+    let dot = 0.0;
+    const n = Math.min(eTake.length, eRef.length);
+    for (let i = 0; i < n; i++) dot += eTake[i] * eRef[i];
+    const cos = Math.max(-1.0, Math.min(1.0, dot));
+    const pct = Math.max(0, Math.min(100, Math.round(((cos - 0.10) / 0.68) * 100)));
+    const cosPermille = Math.max(0, Math.min(1000, Math.round(Math.max(0, cos) * 1000)));
+    self.postMessage({ type: "timbre_result", jobId, pct, cosPermille });
+  } catch (err) {
+    console.warn("[Glint Neural] Timbre embedding failed:", err);
+  }
+}
+
 self.addEventListener("message", (ev) => {
   const msg = ev.data;
   if (!msg) return;
@@ -813,6 +1021,11 @@ self.addEventListener("message", (ev) => {
   if (msg.type === "analyze_live_formants") {
     latestLiveFormantJobId = msg.jobId;
     queueTail = queueTail.then(() => handleAnalyzeLiveFormants(msg));
+    return;
+  }
+  if (msg.type === "compare_timbre") {
+    latestTimbreJobId = msg.jobId;
+    queueTail = queueTail.then(() => handleCompareTimbre(msg));
     return;
   }
   if (msg.type === "analyze_phonemes") {

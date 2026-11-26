@@ -1808,6 +1808,17 @@ const glintImports = {
     new Float64Array(memBuf(), f3Ptr, n).set(liveFormantResult.fmtF3.subarray(0, n));
     return n;
   },
+  ov_timbre_compare: (jobId, takePtr, takeCount, takeSr, refPtr, refCount, refSr) => {
+    if (!neuralWorker || takeCount < 400 || refCount < 400 || takeSr <= 0 || refSr <= 0) return;
+    const takeSamples = new Float32Array(takeCount);
+    takeSamples.set(new Float32Array(memBuf(), takePtr, takeCount));
+    const refSamples = new Float32Array(refCount);
+    refSamples.set(new Float32Array(memBuf(), refPtr, refCount));
+    neuralWorker.postMessage(
+      { type: "compare_timbre", jobId, takeSamples, takeSr, refSamples, refSr },
+      [takeSamples.buffer, refSamples.buffer],
+    );
+  },
 
   // Browser-local Source-Filter Voice Preview Resynthesizer (Pitch / Size / Weight)
   ov_synth_render: (
@@ -2162,6 +2173,13 @@ function initNeuralWorker() {
         const payload = `${msg.jobId}`;
         if (mountedPage) {
           mountedPage.post("neural_live_formants", payload);
+        }
+      } else if (msg.type === "timbre_result") {
+        const payload = `${msg.jobId}|${msg.pct}|${msg.cosPermille}`;
+        if (mountedPage) {
+          mountedPage.post("timbre_ready", payload);
+        } else {
+          pendingNeuralPosts.push(["timbre_ready", payload]);
         }
       } else if (msg.type === "phonemes_result") {
         const slot = msg.isRef ? 1 : 0;

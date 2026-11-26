@@ -324,6 +324,15 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
   unsafe extern "C" fn ov_synth_copy(out: ?[*]mut f32, maxCount: i32) -> i32 as "glint#ov_synth_copy"
 
   unsafe extern "C" fn ov_phoneme_set_enabled(enabled: i32) -> () as "glint#ov_phoneme_set_enabled"
+  unsafe extern "C" fn ov_timbre_compare(
+    jobId: i32,
+    takeSamples: ?[*]const f32,
+    takeCount: i32,
+    takeSr: f64,
+    refSamples: ?[*]const f32,
+    refCount: i32,
+    refSr: f64,
+  ) -> () as "glint#ov_timbre_compare"
   unsafe extern "C" fn ov_vowel_analyze(
     jobId: i32,
     isRef: i32,
@@ -1721,6 +1730,35 @@ pub fn neuralRequest(
     drop sampleRate
     drop fmin
     drop fmax
+  }
+}
+
+pub fn timbreCompare(
+  jobId: i32,
+  takeSamples: &[f32],
+  takeSr: f64,
+  refSamples: &[f32],
+  refSr: f64,
+) -> () {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    if takeSamples.length < 400 || refSamples.length < 400 || takeSr <= 0.0 || refSr <= 0.0 {
+      return ()
+    }
+    unsafe ov_timbre_compare(
+      jobId,
+      Pointer.fromSlice(takeSamples),
+      usize.toI32(takeSamples.length),
+      takeSr,
+      Pointer.fromSlice(refSamples),
+      usize.toI32(refSamples.length),
+      refSr,
+    )
+  } else {
+    drop jobId
+    drop takeSamples
+    drop takeSr
+    drop refSamples
+    drop refSr
   }
 }
 

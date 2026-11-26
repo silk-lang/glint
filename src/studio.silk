@@ -274,7 +274,7 @@ pub const LIB_W: f32 = 232.0
 pub const INIT_SPEC_W: f32 = 844.0
 pub const INIT_SPEC_H: f32 = 460.0
 pub const PIANO_W: f32 = 12.0
-pub const AXIS_W: f32 = 34.0
+pub const AXIS_W: f32 = 44.0
 pub const METRICS_H: f32 = 64.0
 pub const SLICE_W: f32 = 268.0
 pub const PAD_W: f32 = 268.0
@@ -454,6 +454,7 @@ pub union Message {
   ToggleNeural,
   NeuralReady { pub jobId: i32, pub isRef: bool, pub hasPitch: bool, pub hasFormants: bool },
   LiveNeuralFormantsReady { pub jobId: i32 },
+  TimbreReady { pub jobId: i32, pub pct: i32, pub cosPermille: i32 },
   NeuralStatus { pub flags: i32 },
   // Vowel / consonant isolation, TD-PSOLA stretch, Voice Lab & Klatt vowel synth
   SetIsolateMode { pub mode: u32 },
@@ -754,10 +755,23 @@ pub struct Overtone {
   pub readoutH1H2: String,
   pub readoutHnr: String,
   pub readoutAvgF0: String,
+  pub readoutCpps: String,
+  pub readoutTwang: String,
+  pub readoutStrain: String,
+  pub readoutExpress: String,
+  pub readoutStrainHigh: bool,
   pub readoutDeltaPitch: String,
   pub readoutDeltaVtl: String,
   pub readoutDeltaWeight: String,
   pub readoutDeltaHnr: String,
+  pub readoutDeltaCpps: String,
+  pub readoutDeltaTwang: String,
+  pub readoutDeltaStrain: String,
+  pub readoutDeltaExpress: String,
+  pub timbreJobGen: i32,
+  pub timbreMatchPct: i32,
+  pub timbreCosPermille: i32,
+  pub timbrePending: bool,
   pub selVoiceSummary: VoiceSummary,
   pub selTakeLtas: [f32; 64],
   pub hasSelTakeLtas: bool,
@@ -1158,10 +1172,23 @@ impl Overtone {
       readoutH1H2: run String.copy("—"),
       readoutHnr: run String.copy("—"),
       readoutAvgF0: run String.copy("—"),
+      readoutCpps: run String.copy("—"),
+      readoutTwang: run String.copy("—"),
+      readoutStrain: run String.copy("—"),
+      readoutExpress: run String.copy("—"),
+      readoutStrainHigh: false,
       readoutDeltaPitch: String.make(),
       readoutDeltaVtl: String.make(),
       readoutDeltaWeight: String.make(),
       readoutDeltaHnr: String.make(),
+      readoutDeltaCpps: String.make(),
+      readoutDeltaTwang: String.make(),
+      readoutDeltaStrain: String.make(),
+      readoutDeltaExpress: String.make(),
+      timbreJobGen: 0,
+      timbreMatchPct: -1,
+      timbreCosPermille: 0,
+      timbrePending: false,
       selVoiceSummary: VoiceSummary.empty(),
       selTakeLtas: [0.0; 64],
       hasSelTakeLtas: false,
@@ -3357,6 +3384,9 @@ impl Overtone {
       self.readoutDeltaVtl.clear()
       self.readoutDeltaWeight.clear()
       self.readoutDeltaHnr.clear()
+      self.timbreMatchPct = -1
+      self.timbreCosPermille = 0
+      self.timbrePending = false
       self.readoutScoreOverall = run String.copy("—")
       self.readoutScorePitch = run String.copy("—")
       self.readoutScoreSize = run String.copy("—")
@@ -3381,15 +3411,27 @@ impl Overtone {
       dVtl = if useSel { self.selCompare.deltaVtlCm } else { self.compare.deltaVtlCm }
       dWt = if useSel { self.selCompare.deltaH1H2Db } else { self.compare.deltaH1H2Db }
       dHnr = if useSel { self.selCompare.deltaHnrDb } else { self.compare.deltaHnrDb }
+      let dCpps = if useSel { self.selCompare.deltaCppsDb } else { self.compare.deltaCppsDb }
+      let dTwang = if useSel { self.selCompare.deltaTwangDb } else { self.compare.deltaTwangDb }
+      let dStrain = if useSel { self.selCompare.deltaStrainPct } else { self.compare.deltaStrainPct }
+      let dSpan = if useSel { self.selCompare.deltaPitchSpanSt } else { self.compare.deltaPitchSpanSt }
       self.readoutDeltaPitch = run formatSignedFixed(dSemi, 1, "st")
       self.readoutDeltaVtl = run formatSignedFixed(dVtl, 1, " cm")
       self.readoutDeltaWeight = run formatSignedFixed(dWt, 1, " dB")
       self.readoutDeltaHnr = run formatSignedFixed(dHnr, 1, " dB")
+      self.readoutDeltaCpps = run formatSignedFixed(dCpps, 1, " dB")
+      self.readoutDeltaTwang = run formatSignedFixed(dTwang, 1, " dB")
+      self.readoutDeltaStrain = run formatSignedFixed(dStrain, 0, "%")
+      self.readoutDeltaExpress = run formatSignedFixed(dSpan, 1, " st")
     } else {
       self.readoutDeltaPitch.clear()
       self.readoutDeltaVtl.clear()
       self.readoutDeltaWeight.clear()
       self.readoutDeltaHnr.clear()
+      self.readoutDeltaCpps.clear()
+      self.readoutDeltaTwang.clear()
+      self.readoutDeltaStrain.clear()
+      self.readoutDeltaExpress.clear()
     }
     if sc.valid {
       self.readoutScoreOverall = run formatScorePct(u32.toI32(sc.overall))
@@ -3460,12 +3502,55 @@ impl Overtone {
     }
   }
 
+  fn requestTimbreCompare(self: &mut Self) -> () {
+    if !self.refClip.active || !self.useNeural || self.recording || self.samples.length() < 400 || self.refClip.samples.length() < 400 {
+      self.timbreMatchPct = -1
+      self.timbreCosPermille = 0
+      self.timbrePending = false
+      return ()
+    }
+    self.timbreJobGen = self.timbreJobGen + 1
+    self.timbrePending = true
+    let takeAll = self.samples.asSlice()
+    let refAll = self.refClip.samples.asSlice()
+    if self.hasSelection && self.selCompare.valid {
+      let tDur = self.selCompare.takeEnd - self.selCompare.takeStart
+      let rDur = self.selCompare.refEnd - self.selCompare.refStart
+      if tDur >= 0.55 && rDur >= 0.55 {
+        let t0 = f64.toUsize(f64.max(0.0, f64.floor(self.selCompare.takeStart * self.sampleRate)))
+        let t1Raw = f64.toUsize(f64.ceil(self.selCompare.takeEnd * self.sampleRate))
+        let t1 = if t1Raw < takeAll.length { t1Raw } else { takeAll.length }
+        let r0 = f64.toUsize(f64.max(0.0, f64.floor(self.selCompare.refStart * self.refClip.sampleRate)))
+        let r1Raw = f64.toUsize(f64.ceil(self.selCompare.refEnd * self.refClip.sampleRate))
+        let r1 = if r1Raw < refAll.length { r1Raw } else { refAll.length }
+        if t1 > t0 + 400 && r1 > r0 + 400 {
+          audio_native.timbreCompare(
+            self.timbreJobGen,
+            Slice.view<f32>(takeAll, t0, t1 - t0),
+            self.sampleRate,
+            Slice.view<f32>(refAll, r0, r1 - r0),
+            self.refClip.sampleRate,
+          )
+          return ()
+        }
+      }
+    }
+    audio_native.timbreCompare(
+      self.timbreJobGen,
+      takeAll,
+      self.sampleRate,
+      refAll,
+      self.refClip.sampleRate,
+    )
+  }
+
   effect fn updateSelectionCompare(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
     if !self.hasSelection || !self.refClip.active || !self.compare.valid {
       self.selCompare = SelectionCompare.empty()
       run self.syncMatchReadoutStrings()
+      self.requestTimbreCompare()
       return ()
     }
     self.selCompare = run computeSelectionCompare(
@@ -3480,6 +3565,7 @@ impl Overtone {
       self.matchWeights,
     )
     run self.syncMatchReadoutStrings()
+    self.requestTimbreCompare()
   }
 
   effect fn recomputeCompare(self: &mut Self) -> ()
@@ -5411,6 +5497,22 @@ impl Overtone {
           self.readoutAvgF0 = run formatHzFull(vf.f0)
           self.readoutH1H2 = run formatSignedFixed(vf.h1h2Db, 1, " dB")
           self.readoutHnr = run formatSignedFixed(vf.hnrDb, 0, " dB")
+          let mut cp = String.make()
+          run appendFixed(&mut cp, vf.cppsDb, 1)
+          run cp.append(" dB")
+          self.readoutCpps = move cp
+          let twPct = f64.toI32(f64.round(vf.twangNorm * 100.0))
+          let stPct = f64.toI32(f64.round(vf.strainNorm * 100.0))
+          self.readoutTwang = run formatScorePct(twPct)
+          self.readoutStrain = run formatScorePct(stPct)
+          self.readoutStrainHigh = stPct > 55
+          self.readoutExpress = run String.copy("—")
+          if !self.refClip.active {
+            self.readoutDeltaCpps = run String.copy(if vf.cppsDb < 8.5 { "airy" } else if vf.cppsDb < 14.5 { "clear" } else { "firm" })
+            self.readoutDeltaTwang = run String.copy(if twPct < 35 { "mellow" } else if twPct < 65 { "balanced" } else { "bright" })
+            self.readoutDeltaStrain = run String.copy(if stPct < 25 { "easy" } else if stPct <= 55 { "balanced" } else { "pressed" })
+            self.readoutDeltaExpress.clear()
+          }
           if vf.vtlCm > 1.0 {
             self.readoutVtl = run formatVtlCm(vf.vtlCm)
             return ()
@@ -5434,6 +5536,22 @@ impl Overtone {
             self.readoutAvgF0 = run formatHzFull(fr.f0)
             self.readoutH1H2 = run formatSignedFixed(fr.h1h2Db, 1, " dB")
             self.readoutHnr = run formatSignedFixed(fr.hnrDb, 0, " dB")
+            let mut cp = String.make()
+            run appendFixed(&mut cp, fr.cppsDb, 1)
+            run cp.append(" dB")
+            self.readoutCpps = move cp
+            let twPct = f64.toI32(f64.round(fr.twangNorm * 100.0))
+            let stPct = f64.toI32(f64.round(fr.strainNorm * 100.0))
+            self.readoutTwang = run formatScorePct(twPct)
+            self.readoutStrain = run formatScorePct(stPct)
+            self.readoutStrainHigh = stPct > 55
+            self.readoutExpress = run String.copy("—")
+            if !self.refClip.active {
+              self.readoutDeltaCpps = run String.copy(if fr.cppsDb < 8.5 { "airy" } else if fr.cppsDb < 14.5 { "clear" } else { "firm" })
+              self.readoutDeltaTwang = run String.copy(if twPct < 35 { "mellow" } else if twPct < 65 { "balanced" } else { "bright" })
+              self.readoutDeltaStrain = run String.copy(if stPct < 25 { "easy" } else if stPct <= 55 { "balanced" } else { "pressed" })
+              self.readoutDeltaExpress.clear()
+            }
             gotLive = true
           }
           break
@@ -5448,6 +5566,17 @@ impl Overtone {
         self.readoutAvgF0 = run String.copy("—")
         self.readoutH1H2 = run String.copy("—")
         self.readoutHnr = run String.copy("—")
+        self.readoutCpps = run String.copy("—")
+        self.readoutTwang = run String.copy("—")
+        self.readoutStrain = run String.copy("—")
+        self.readoutExpress = run String.copy("—")
+        self.readoutStrainHigh = false
+        if !self.refClip.active {
+          self.readoutDeltaCpps.clear()
+          self.readoutDeltaTwang.clear()
+          self.readoutDeltaStrain.clear()
+          self.readoutDeltaExpress.clear()
+        }
       }
       return ()
     }
@@ -5463,11 +5592,41 @@ impl Overtone {
       self.readoutVtl = run formatVtlCm(activeSum.medianVtlCm)
       self.readoutH1H2 = run formatSignedFixed(activeSum.medianH1H2Db, 1, " dB")
       self.readoutHnr = run formatSignedFixed(activeSum.medianHnrDb, 0, " dB")
+      let mut cp = String.make()
+      run appendFixed(&mut cp, activeSum.medianCppsDb, 1)
+      run cp.append(" dB")
+      self.readoutCpps = move cp
+      let twPct = f64.toI32(f64.round(activeSum.medianTwangNorm * 100.0))
+      let stPct = f64.toI32(f64.round(activeSum.medianStrainNorm * 100.0))
+      self.readoutTwang = run formatScorePct(twPct)
+      self.readoutStrain = run formatScorePct(stPct)
+      self.readoutStrainHigh = stPct > 55
+      let mut ex = String.make()
+      run appendFixed(&mut ex, activeSum.pitchSpanSt, 1)
+      run ex.append(" st")
+      self.readoutExpress = move ex
+      if !self.refClip.active {
+        self.readoutDeltaCpps = run String.copy(if activeSum.medianCppsDb < 8.5 { "airy" } else if activeSum.medianCppsDb < 14.5 { "clear" } else { "firm" })
+        self.readoutDeltaTwang = run String.copy(if twPct < 35 { "mellow" } else if twPct < 65 { "balanced" } else { "bright" })
+        self.readoutDeltaStrain = run String.copy(if stPct < 25 { "easy" } else if stPct <= 55 { "balanced" } else { "pressed" })
+        self.readoutDeltaExpress = run String.copy(if activeSum.pitchSpanSt < 2.5 { "flat" } else if activeSum.pitchSpanSt < 7.5 { "natural" } else { "lively" })
+      }
     } else {
       self.readoutAvgF0 = run String.copy("—")
       self.readoutVtl = run String.copy("—")
       self.readoutH1H2 = run String.copy("—")
       self.readoutHnr = run String.copy("—")
+      self.readoutCpps = run String.copy("—")
+      self.readoutTwang = run String.copy("—")
+      self.readoutStrain = run String.copy("—")
+      self.readoutExpress = run String.copy("—")
+      self.readoutStrainHigh = false
+      if !self.refClip.active {
+        self.readoutDeltaCpps.clear()
+        self.readoutDeltaTwang.clear()
+        self.readoutDeltaStrain.clear()
+        self.readoutDeltaExpress.clear()
+      }
     }
   }
 
@@ -8291,7 +8450,11 @@ impl Overtone {
         if self.useNeural {
           self.requestNeuralForTake()
           self.requestNeuralForRef()
+          self.requestTimbreCompare()
         } else {
+          self.timbreMatchPct = -1
+          self.timbreCosPermille = 0
+          self.timbrePending = false
           run self.analyzeAll()
           run self.reanalyzeRefClip()
           run self.recomputeCompare()
@@ -8305,6 +8468,14 @@ impl Overtone {
 
       Message.LiveNeuralFormantsReady { jobId } => {
         run self.applyLiveNeuralFormants(jobId)
+      }
+
+      Message.TimbreReady { jobId, pct, cosPermille } => {
+        if jobId == self.timbreJobGen && self.refClip.active && self.useNeural {
+          self.timbreMatchPct = pct
+          self.timbreCosPermille = cosPermille
+          self.timbrePending = false
+        }
       }
 
       Message.NeuralStatus { flags } => {

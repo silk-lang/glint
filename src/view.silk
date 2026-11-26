@@ -1260,7 +1260,7 @@ fn renderExplorerRow(m: &Overtone, h: &Document<Message>, idx: usize, topY: f32)
         h.onPointerDown(|e| Reply<Message>.EmitAndStop { message: Message.ExplorerRowDown { idx: idx, x: e.x, y: e.y, button: e.button, modifiers: e.modifiers } }),
       ],
       &[
-        txt(h, if node.expanded { "▾" } else { "▸" }, "w-[10px] shrink-0 text-[9px]"),
+        txt(h, if node.expanded { "▾" } else { "▸" }, "w-[12px] h-[14px] flex items-center justify-center shrink-0 text-[11px] leading-[12px] text-[#6B6B70]"),
         txt(h, String.view(&node.displayName), "flex-1 text-[12px] leading-[16px] truncate"),
       ],
     )
@@ -1343,13 +1343,13 @@ fn renderExplorerRow(m: &Overtone, h: &Document<Message>, idx: usize, topY: f32)
       if hasKids {
         h.row(
           &[
-            h.class("items-center gap-[2px] px-[4px] py-[1px] rounded-[4px] text-[#6B6B70] hover:text-[#0B0B0C] hover:bg-[#E6E6EA] shrink-0"),
+            h.class("items-center gap-[3px] px-[5px] py-[2px] rounded-[4px] text-[#5A5A62] hover:text-[#0B0B0C] hover:bg-[#E6E6EA] shrink-0"),
             h.cursor(Cursor.Pointer),
             h.onPointerDown(|_| Reply<Message>.EmitAndStop { message: Message.ToggleRefGroupExpand { idx: idx } }),
           ],
           &[
             txt(h, pctDigits(u32.toI32(node.childCount)), "glint-mono text-[10px] leading-[12px]"),
-            txt(h, if node.expanded { "⌄" } else { "›" }, "text-[11px] leading-[12px]"),
+            txt(h, if node.expanded { "▾" } else { "▸" }, "w-[12px] h-[12px] flex items-center justify-center text-[13px] leading-[12px]"),
           ],
         )
       } else {
@@ -1491,7 +1491,7 @@ fn renderSpectrogramWell(m: &Overtone, h: &Document<Message>) -> Node {
     &[
       if onRef {
         h.row(
-          &[h.class("h-[26px] shrink-0 items-center gap-[10px] pl-[34px] pr-[8px] mb-[4px] bg-[#141416] border-b border-white/10")],
+          &[h.class("h-[26px] shrink-0 items-center gap-[10px] pl-[44px] pr-[8px] mb-[4px] bg-[#141416] border-b border-white/10")],
           &[
             txt(h, "BASE · REF", "glint-mono text-[10px] leading-[12px] tracking-[0.06em] text-white shrink-0"),
             txt(h, String.view(&m.refClip.name), "glint-mono text-[10px] leading-[12px] text-[#9A9AA2] truncate max-w-[160px]"),
@@ -1533,7 +1533,7 @@ fn renderSpectrogramWell(m: &Overtone, h: &Document<Message>) -> Node {
                             h,
                             String.view(&tk.label),
                             &[
-                              h.class("absolute right-[6px] glint-mono text-[10px] leading-[12px] text-[#6E6E76]"),
+                              h.class("absolute right-[6px] glint-mono text-[10px] leading-[12px] text-[#B4B4C0]"),
                               h.style(&[css.top(px(tk.pos - 6.0))]),
                             ],
                           ),
@@ -1549,7 +1549,7 @@ fn renderSpectrogramWell(m: &Overtone, h: &Document<Message>) -> Node {
                             h,
                             String.view(&tk.label),
                             &[
-                              h.class("absolute right-[6px] glint-mono text-[10px] leading-[12px] text-[#6E6E76]"),
+                              h.class("absolute right-[6px] glint-mono text-[10px] leading-[12px] text-[#B4B4C0]"),
                               h.style(&[css.top(px(tk.pos - 6.0))]),
                             ],
                           ),
@@ -1565,7 +1565,7 @@ fn renderSpectrogramWell(m: &Overtone, h: &Document<Message>) -> Node {
                     h,
                     String.view(&tk.label),
                     &[
-                      h.class("absolute right-[6px] glint-mono text-[10px] leading-[12px] text-[#6E6E76]"),
+                      h.class("absolute right-[6px] glint-mono text-[10px] leading-[12px] text-[#B4B4C0]"),
                       h.style(&[css.top(px(tk.pos - 6.0))]),
                     ],
                   ),
@@ -1797,7 +1797,7 @@ fn renderSpectrogramWell(m: &Overtone, h: &Document<Message>) -> Node {
       ),
       h.box(
         &[
-          h.class("h-[18px] shrink-0 ml-[34px] relative overflow-hidden"),
+          h.class("h-[18px] shrink-0 ml-[44px] relative overflow-hidden"),
           h.cursor(Cursor.ResizeHorizontal),
           if m.drag == DRAG_TIME_RULER { h.capturePointer() } else { h.none() },
           h.onPointerDown(|e| Reply<Message>.EmitAndStop { message: Message.TimeRulerDown { x: e.x, y: e.y } }),
@@ -1811,7 +1811,7 @@ fn renderSpectrogramWell(m: &Overtone, h: &Document<Message>) -> Node {
               h,
               String.view(&tk.label),
               &[
-                h.class("absolute top-[4px] glint-mono text-[10px] leading-[12px] text-[#6E6E76]"),
+                h.class("absolute top-[4px] glint-mono text-[10px] leading-[12px] text-[#B4B4C0]"),
                 h.style(&[css.left(px(tk.pos - 12.0))]),
               ],
             ),
@@ -1819,7 +1819,7 @@ fn renderSpectrogramWell(m: &Overtone, h: &Document<Message>) -> Node {
         ],
       ),
       h.row(
-        &[h.class("items-center gap-[8px] pl-[34px] pt-[2px] shrink-0")],
+        &[h.class("items-center gap-[8px] pl-[44px] pt-[2px] shrink-0")],
         &[
           h.box(
             &[
@@ -1849,7 +1849,7 @@ fn renderSpectrogramWell(m: &Overtone, h: &Document<Message>) -> Node {
               ),
             ],
           ),
-          txt(h, String.view(&m.readoutDuration), "glint-mono text-[10px] leading-[12px] text-[#6E6E76] shrink-0"),
+          txt(h, String.view(&m.readoutDuration), "glint-mono text-[10px] leading-[12px] text-[#B4B4C0] shrink-0"),
         ],
       ),
     ],
@@ -1893,7 +1893,7 @@ fn renderSizeWeightLane(m: &Overtone, h: &Document<Message>) -> Node {
     &[h.class("shrink-0 gap-[4px]")],
     &[
       h.row(
-        &[h.class("items-center gap-[12px] pl-[34px] text-[11px] leading-[14px] text-[#6B6B70]")],
+        &[h.class("items-center gap-[12px] pl-[44px] text-[11px] leading-[14px] text-[#6B6B70]")],
         &[
           h.row(
             &[h.class("items-center gap-[2px] p-[2px] rounded-[5px] bg-[#F1F1F2]")],
@@ -2338,6 +2338,11 @@ fn renderMatchCard(m: &Overtone, h: &Document<Message>) -> Node {
                 tunerBarRowClick(h, "Size", "big", "small", sSize, m.heatmapMetric == HEATMAP_SIZE, Message.SetHeatmapMetric { metric: HEATMAP_SIZE }),
                 tunerBarRowClick(h, "Weight", "heavy", "light", sWeight, m.heatmapMetric == HEATMAP_WEIGHT, Message.SetHeatmapMetric { metric: HEATMAP_WEIGHT }),
                 tunerBarRowClick(h, "Vowels", "back", "front", sVowel, m.heatmapMetric == HEATMAP_VOWEL, Message.SetHeatmapMetric { metric: HEATMAP_VOWEL }),
+                if m.useNeural {
+                  timbreMatchRow(h, m.timbreMatchPct, m.timbrePending)
+                } else {
+                  h.empty()
+                },
               ],
             ),
           ],
@@ -2509,6 +2514,63 @@ fn tunerBarRowClick(
   )
 }
 
+fn timbreMatchRow(h: &Document<Message>, pct: i32, pending: bool) -> Node {
+  let hasVal = pct >= 0
+  let clamped = if pct < 0 { 0 } else if pct > 100 { 100 } else { pct }
+  let fillPct: f32 = i32.toF32(clamped)
+  let barBg = if !hasVal {
+    "bg-[#C8C8CE]"
+  } else if clamped >= 72 {
+    "bg-[#2D8A5F]"
+  } else if clamped >= 45 {
+    "bg-[#2E7D96]"
+  } else {
+    "bg-[#D9381E]"
+  }
+  let numCls = if !hasVal {
+    "glint-mono text-[10px] leading-[12px] text-[#8A8A90]"
+  } else if clamped >= 72 {
+    "glint-mono text-[10px] leading-[12px] font-semibold text-[#2D8A5F]"
+  } else if clamped >= 45 {
+    "glint-mono text-[10px] leading-[12px] font-semibold text-[#2E7D96]"
+  } else {
+    "glint-mono text-[10px] leading-[12px] font-semibold text-[#D9381E]"
+  }
+  return h.row(
+    &[h.class("items-center gap-[6px] pt-[3px] mt-[2px] border-t border-[#ECECEE]")],
+    &[
+      txt(h, "Timbre", "w-[40px] shrink-0 text-[11px] leading-[13px] text-[#3A3A40] font-medium"),
+      h.box(
+        &[h.class("flex-1 h-[4px] rounded-[2px] bg-[#ECECEE] overflow-hidden flex")],
+        &[
+          if hasVal {
+            h.box(&[h.class("h-full rounded-[2px]"), h.class(barBg), h.style(&[css.width(percent(fillPct))])], &[])
+          } else {
+            h.empty()
+          },
+        ],
+      ),
+      h.row(
+        &[h.class("w-[54px] shrink-0 items-baseline justify-end gap-[3px]")],
+        &[
+          txt(h, if pending { "AI…" } else { "AI" }, "text-[8px] leading-[10px] text-[#9A9AA2]"),
+          if hasVal {
+            h.row(
+              &[h.class("items-baseline")],
+              &[
+                txt(h, pctDigits(clamped), numCls),
+                txt(h, "%", numCls),
+              ],
+            )
+          } else {
+            txt(h, if pending { "…" } else { "—" }, numCls)
+          },
+        ],
+      ),
+    ],
+  )
+}
+
 fn renderMetricsRow(m: &Overtone, h: &Document<Message>) -> Node {
   let hasSel = m.hasSelection && m.selVoiceSummary.voicedFrames > 0
   let scopeLbl = if m.recording {
@@ -2547,6 +2609,15 @@ fn renderMetricsRow(m: &Overtone, h: &Document<Message>) -> Node {
           metricCol(h, "VTL", String.view(&m.readoutVtl), String.view(&m.readoutDeltaVtl), m.readoutWeakestMetric == 2),
           metricCol(h, "H1*–H2*", String.view(&m.readoutH1H2), String.view(&m.readoutDeltaWeight), m.readoutWeakestMetric == 3),
           metricCol(h, "HNR", String.view(&m.readoutHnr), String.view(&m.readoutDeltaHnr), false),
+        ],
+      ),
+      h.row(
+        &[h.class("gap-[6px] pt-[5px] border-t border-[#F0F0F2]")],
+        &[
+          metricCol(h, "Closure", String.view(&m.readoutCpps), String.view(&m.readoutDeltaCpps), false),
+          metricCol(h, "Twang", String.view(&m.readoutTwang), String.view(&m.readoutDeltaTwang), false),
+          metricCol(h, "Strain", String.view(&m.readoutStrain), String.view(&m.readoutDeltaStrain), m.readoutStrainHigh),
+          metricCol(h, "Express", String.view(&m.readoutExpress), String.view(&m.readoutDeltaExpress), false),
         ],
       ),
     ],
